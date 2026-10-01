@@ -1,0 +1,270 @@
+# CI for TalentMatch AI.
+#
+# Each component job runs only once that component exists in the repo, so this
+# workflow is safe to merge before the code lands and picks up each phase
+# automatically as it is pushed:
+#
+#   Phase 1  etl/ + db/migrations/   -> "ETL (Python)" job, against a real Postgres
+#   Phase 2  backend/                -> "Backend (Java)" job
+#   Phase 4  frontend/               -> "Frontend (React)" job
+#   Phase 5  **/Dockerfile, compose  -> "Docker build" job
+#
+# If your folders are named differently, change the paths in `env` below.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+    paths-ignore: ["**.md", "LICENSE"]
+  pull_request:
+    paths-ignore: ["**.md", "LICENSE"]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  ETL_DIR: etl
+  MIGRATIONS_DIR: db/migrations
+  BACKEND_DIR: backend
+  FRONTEND_DIR: frontend
+  PYTHON_VERSION: "3.12"
+  JAVA_VERSION: "17"
+  NODE_VERSION: "20"
+
+jobs:
+  detect:
+    name: Detect components
+    runs-on: ubuntu-latest
+    outputs:
+      etl: ${{ steps.detect.outputs.etl }}
+      migrations: ${{ steps.detect.outputs.migrations }}
+      backend: ${{ steps.detect.outputs.backend }}
+      frontend: ${{ steps.detect.outputs.frontend }}
+      docker: ${{ steps.detect.outputs.docker }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: detect
+        shell: bash
+        run: |
+          has_any() { for f in "$@"; do [ -e "$f" ] && return 0; done; return 1; }
+
+          has_any "$ETL_DIR/requirements.txt" "$ETL_DIR/pyproject.toml" \
+            && echo "etl=true" >> "$GITHUB_OUTPUT" || echo "etl=false" >> "$GITHUB_OUTPUT"
+
+          compgen -G "$MIGRATIONS_DIR/*.sql" > /dev/null \
+            && echo "migrations=true" >> "$GITHUB_OUTPUT" || echo "migrations=false" >> "$GITHUB_OUTPUT"
+
+          has_any "$BACKEND_DIR/pom.xml" "$BACKEND_DIR/build.gradle" "$BACKEND_DIR/build.gradle.kts" \
+            && echo "backend=true" >> "$GITHUB_OUTPUT" || echo "backend=false" >> "$GITHUB_OUTPUT"
+
+          has_any "$FRONTEND_DIR/package.json" \
+            && echo "frontend=true" >> "$GITHUB_OUTPUT" || echo "frontend=false" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$(git ls-files '*Dockerfile' 'docker-compose*.yml' 'compose*.yml')" ]; then
+            echo "docker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docker=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "### Components detected" >> "$GITHUB_STEP_SUMMARY"
+          sed 's/^/- /' "$GITHUB_OUTPUT" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- Phase 1 --
+  etl:
+    name: ETL (Python)
+    needs: detect
+    if: needs.detect.outputs.etl == 'true' || needs.detect.outputs.migrations == 'true'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: talentmatch
+          POSTGRES_PASSWORD: talentmatch
+          POSTGRES_DB: talentmatch
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U talentmatch"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # Exposed in several common shapes so the ETL code and tests can read
+      # whichever one they use. CI-only credentials, not a secret.
+      DATABASE_URL: postgresql://talentmatch:talentmatch@localhost:5432/talentmatch
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGUSER: talentmatch
+      PGPASSWORD: talentmatch
+      PGDATABASE: talentmatch
+      POSTGRES_HOST: localhost
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: talentmatch
+      POSTGRES_PASSWORD: talentmatch
+      POSTGRES_DB: talentmatch
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply SQL migrations
+        if: needs.detect.outputs.migrations == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Version-sorted so V2__ runs before V10__ (Flyway-style names work too).
+          for f in $(ls "$MIGRATIONS_DIR"/*.sql | sort -V); do
+            echo "::group::$f"
+            psql -v ON_ERROR_STOP=1 -f "$f"
+            echo "::endgroup::"
+          done
+          psql -c '\dt'
+
+      - uses: actions/setup-python@v5
+        if: needs.detect.outputs.etl == 'true'
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: |
+            ${{ env.ETL_DIR }}/requirements*.txt
+            ${{ env.ETL_DIR }}/pyproject.toml
+
+      - name: Install dependencies
+        if: needs.detect.outputs.etl == 'true'
+        working-directory: ${{ env.ETL_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements-dev.txt ]; then pip install -r requirements-dev.txt; fi
+          if [ -f pyproject.toml ]; then pip install -e ".[dev]" 2>/dev/null || pip install -e .; fi
+          pip install pytest pytest-cov
+
+      - name: Lint (ruff, only if configured)
+        if: needs.detect.outputs.etl == 'true'
+        working-directory: ${{ env.ETL_DIR }}
+        shell: bash
+        run: |
+          if [ -f ruff.toml ] || [ -f .ruff.toml ] || grep -qs '\[tool.ruff' pyproject.toml; then
+            pip install ruff
+            ruff check .
+            ruff format --check .
+          else
+            echo "No ruff config found in $ETL_DIR — skipping lint."
+          fi
+
+      - name: Run tests
+        if: needs.detect.outputs.etl == 'true'
+        working-directory: ${{ env.ETL_DIR }}
+        run: pytest -v --cov=. --cov-report=term-missing --cov-report=xml
+
+      - uses: actions/upload-artifact@v4
+        if: always() && needs.detect.outputs.etl == 'true'
+        with:
+          name: etl-coverage
+          path: ${{ env.ETL_DIR }}/coverage.xml
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- Phase 2 --
+  backend:
+    name: Backend (Java)
+    needs: detect
+    if: needs.detect.outputs.backend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.BACKEND_DIR }}
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+          cache: ${{ hashFiles(format('{0}/pom.xml', env.BACKEND_DIR)) != '' && 'maven' || 'gradle' }}
+
+      # Testcontainers (planned for the integration tests) works out of the box
+      # on GitHub-hosted runners because Docker is preinstalled.
+      - name: Build and test
+        run: |
+          set -euo pipefail
+          if [ -f pom.xml ]; then
+            if [ -f mvnw ]; then chmod +x mvnw; ./mvnw -B verify; else mvn -B verify; fi
+          else
+            if [ -f gradlew ]; then chmod +x gradlew; ./gradlew build --no-daemon; else gradle build --no-daemon; fi
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-test-reports
+          path: |
+            ${{ env.BACKEND_DIR }}/target/surefire-reports/
+            ${{ env.BACKEND_DIR }}/target/failsafe-reports/
+            ${{ env.BACKEND_DIR }}/build/reports/tests/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------- Phase 4 --
+  frontend:
+    name: Frontend (React)
+    needs: detect
+    if: needs.detect.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.FRONTEND_DIR }}
+    env:
+      CI: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        shell: bash
+        run: if [ -f package-lock.json ]; then npm ci; else npm install; fi
+
+      - run: npm run lint --if-present
+      - run: npm test --if-present
+      - run: npm run build --if-present
+
+  # ---------------------------------------------------------------- Phase 5 --
+  docker:
+    name: Docker build
+    needs: [detect, etl, backend, frontend]
+    # Run after the component jobs, tolerating the ones that were skipped.
+    if: >-
+      always() && needs.detect.outputs.docker == 'true'
+      && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate docker-compose files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in $(git ls-files 'docker-compose*.yml' 'compose*.yml'); do
+            echo "Validating $f"
+            docker compose -f "$f" config --quiet
+          done
+
+      - name: Build every Dockerfile (no push)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for df in $(git ls-files '*Dockerfile'); do
+            ctx=$(dirname "$df")
+            name=$(basename "$(realpath "$ctx")" | tr '[:upper:]' '[:lower:]')
+            echo "::group::docker build $ctx"
+            docker build -f "$df" -t "talentmatch-$name:ci" "$ctx"
+            echo "::endgroup::"
+          done
