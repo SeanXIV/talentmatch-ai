@@ -43,6 +43,7 @@ English — turning a scoring number into something a recruiter can actually act
 - [`DATA_MODEL.md`](./DATA_MODEL.md) — database schema and entity-relationship diagram
 - [`API_SPEC.md`](./API_SPEC.md) — REST API specification
 - [`ROADMAP.md`](./ROADMAP.md) — phased build plan with milestones
+- [`PRODUCTION_READINESS.md`](./PRODUCTION_READINESS.md) — dev/MVP shortcuts that must change before production
 
 ## Project Status
 
