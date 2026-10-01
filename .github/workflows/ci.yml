@@ -4,8 +4,10 @@
 # workflow is safe to merge before the code lands and picks up each phase
 # automatically as it is pushed:
 #
-#   Phase 1  etl/ + db/migrations/   -> "ETL (Python)" job, against a real Postgres
-#   Phase 2  backend/                -> "Backend (Java)" job
+#   Phase 1  scripts/etl/ + src/main/resources/db/migration/
+#                                    -> "ETL (Python)" job, against a real Postgres
+#                                       (tests in tests/etl/, run from repo root)
+#   Phase 2  pom.xml at repo root    -> "Backend (Java)" job
 #   Phase 4  frontend/               -> "Frontend (React)" job
 #   Phase 5  **/Dockerfile, compose  -> "Docker build" job
 #
@@ -29,9 +31,10 @@ permissions:
   contents: read
 
 env:
-  ETL_DIR: etl
-  MIGRATIONS_DIR: db/migrations
-  BACKEND_DIR: backend
+  ETL_DIR: scripts/etl
+  MIGRATIONS_DIR: src/main/resources/db/migration
+  # Repo root: paths below resolve to ./pom.xml, ./target/..., etc.
+  BACKEND_DIR: "."
   FRONTEND_DIR: frontend
   PYTHON_VERSION: "3.12"
   JAVA_VERSION: "17"
@@ -108,6 +111,12 @@ jobs:
       POSTGRES_USER: talentmatch
       POSTGRES_PASSWORD: talentmatch
       POSTGRES_DB: talentmatch
+      # Read by tests/etl (integration tests create/drop talentmatch_test).
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      DB_USER: talentmatch
+      DB_PASSWORD: talentmatch
+      DB_NAME: talentmatch
     steps:
       - uses: actions/checkout@v4
 
@@ -158,16 +167,16 @@ jobs:
             echo "No ruff config found in $ETL_DIR — skipping lint."
           fi
 
+      # Runs from the repo root: tests/etl/conftest.py puts scripts/etl on sys.path.
       - name: Run tests
         if: needs.detect.outputs.etl == 'true'
-        working-directory: ${{ env.ETL_DIR }}
-        run: pytest -v --cov=. --cov-report=term-missing --cov-report=xml
+        run: pytest tests/etl -v -rs --cov=scripts/etl/talentmatch_etl --cov-report=term-missing --cov-report=xml
 
       - uses: actions/upload-artifact@v4
         if: always() && needs.detect.outputs.etl == 'true'
         with:
           name: etl-coverage
-          path: ${{ env.ETL_DIR }}/coverage.xml
+          path: coverage.xml
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------- Phase 2 --
