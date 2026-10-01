@@ -12,13 +12,15 @@ a frontend that presents everything to a user.
 ```mermaid
 flowchart TB
     subgraph Ingestion["Data Ingestion"]
-        RAW["Raw CSV\n(candidates, jobs)"]
+        GEN["Source adapter\ngenerate_synthetic.py\n(real jobs feed later)"]
+        RAW["Contract CSVs\n(skills, candidates, jobs,\ncandidate_skills, job_skills)"]
         ETL["Python ETL\nclean_and_load.py"]
+        GEN --> RAW
         RAW --> ETL
     end
 
     subgraph Data["Data Layer"]
-        DB[("PostgreSQL\ncandidates, jobs,\nskills, matches")]
+        DB[("PostgreSQL\ncandidate, job, skill,\njob_match")]
     end
 
     subgraph Backend["Backend API — Spring Boot"]
@@ -55,13 +57,30 @@ flowchart TB
 
 | Component | Responsibility | Owns |
 |---|---|---|
-| Python ETL | Validate, clean, and load raw candidate/job data | Data quality at ingestion |
-| PostgreSQL | Single source of truth for candidates, jobs, skills, matches | Data persistence |
+| Python ETL (`scripts/etl/`) | Produce raw contract CSVs via source adapters, then validate, clean, and idempotently load them | Data quality at ingestion |
+| PostgreSQL | Single source of truth for candidates, jobs, skills, and `job_match` results | Data persistence |
 | Spring Boot API | Expose REST endpoints, run matching logic, orchestrate AI calls | Business logic |
 | AI Explanation Service | Use LangChain4j's `AiServices` to call the configured LLM provider and return a typed response for storage/display | Match explanations |
 | LLM Provider | Ollama (local, free) by default; OpenAI/Claude API optional, swappable via config for higher-quality output | Natural-language generation |
 | React Frontend | Present candidates, jobs, and match results to a user | User interface |
 | Docker / AWS | Package and run every component consistently, locally and in the cloud | Deployment |
+
+## Data Ingestion (`scripts/etl/`)
+
+1. A **source adapter** writes contract CSVs (`skills.csv`, `candidates.csv`,
+   `jobs.csv`, `candidate_skills.csv`, `job_skills.csv`) into a raw directory.
+   Today the only adapter is the seeded Faker generator,
+   `scripts/etl/generate_synthetic.py`, which can also inject known defects
+   for testing the cleaner.
+2. `scripts/etl/clean_and_load.py` reads that directory, validates and
+   normalizes the rows, writes a rejects report (`rejects.csv`,
+   `summary.json`), and upserts the clean rows into PostgreSQL. Reruns with
+   the same input change nothing.
+
+Adapters implement the `talentmatch_etl.sources.base.SourceAdapter` protocol
+and may write only a subset of the files (missing files are read as empty).
+This lets a real job-postings source be added later without changing the
+cleaner or loader.
 
 ## Data Flow (a single match request)
 

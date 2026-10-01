@@ -11,15 +11,22 @@ no phase depends on a later one being finished to be demonstrable.
 - [x] Roadmap
 
 ## Phase 1 — Data Layer
-- [ ] Set up PostgreSQL (local via Docker)
-- [ ] Write schema migration scripts (tables from `DATA_MODEL.md`)
-- [ ] Source a public synthetic candidates/jobs dataset
-- [ ] Write Python ETL script: validate, clean, normalize skills, load to Postgres
-- [ ] Write pytest tests for the ETL script (bad rows, missing fields, duplicate skills)
+- [x] Set up PostgreSQL (local via Docker, `scripts/start_db.sh`)
+- [x] Write schema migration scripts (Flyway `V1__init_schema.sql`, tables from `DATA_MODEL.md`)
+- [x] Generate candidates/jobs data with a seeded Faker synthetic generator
+      (`scripts/etl/generate_synthetic.py`); a real job-postings source adapter
+      comes later
+- [x] Write Python ETL script (`scripts/etl/clean_and_load.py`): validate, clean,
+      normalize skills, load to Postgres
+- [x] Data-quality cleaning with a rejects report (`rejects.csv`, `summary.json`)
+- [x] Idempotent upsert load (reruns with the same input change nothing)
+- [x] Write pytest tests for the ETL script (bad rows, missing fields, duplicate skills)
 
 **Demonstrable output:** a populated database and a tested, reusable ingestion script.
 
 ## Phase 2 — Backend API
+- [ ] Add the Maven `pom.xml` (Spring Boot 3, Java 17, `flyway-core` +
+      `flyway-database-postgresql`) — the first Phase 2 step
 - [ ] Scaffold Spring Boot project (Java 17, Spring Data JPA)
 - [ ] Implement entities and repositories matching the schema
 - [ ] Implement `GET /candidates`, `GET /candidates/{id}`
@@ -36,7 +43,7 @@ no phase depends on a later one being finished to be demonstrable.
 - [ ] Define the AI Explanation Service as a LangChain4j `AiServices` interface
       (candidate + job in, typed explanation object out)
 - [ ] Wire it into the match endpoint, with graceful fallback if the call fails
-- [ ] Persist explanations in the `match` table so they aren't regenerated needlessly
+- [ ] Persist explanations in the `job_match` table so they aren't regenerated needlessly
 - [ ] Write tests using a mocked `ChatModel` (no real model calls in CI)
 - [ ] Add the OpenAI/Claude Spring Boot starter as an optional profile, so the
       provider can be swapped via config without code changes (only enable for

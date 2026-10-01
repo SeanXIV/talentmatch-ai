@@ -5,7 +5,7 @@ A full-stack candidate–job matching platform with AI-generated match explanati
 Built as a portfolio project to demonstrate end-to-end software engineering across
 backend APIs, data pipelines, relational databases, a React frontend, cloud deployment,
 and applied AI — the same shape of problem solved in production CRM/recruitment tooling,
-rebuilt from scratch with a generic, public dataset.
+rebuilt from scratch with a generic, synthetic dataset.
 
 ## Problem Statement
 
@@ -39,25 +39,57 @@ English — turning a scoring number into something a recruiter can actually act
 
 ## Documentation
 
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system architecture and component diagram
-- [`docs/DATA_MODEL.md`](docs/DATA_MODEL.md) — database schema and entity-relationship diagram
-- [`docs/API_SPEC.md`](docs/API_SPEC.md) — REST API specification
-- [`docs/ROADMAP.md`](docs/ROADMAP.md) — phased build plan with milestones
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — system architecture and component diagram
+- [`DATA_MODEL.md`](./DATA_MODEL.md) — database schema and entity-relationship diagram
+- [`API_SPEC.md`](./API_SPEC.md) — REST API specification
+- [`ROADMAP.md`](./ROADMAP.md) — phased build plan with milestones
 
 ## Project Status
 
-🚧 In planning — architecture, data model, and API are specified before implementation
-begins. See `docs/ROADMAP.md` for current phase.
+🚧 Phase 1 (data layer) is complete: PostgreSQL schema via Flyway, plus a Python ETL
+that generates, cleans, and loads data. Phase 2 (Spring Boot API) is next. See
+[`ROADMAP.md`](./ROADMAP.md) for details.
 
 ## Getting Started
 
-_(To be completed once the initial implementation lands — will include `docker-compose up`
-instructions for running the full stack locally.)_
+### Quick start (data layer)
+
+Requires Python >= 3.10 and Docker. Run from the repository root:
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -r scripts/etl/requirements.txt
+bash scripts/start_db.sh                       # Postgres 16 + Flyway migrations
+
+python scripts/etl/generate_synthetic.py --seed 42 --candidates 200 --jobs 50 \
+    --dirty-ratio 0.1 --out scripts/etl/data/raw
+python scripts/etl/clean_and_load.py --input scripts/etl/data/raw \
+    --reports scripts/etl/data/reports
+```
+
+Run the tests:
+
+```bash
+pip install -r scripts/etl/requirements-dev.txt
+python -m pytest tests/etl
+bash tests/db/test_schema.sh
+```
+
+**WSL note:** enable Docker Desktop's WSL integration for your distro so `docker`
+works inside WSL, or run the schema test against the Windows CLI with
+`DOCKER=docker.exe bash tests/db/test_schema.sh`.
+
+See [`scripts/etl/README.md`](./scripts/etl/README.md) for ETL options and outputs.
+
+_(Full-stack `docker-compose up` instructions will be added once the backend and
+frontend land.)_
 
 ## Data Source
 
-Uses a public, synthetic job-postings/resume dataset (e.g. from Kaggle) — no real
-personal or client data is used anywhere in this project.
+Uses a seeded, synthetic dataset generated with Faker
+(`scripts/etl/generate_synthetic.py`) — no real personal or client data is used
+anywhere in this project. A real public job-postings source can be added later as
+another ETL source adapter.
 
 ## License
 
