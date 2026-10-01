@@ -124,7 +124,7 @@ jobs:
           done
           psql -c '\dt'
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         if: needs.detect.outputs.etl == 'true'
         with:
           python-version: ${{ env.PYTHON_VERSION }}
