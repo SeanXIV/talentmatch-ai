@@ -163,7 +163,7 @@ jobs:
         working-directory: ${{ env.ETL_DIR }}
         run: pytest -v --cov=. --cov-report=term-missing --cov-report=xml
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always() && needs.detect.outputs.etl == 'true'
         with:
           name: etl-coverage
@@ -200,7 +200,7 @@ jobs:
             if [ -f gradlew ]; then chmod +x gradlew; ./gradlew build --no-daemon; else gradle build --no-daemon; fi
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: backend-test-reports
