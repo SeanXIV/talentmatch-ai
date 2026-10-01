@@ -48,7 +48,7 @@ jobs:
       frontend: ${{ steps.detect.outputs.frontend }}
       docker: ${{ steps.detect.outputs.docker }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: detect
         shell: bash
         run: |
@@ -109,7 +109,7 @@ jobs:
       POSTGRES_PASSWORD: talentmatch
       POSTGRES_DB: talentmatch
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Apply SQL migrations
         if: needs.detect.outputs.migrations == 'true'
@@ -181,7 +181,7 @@ jobs:
         working-directory: ${{ env.BACKEND_DIR }}
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-java@v4
         with:
@@ -222,7 +222,7 @@ jobs:
     env:
       CI: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
@@ -246,7 +246,7 @@ jobs:
       && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Validate docker-compose files
         shell: bash
