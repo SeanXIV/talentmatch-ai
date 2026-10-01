@@ -1,0 +1,23 @@
+# Weekly dependency update PRs. Uncomment each block once that folder exists
+# (Dependabot reports an error for directories with no manifest).
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  # - package-ecosystem: pip
+  #   directory: /etl
+  #   schedule:
+  #     interval: weekly
+
+  # - package-ecosystem: maven      # use "gradle" if the backend uses Gradle
+  #   directory: /backend
+  #   schedule:
+  #     interval: weekly
+
+  # - package-ecosystem: npm
+  #   directory: /frontend
+  #   schedule:
+  #     interval: weekly
