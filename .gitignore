@@ -1,0 +1,22 @@
+# Local secrets (scripts/.env.example stays tracked)
+scripts/.env
+
+# Build output
+target/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# ETL runtime data (generated raw CSVs, reports)
+scripts/etl/data/
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
