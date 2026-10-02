@@ -1,0 +1,5 @@
+# Shell scripts must keep LF endings (they break under CRLF in WSL/Linux CI).
+mvnw  text eol=lf
+*.sh  text eol=lf
+# Windows command scripts keep CRLF.
+*.cmd text eol=crlf

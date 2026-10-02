@@ -3,8 +3,9 @@
 Puts scripts/etl on sys.path so ``import talentmatch_etl`` works.
 
 Integration tests use a scratch database (default ``talentmatch_test``) that
-is created inside the running Postgres instance, migrated with V1 SQL, and
-dropped at the end of the session. The real ``talentmatch`` database is only
+is created inside the running Postgres instance, migrated with every
+``src/main/resources/db/migration/V*.sql`` file in numeric version order (V2
+after V1, V10 after V2), and dropped at the end of the session. The real ``talentmatch`` database is only
 used to issue CREATE/DROP DATABASE for the scratch DB; its data is never
 touched. Integration tests are skipped when psycopg or the server is not
 available.
@@ -16,6 +17,7 @@ to create the scratch DB), TM_TEST_DB (scratch DB name).
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +28,8 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ETL_DIR = REPO_ROOT / "scripts" / "etl"
-MIGRATION_SQL = REPO_ROOT / "src" / "main" / "resources" / "db" / "migration" / "V1__init_schema.sql"
+MIGRATION_DIR = REPO_ROOT / "src" / "main" / "resources" / "db" / "migration"
+_MIGRATION_NAME = re.compile(r"^V(\d+(?:[._]\d+)*)__.+\.sql$")
 
 if str(ETL_DIR) not in sys.path:
     sys.path.insert(0, str(ETL_DIR))
@@ -41,6 +44,32 @@ ADMIN_DB = os.environ.get("DB_NAME", "talentmatch")
 TEST_DB = os.environ.get("TM_TEST_DB", "talentmatch_test")
 
 DATA_TABLES = ("job_match", "candidate_skill", "job_skill", "candidate", "job", "skill")
+
+
+# --------------------------------------------------------------------------
+# Migrations
+# --------------------------------------------------------------------------
+
+def migration_files(directory: Path = MIGRATION_DIR) -> list[Path]:
+    """All Flyway versioned migrations (V<version>__<desc>.sql), sorted by numeric version.
+
+    Versions compare part by part as integers (Flyway semantics), so V2 sorts after V1
+    and V10 after V2 (a plain string sort would put V10 before V2).
+    """
+    found: list[tuple[tuple[int, ...], Path]] = []
+    for path in directory.glob("V*.sql"):
+        m = _MIGRATION_NAME.match(path.name)
+        if not m:
+            raise ValueError(f"Unexpected migration file name: {path.name}")
+        version = tuple(int(p) for p in re.split(r"[._]", m.group(1)))
+        found.append((version, path))
+    found.sort(key=lambda vp: vp[0])
+    versions = [v for v, _ in found]
+    if len(set(versions)) != len(versions):
+        raise ValueError(f"Duplicate migration versions in {directory}")
+    if not found:
+        raise FileNotFoundError(f"No V*.sql migrations in {directory}")
+    return [p for _, p in found]
 
 
 # --------------------------------------------------------------------------
@@ -107,7 +136,8 @@ def scratch_db():
         admin.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}"')
         admin.execute(f'CREATE DATABASE "{TEST_DB}"')
     with psycopg.connect(_conninfo(TEST_DB), autocommit=True) as conn:
-        conn.execute(MIGRATION_SQL.read_text(encoding="utf-8"))
+        for migration in migration_files():
+            conn.execute(migration.read_text(encoding="utf-8"))
     yield TEST_DB
     with psycopg.connect(_conninfo(ADMIN_DB), autocommit=True) as admin:
         admin.execute(f'DROP DATABASE IF EXISTS "{TEST_DB}" WITH (FORCE)')

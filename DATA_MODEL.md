@@ -1,7 +1,11 @@
 # Data Model
 
-The schema is created by the Flyway migration
-`src/main/resources/db/migration/V1__init_schema.sql` (PostgreSQL 16).
+The schema is created by the Flyway migrations in `src/main/resources/db/migration/`
+(PostgreSQL 16):
+
+- `V1__init_schema.sql`: tables, constraints, indexes, `set_updated_at()` triggers.
+- `V2__skill_link_staleness.sql`: link-touch triggers that make skill changes visible to
+  match staleness (see below).
 
 ## Entity-Relationship Diagram
 
@@ -96,22 +100,58 @@ every time the dashboard is opened. There is at most one row per
 `(candidate_id, job_id)` pair (unique constraint), and `score` is a
 `double precision` constrained to `[0, 1]`.
 
+`job_match` is written **only** by the API's set-based upsert
+(`INSERT ... SELECT FROM unnest(...) ON CONFLICT (candidate_id, job_id) DO UPDATE SET score,
+computed_at`), never through JPA. `computed_at` means "verified fresh at": every upsert
+advances it to `now()`, even when the score is unchanged. `ai_explanation` is never touched
+by the upsert (Phase 3 owns it).
+
 ### `updated_at` and the `set_updated_at()` trigger
 `candidate`, `job`, `skill`, and `job_match` each have an `updated_at`
 column. A shared `set_updated_at()` trigger function sets it to `now()` on
 every `UPDATE`, so it stays correct even when the ETL's
 `ON CONFLICT DO UPDATE` upserts don't set it explicitly.
 
+### Link-touch triggers (V2) and match staleness
+`candidate_skill` / `job_skill` have no timestamps of their own. V2 adds statement-level
+`AFTER INSERT / UPDATE / DELETE` triggers (one per event, using transition tables
+`new_links` / `old_links`) that bump the parent's `updated_at` whenever a link row really
+changes:
+
+- `trg_candidate_skill_touch_{ins,upd,del}` → `touch_candidate_from_links()`
+- `trg_job_skill_touch_{ins,upd,del}` → `touch_job_from_links()`
+
+One parent `UPDATE` runs per statement. Statements touching zero rows (no-op ETL reruns,
+whose conditional `DO UPDATE ... WHERE` and prune `DELETE` affect nothing) bump nothing. The
+`updated_at IS DISTINCT FROM now()` guard skips parents already touched in the same
+transaction (e.g. a candidate inserted together with its links). Deleting a skill cascades
+to its links and therefore bumps every affected candidate and job. Because triggers live in
+the database, they catch both writers: the API and the ETL.
+
+**Staleness rule.** A `job_match` row is stale when
+
+```
+computed_at < GREATEST(candidate.updated_at, job.updated_at)
+```
+
+and a missing row counts as stale. The API recomputes stale rows on read
+(`GET /jobs/{id}/matches`) or in batch (`POST /matches/recompute`).
+
 ## Match Scoring Rule
 
-Each of the job's skills is worth points: a **required** skill is worth
-**10 points**, a **nice-to-have** skill is worth **5 points**. A candidate
-earns a skill's points if they have that skill. The stored score is
-normalized:
+Each of the job's skills is worth points: by default a **required** skill is worth
+**10 points** and a **nice-to-have** skill **5 points** (configurable via
+`talentmatch.scoring.required-weight` / `nice-to-have-weight`, validated at startup). A
+candidate earns a skill's points if they have that skill; extra candidate skills and years
+of experience do not affect the score. The stored score is normalized:
 
 ```
 score = earned points / max points   (0..1)
 ```
+
+A job with no skills is **not matchable**: it is never scored (no `0/0`, no rows written),
+and the API returns an explicit `JOB_HAS_NO_SKILLS` state. Changing the weights does not mark
+rows stale; run `POST /api/matches/recompute` afterwards.
 
 ## Design Decisions
 

@@ -25,16 +25,23 @@ no phase depends on a later one being finished to be demonstrable.
 **Demonstrable output:** a populated database and a tested, reusable ingestion script.
 
 ## Phase 2 — Backend API
-- [ ] Add the Maven `pom.xml` (Spring Boot 3, Java 17, `flyway-core` +
-      `flyway-database-postgresql`) — the first Phase 2 step
-- [ ] Scaffold Spring Boot project (Java 17, Spring Data JPA)
-- [ ] Implement entities and repositories matching the schema
-- [ ] Implement `GET /candidates`, `GET /candidates/{id}`
-- [ ] Implement `GET /jobs`, `GET /jobs/{id}`
-- [ ] Implement the skill-overlap match scoring logic (no AI yet)
-- [ ] Implement `GET /jobs/{id}/matches` (score only, `aiExplanation: null`)
-- [ ] Write JUnit tests for the match scoring logic
-- [ ] Write JUnit integration tests for the endpoints (e.g. Testcontainers or an in-memory DB)
+- [x] Add the Maven `pom.xml` (Spring Boot 3.5, Java 17, `flyway-core` +
+      `flyway-database-postgresql`, Maven wrapper) — the first Phase 2 step
+- [x] Scaffold Spring Boot project (Java 17, Spring Data JPA, Flyway at startup in dev,
+      `ddl-auto=validate`, Actuator health, `prod` profile)
+- [x] Implement entities and repositories matching the schema
+- [x] Implement `GET /candidates`, `GET /candidates/{id}` (plus `POST`/`PUT`/`DELETE`)
+- [x] Implement `GET /jobs`, `GET /jobs/{id}` (plus `POST`/`PUT`/`DELETE`)
+- [x] Implement `GET/POST /skills` (case-insensitive names, never auto-created)
+- [x] Implement the skill-overlap match scoring logic (no AI yet): pure `ScoringEngine`,
+      configurable weights, deterministic breakdown + one-line summary per match
+- [x] Implement `GET /jobs/{id}/matches` (score only, `aiExplanation: null`): cached in
+      `job_match`, staleness via V2 link-touch triggers, per-job advisory lock, explicit
+      "not matchable" state for jobs with no skills
+- [x] Implement `POST /matches/recompute` (202 + pollable run resource)
+- [x] Consistent error format with codes, request ids and field errors
+- [x] Write JUnit tests for the match scoring logic
+- [x] Write JUnit integration tests for the endpoints (Testcontainers, PostgreSQL 16)
 
 **Demonstrable output:** a working, tested REST API returning real match scores.
 

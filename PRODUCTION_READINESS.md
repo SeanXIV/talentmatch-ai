@@ -73,6 +73,11 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     deploys don't break.
   - **When:** `ddl-auto=validate` and `clean-disabled` in Phase 2; the rest
     before first prod deploy (Phase 5).
+  - **Done in Phase 2:** `spring.jpa.hibernate.ddl-auto=validate` and
+    `spring.flyway.clean-disabled=true` (`src/main/resources/application.yml`);
+    `application-prod.yml` sets `spring.flyway.enabled=false`. Schema changes since V1 are
+    additive migrations (`V2__skill_link_staleness.sql`). Still open: the pipeline step,
+    least-privilege users, backups.
 
 - [ ] **Local Docker Postgres → AWS RDS**
   - **Now (dev):** container `talentmatch-postgres` (`postgres:16`, volume
@@ -95,14 +100,19 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     startup if any are missing.
   - **Why:** a default password that works is a breach waiting to happen.
   - **When:** before first prod deploy.
+  - **Done in Phase 2:** the API's dev defaults live only in `application.yml`
+    (`DB_PASSWORD:talentmatch`); `application-prod.yml` has no credential defaults and
+    requires `sslmode=require`, so a missing variable fails startup. Still open: the
+    secrets manager.
 
-- [ ] **Hard-coded scoring weights → configuration**
-  - **Now (dev):** required = 10, nice-to-have = 5 (`DATA_MODEL.md`, "Match
-    Scoring Rule"). Planned as constants in the Phase 2 Match Service.
-  - **Production:** externalized properties (e.g. `talentmatch.scoring.required-weight`)
-    with validation and documented defaults.
-  - **Why:** lets us tune weights without a code change or redeploy of logic.
-  - **When:** Phase 2 if cheap, otherwise before first prod deploy.
+- [x] **Hard-coded scoring weights → configuration** (Phase 2)
+  - **Now:** `talentmatch.scoring.required-weight` (10) and `nice-to-have-weight` (5) in
+    `application.yml`, bound to the validated `ScoringProperties` record (1..1000; invalid
+    values fail startup) and passed to the pure `ScoringEngine`.
+  - **Note:** changing weights does not mark cached scores stale; run
+    `POST /api/matches/recompute` after a change (the API logs a WARN when a cached score
+    differs from the engine).
+  - **Why:** lets us tune weights without a code change.
 
 ## 4. AI / LLM
 
@@ -135,28 +145,30 @@ shortcuts we took on purpose, written down so they don't get forgotten.
 ## 5. Matching behaviour (DECIDED 2026-10-01)
 
 - [ ] **Jobs with no skills**
-  - **Now (dev):** undefined. `score = earned / max` is `0/0` when a job has
-    no `job_skill` rows.
-  - **Production:** such jobs are not scored. The API returns an explicit
-    "not matchable / add skills" state instead of `0`. Later, the LLM suggests
-    skills from `job.description` for the recruiter to confirm.
+  - **Now (Phase 2 part done):** such jobs are never scored. `GET /api/jobs/{id}/matches`
+    returns `200` with `matchable: false`, `reason: "JOB_HAS_NO_SKILLS"` and an
+    "add skills" message; nothing is written. `POST/PUT /api/jobs` require at least one
+    skill; ETL-loaded jobs may still have none. Batch recompute lists them as skipped.
+  - **Production:** additionally, the LLM suggests skills from `job.description` for the
+    recruiter to confirm.
   - **Why:** a score of `0` reads as "nobody fits" when the real issue is "no
     criteria".
-  - **When:** Phase 2 (explicit state); LLM suggestions after Phase 3.
+  - **When:** LLM suggestions after Phase 3.
 
-- [ ] **Match staleness when skills change**
-  - **Now (dev):** `candidate_skill` / `job_skill` have no `updated_at`
-    (`DATA_MODEL.md`), so skill changes don't mark `job_match` rows stale.
-  - **Production:** add a `V2__` migration, e.g. a trigger that bumps the
-    parent's `updated_at` on link insert/update/delete, or a dedicated
-    `skills_updated_at` column. Compare it with `job_match.computed_at`.
+- [x] **Match staleness when skills change** (Phase 2)
+  - **Now:** `V2__skill_link_staleness.sql` adds statement-level link-touch triggers that
+    bump the parent's `updated_at` on any real `candidate_skill` / `job_skill` insert,
+    update or delete (API and ETL alike; no-op ETL reruns bump nothing). A row is stale
+    when `computed_at < GREATEST(candidate.updated_at, job.updated_at)` (`DATA_MODEL.md`).
   - **Why:** without it, persisted matches silently go out of date.
-  - **When:** before relying on staleness detection.
 
 ## 6. API, security & UX
 
 - [ ] **No authentication → secured API**
-  - **Now (dev):** no auth planned for Phases 2 to 4 (`API_SPEC.md`).
+  - **Now (dev):** no auth in Phases 2 to 4 (`API_SPEC.md`). Since Phase 2 this includes
+    the write endpoints (`POST/PUT/DELETE` candidates and jobs, `POST /skills`) and
+    `POST /matches/recompute`: anyone who can reach the API can change data or start a
+    batch recompute.
   - **Production:** Spring Security with OAuth2/JWT, with admin-only access to
     `POST /matches/recompute`. CORS restricted to the frontend origin. Request
     validation on all inputs. Rate limiting, especially on `regenerate=true`
@@ -167,7 +179,12 @@ shortcuts we took on purpose, written down so they don't get forgotten.
 ## 7. Observability & operations
 
 - [ ] **Health, logs, metrics, alerts**
-  - **Now (dev):** console logs only.
+  - **Now (dev):** console logs, with the request id in every log line
+    (`X-Request-Id`, MDC). **Done in Phase 2:** Actuator `/actuator/health` with
+    liveness/readiness probes (details hidden in the `prod` profile); error responses use
+    one `ApiError` shape with codes and never include stack traces, exception class
+    names or SQL (`server.error.include-*=never`, `GlobalExceptionHandler`,
+    `ApiErrorAttributes`). Still open: JSON logs, metrics, alerting.
   - **Production:** Spring Boot Actuator liveness/readiness probes; structured
     (JSON) logs; metrics (latency, error rate, LLM tokens/cost, ETL rejects);
     alerting. Error responses use the `API_SPEC.md` error format and never
@@ -206,3 +223,59 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     (section 2), then deploys to EC2/Elastic Beanstalk, with a rollback path.
   - **Why:** repeatable, auditable releases.
   - **When:** Phase 5.
+
+- [ ] **Backend integration tests need Docker**
+  - **Now (dev):** `./mvnw verify` runs `*IT` tests against Testcontainers PostgreSQL 16.
+    They deliberately do **not** use `disabledWithoutDocker`, so a missing Docker daemon
+    fails the build instead of silently skipping (GitHub-hosted runners have Docker).
+  - **Production:** keep it that way in CI; never add a skip-without-Docker switch.
+  - **Why:** a green build must mean the integration tests actually ran.
+  - **When:** Phase 2 (keep).
+
+## 9. Backend API (Phase 2) dev-only shortcuts
+
+- [ ] **In-memory recompute runs**
+  - **Now (dev):** `RecomputeService` keeps run status in memory: one run at a time, last
+    20 runs, lost on restart, executor is per instance (`AsyncConfig`, single thread).
+    Two app instances could each run a batch at once (still safe: per-job advisory locks).
+  - **Production:** a persisted job table or a real scheduler/queue (e.g. a `recompute_run`
+    table, or AWS Batch/EventBridge), with cluster-wide "one at a time".
+  - **Why:** status must survive restarts and be consistent across instances.
+  - **When:** before running more than one instance.
+
+- [ ] **Staleness race window**
+  - **Now (dev):** an edit transaction that started before a recompute read the data but
+    commits after it (sub-second window) gets `updated_at` = its own start time, which can
+    be earlier than the recompute's `computed_at`, so that one change may not mark the row
+    stale. The next change to that candidate/job, `regenerate=true` or a full
+    `POST /matches/recompute` fixes it.
+  - **Production:** compare against a commit-ordered version (e.g. a per-row version
+    counter or `clock_timestamp()`-based touch plus a "dirty" flag) if exactness matters.
+  - **Why:** rare, self-healing, but not strictly correct.
+  - **When:** before relying on matches for automated decisions.
+
+- [ ] **Last-write-wins updates**
+  - **Now (dev):** `PUT` has no optimistic locking (no `version` column); concurrent edits
+    of the same candidate/job silently overwrite each other.
+  - **Production:** add a `version` column (`@Version`) and `If-Match`/ETag support,
+    returning `409`/`412` on conflicts.
+  - **Why:** prevents lost updates when two recruiters edit the same record.
+  - **When:** before multi-user use.
+
+- [ ] **Stale check scans all candidates per GET**
+  - **Now (dev):** `GET /jobs/{id}/matches` runs one `candidate LEFT JOIN job_match` query
+    over all candidates to find stale rows. Fine for thousands of candidates.
+  - **Production:** maintain a dirty set (e.g. a `job_match_dirty` table filled by the
+    triggers), or recompute asynchronously on change; add indexes as data grows.
+  - **Why:** latency grows linearly with the number of candidates.
+  - **When:** when candidates reach ~100k or p95 latency demands it.
+
+- [ ] **Advisory lock assumes a single database**
+  - **Now (dev):** per-job recomputes are serialized with
+    `pg_advisory_xact_lock(hashtextextended('job_match:' || jobId, 0))`; correct for one
+    PostgreSQL primary (any number of app instances). A 64-bit hash collision would only
+    serialize two unrelated jobs, never corrupt data.
+  - **Production:** keep a single writer primary, or move to row-level locks/a queue if the
+    database is ever sharded.
+  - **Why:** advisory locks are not shared across separate databases.
+  - **When:** only if the data store changes.

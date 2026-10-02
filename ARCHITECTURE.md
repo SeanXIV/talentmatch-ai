@@ -82,18 +82,56 @@ and may write only a subset of the files (missing files are read as empty).
 This lets a real job-postings source be added later without changing the
 cleaner or loader.
 
+## Backend Package Layering (`src/main/java/com/talentmatch/`)
+
+| Package | Responsibility | Depends on |
+|---|---|---|
+| `web.controller` | HTTP mapping under `/api`, query-param validation (`@Validated`) | `service` |
+| `web.dto` | request/response records, `PageResponse<T>` | — |
+| `web.error` | `ApiError`, `ErrorCode`, `GlobalExceptionHandler`, `/error` attributes, `RequestIdFilter` | `service.exception` |
+| `service` | use cases, transactions, normalization (`TextNormalizer`), skill resolution, match caching, batch recompute | `repository`, `domain` |
+| `repository` | Spring Data JPA repositories (CRUD, list projections) and `MatchJdbcRepository` (set-based match SQL) | `domain.entity` |
+| `domain.entity` | JPA entities matching the Flyway schema (`ddl-auto=validate`) | — |
+| `domain.scoring` | **pure** `ScoringEngine` (no Spring, no JPA): score, breakdown, summary | — |
+| `config` | typed properties (`talentmatch.*`), executor, startup failure analyzer | — |
+
+The schema is owned by Flyway; Hibernate only validates it. `job_match` is read through
+JDBC/JPA but written only by one SQL upsert.
+
 ## Data Flow (a single match request)
 
 1. User opens the dashboard and selects a job.
 2. Frontend calls `GET /api/jobs/{id}/matches`.
-3. Spring Boot loads the job and all candidates from PostgreSQL.
-4. Match Service scores each candidate against the job's required skills.
-5. For the top-scoring candidates, the AI Explanation Service uses LangChain4j's
+3. In one read-write transaction (READ COMMITTED) the Match Service loads the job (404 if
+   missing) and its skills. A job with no skills returns `matchable: false` immediately;
+   nothing is written.
+4. **Staleness check:** one query finds candidates with no `job_match` row or with
+   `computed_at < GREATEST(candidate.updated_at, job.updated_at)` (V2 triggers bump
+   `updated_at` on any skill-link change). `regenerate=true` targets every candidate.
+5. If anything is stale: `SET LOCAL lock_timeout = '10s'`, then
+   `pg_advisory_xact_lock(hashtextextended('job_match:' || jobId, 0))` serializes recomputes of
+   this job (a timeout returns `503 MATCHES_BUSY`). The job, its skills and the stale set are
+   re-read under the lock, so a request that waited for a concurrent recompute usually finds
+   nothing left to do.
+6. One query loads the targets' relevant `candidate_skill` rows; the pure `ScoringEngine`
+   scores them in memory; one chunked upsert (`unnest` arrays, 5000 rows per statement)
+   writes scores with `computed_at = now()`. Query count per request is constant.
+7. The ranked page (`score DESC, full_name, id`, `minScore`, `LIMIT/OFFSET`) and its count are
+   read; the breakdown and summary are recomputed for that page only (not stored). If a cached
+   score differs from the engine (weights changed), a WARN is logged.
+8. *(Phase 3)* For the top-scoring candidates, the AI Explanation Service uses LangChain4j's
    `AiServices` to call the configured LLM provider (Ollama locally by default)
    with the candidate and job details, and gets back a typed response containing
-   a short plain-English reason.
-6. API returns match scores plus explanations to the frontend.
-7. Frontend renders the ranked list with each explanation.
+   a short plain-English reason. In Phase 2 `aiExplanation` is always `null` and
+   `explanationStatus` is `UNAVAILABLE`.
+9. API returns match scores (plus explanations, from Phase 3) to the frontend.
+10. Frontend renders the ranked list with each explanation.
+
+**Batch recompute** (`POST /api/matches/recompute`): returns `202` with a run resource and
+runs on a single background thread (one run at a time; a second request gets `409`). It
+snapshots job ids, then calls the same per-job recompute (lock → stale/all targets → facts →
+evaluate → upsert) in a separate transaction per job, recording per-job failures without
+stopping. Run status is kept in memory (last 20 runs).
 
 ## AI Tooling and Provider Choice
 
