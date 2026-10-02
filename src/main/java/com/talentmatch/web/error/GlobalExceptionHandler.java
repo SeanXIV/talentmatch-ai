@@ -11,11 +11,18 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.ConstraintViolationException;
 import jakarta.validation.Path;
+import java.net.SocketException;
 import java.net.URI;
 import java.sql.SQLException;
+import java.sql.SQLNonTransientConnectionException;
+import java.sql.SQLTransientConnectionException;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.Deque;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -38,7 +45,9 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
+import org.springframework.jdbc.CannotGetJdbcConnectionException;
 import org.springframework.transaction.CannotCreateTransactionException;
+import org.springframework.transaction.TransactionSystemException;
 import org.springframework.validation.FieldError;
 import org.springframework.validation.ObjectError;
 import org.springframework.validation.method.MethodValidationException;
@@ -74,6 +83,8 @@ public class GlobalExceptionHandler {
     private static final String EXAMPLE_ID = "3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6";
     private static final Pattern CONSTRAINT_IN_MESSAGE = Pattern.compile("constraint \"([^\"]+)\"");
     private static final int MAX_ECHO = 64;
+    private static final int MAX_CAUSES_INSPECTED = 64;
+    private static final String HIKARI_CLOSED_CONNECTION = "Connection is closed";
 
     /** Unique constraint / index name (verified against V1__init_schema.sql) -> conflict. */
     private static final Map<String, Conflict> CONFLICTS = Map.of(
@@ -285,9 +296,12 @@ public class GlobalExceptionHandler {
 
     @ExceptionHandler(Exception.class)
     ResponseEntity<ApiError> unexpected(Exception ex, HttpServletRequest req) {
-        if (isConnectionFailure(ex)) {
-            log.warn("Database connection failure on {} (request {})", req.getRequestURI(),
-                    RequestIdFilter.currentRequestId(req), ex);
+        // Before the 500 path: covers wrappers such as JpaSystemException/TransactionSystemException
+        // thrown when a rollback on a dead connection overrides the original failure.
+        if (isDatabaseUnavailable(ex)) {
+            log.warn("Database unavailable on {} (request {}): {}: {}", req.getRequestURI(),
+                    RequestIdFilter.currentRequestId(req), ex.getClass().getSimpleName(), ex.getMessage());
+            log.debug("Database unavailable detail", ex);
             return databaseUnavailable(req);
         }
         if (ex instanceof ErrorResponse er && er.getStatusCode().is4xxClientError()) {
@@ -417,13 +431,65 @@ public class GlobalExceptionHandler {
         return null;
     }
 
-    /** SQLState class 08 (connection exception) or 57P0x (server shutting down) in the cause chain. */
-    private static boolean isConnectionFailure(Throwable ex) {
-        for (Throwable t = ex; t != null; t = t.getCause() == t ? null : t.getCause()) {
-            if (t instanceof SQLException sql && sql.getSQLState() != null
-                    && (sql.getSQLState().startsWith("08") || sql.getSQLState().startsWith("57P0"))) {
+    /**
+     * True if anything reachable from {@code ex} shows the database (or the connection to it) is
+     * gone. Walks causes, suppressed exceptions, {@link SQLException#getNextException()} and
+     * {@link TransactionSystemException#getApplicationException()}, guarding against cycles.
+     *
+     * <p>This matters when a dead connection makes the rollback fail too: TransactionInterceptor
+     * then throws the rollback failure (e.g. {@code JpaSystemException: Unable to rollback against
+     * JDBC Connection}) instead of the original error, so only the rollback chain is available.
+     */
+    static boolean isDatabaseUnavailable(Throwable ex) {
+        Deque<Throwable> pending = new ArrayDeque<>();
+        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
+        if (ex != null) {
+            pending.push(ex);
+        }
+        while (!pending.isEmpty() && seen.size() < MAX_CAUSES_INSPECTED) {
+            Throwable t = pending.pop();
+            if (!seen.add(t)) {
+                continue;
+            }
+            if (isDatabaseUnavailableSignal(t)) {
                 return true;
             }
+            if (t.getCause() != null) {
+                pending.push(t.getCause());
+            }
+            for (Throwable s : t.getSuppressed()) {
+                pending.push(s);
+            }
+            if (t instanceof SQLException sql && sql.getNextException() != null) {
+                pending.push(sql.getNextException());
+            }
+            if (t instanceof TransactionSystemException tse && tse.getApplicationException() != null) {
+                pending.push(tse.getApplicationException());
+            }
+        }
+        return false;
+    }
+
+    private static boolean isDatabaseUnavailableSignal(Throwable t) {
+        if (t instanceof CannotGetJdbcConnectionException
+                || t instanceof DataAccessResourceFailureException
+                || t instanceof CannotCreateTransactionException
+                || t instanceof QueryTimeoutException
+                || t instanceof org.hibernate.exception.JDBCConnectionException
+                || t instanceof SocketException // includes ConnectException
+                || t instanceof SQLTransientConnectionException
+                || t instanceof SQLNonTransientConnectionException) {
+            return true;
+        }
+        if (t instanceof SQLException sql) {
+            String state = sql.getSQLState();
+            if (state != null) {
+                // 08xxx: connection exception; 57P0x: server shutting down / admin terminated.
+                return state.startsWith("08") || state.startsWith("57P0");
+            }
+            // HikariCP's closed-connection proxy (used after the pool evicts a broken connection)
+            // throws this without a SQLState in some versions.
+            return HIKARI_CLOSED_CONNECTION.equals(sql.getMessage());
         }
         return false;
     }
