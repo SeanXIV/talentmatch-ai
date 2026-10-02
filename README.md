@@ -43,12 +43,15 @@ English — turning a scoring number into something a recruiter can actually act
 - [`DATA_MODEL.md`](./DATA_MODEL.md) — database schema and entity-relationship diagram
 - [`API_SPEC.md`](./API_SPEC.md) — REST API specification
 - [`ROADMAP.md`](./ROADMAP.md) — phased build plan with milestones
+- [`PRODUCTION_READINESS.md`](./PRODUCTION_READINESS.md) — dev/MVP shortcuts that must change before production
 
 ## Project Status
 
 🚧 Phase 1 (data layer) is complete: PostgreSQL schema via Flyway, plus a Python ETL
-that generates, cleans, and loads data. Phase 2 (Spring Boot API) is next. See
-[`ROADMAP.md`](./ROADMAP.md) for details.
+that generates, cleans, and loads data. Phase 2 (Spring Boot API) is implemented:
+candidates, jobs and skills CRUD, cached skill-overlap match scoring with a deterministic
+breakdown, batch recompute, and a consistent error format. Phase 3 (AI explanations) is
+next. See [`ROADMAP.md`](./ROADMAP.md) for details.
 
 ## Getting Started
 
@@ -80,6 +83,41 @@ works inside WSL, or run the schema test against the Windows CLI with
 `DOCKER=docker.exe bash tests/db/test_schema.sh`.
 
 See [`scripts/etl/README.md`](./scripts/etl/README.md) for ETL options and outputs.
+
+### Quick start (backend API)
+
+Requires Java 17 (no Maven install needed: use the wrapper). With the database from the
+data-layer quick start running:
+
+```bash
+bash scripts/start_db.sh          # if not already running
+./mvnw spring-boot:run            # applies pending Flyway migrations (e.g. V2), starts on :8080
+
+curl localhost:8080/api/jobs
+curl "localhost:8080/api/jobs/<job-id>/matches?limit=5"
+curl localhost:8080/actuator/health
+```
+
+Connection settings come from environment variables with local-dev defaults:
+`DB_HOST` (localhost), `DB_PORT` (5432), `DB_NAME` (talentmatch), `DB_USER` (talentmatch),
+`DB_PASSWORD` (talentmatch), plus `DB_POOL_SIZE` and `SERVER_PORT`. If you set `DB_PORT=5433`
+in `scripts/.env`, export it for the API too (`DB_PORT=5433 ./mvnw spring-boot:run`). If
+the database is unreachable, startup fails with a message telling you how to fix it.
+The `prod` profile (`SPRING_PROFILES_ACTIVE=prod`) has no defaults, requires SSL and does
+not run migrations.
+
+Run the backend tests (unit + integration):
+
+```bash
+./mvnw verify
+```
+
+Integration tests use Testcontainers (PostgreSQL 16), so **Docker must be running**; they
+fail, rather than skip, without it. **WSL note:** Testcontainers needs the Docker daemon
+reachable from inside WSL, so enable Docker Desktop's WSL integration for your distro
+(`DOCKER=docker.exe` is not enough for Testcontainers).
+
+See [`API_SPEC.md`](./API_SPEC.md) for every endpoint, parameter and error code.
 
 _(Full-stack `docker-compose up` instructions will be added once the backend and
 frontend land.)_

@@ -1,0 +1,11 @@
+# Production profile: no credential defaults, so a missing variable fails startup.
+# Migrations run as a separate deploy step (PRODUCTION_READINESS §2), not at app startup.
+spring:
+  datasource:
+    url: jdbc:postgresql://${DB_HOST}:${DB_PORT:5432}/${DB_NAME}?sslmode=require
+    username: ${DB_USER}
+    password: ${DB_PASSWORD}
+  flyway.enabled: false
+  jpa.hibernate.ddl-auto: validate
+
+management.endpoint.health.show-details: never
