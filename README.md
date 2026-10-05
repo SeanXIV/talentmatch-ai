@@ -53,8 +53,9 @@ candidates, jobs and skills CRUD, cached skill-overlap match scoring with a dete
 breakdown, batch recompute, and a consistent error format. Phase 3 (AI explanations) is
 implemented: LangChain4j explanations for the top matches (local Ollama by default,
 OpenAI/Claude via profiles), persisted with prompt-hash staleness, with a deterministic
-template fallback so every match always has an explanation. Phase 4 (frontend) is next.
-See [`ROADMAP.md`](./ROADMAP.md) for details.
+template fallback so every match always has an explanation. The project is now aimed at
+personal job hunting (see [`ROADMAP.md`](./ROADMAP.md)): Phase 4, uploading your CV as a
+structured master profile, is next.
 
 ## Getting Started
 
