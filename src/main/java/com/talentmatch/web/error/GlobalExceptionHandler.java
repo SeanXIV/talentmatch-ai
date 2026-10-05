@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import com.talentmatch.service.exception.ApiException;
 import com.talentmatch.service.exception.MatchesBusyException;
 import com.talentmatch.service.exception.RecomputeAlreadyRunningException;
+import com.talentmatch.service.exception.RegenerateRateLimitedException;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.ConstraintViolation;
 import jakarta.validation.ConstraintViolationException;
@@ -106,6 +107,14 @@ public class GlobalExceptionHandler {
         if (ex.getActiveRunId() != null) {
             headers.setLocation(URI.create("/api/matches/recompute/" + ex.getActiveRunId()));
         }
+        return respond(ex.getStatus(), ex.getCode(), ex.getMessage(), ex.getFieldErrors(), req, headers);
+    }
+
+    @ExceptionHandler(RegenerateRateLimitedException.class)
+    ResponseEntity<ApiError> regenerateRateLimited(RegenerateRateLimitedException ex, HttpServletRequest req) {
+        log.info("Regenerate rate-limited on {} (retry after {}s)", req.getRequestURI(), ex.getRetryAfterSeconds());
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.RETRY_AFTER, String.valueOf(ex.getRetryAfterSeconds()));
         return respond(ex.getStatus(), ex.getCode(), ex.getMessage(), ex.getFieldErrors(), req, headers);
     }
 

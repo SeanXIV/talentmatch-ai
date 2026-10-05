@@ -6,6 +6,8 @@ The schema is created by the Flyway migrations in `src/main/resources/db/migrati
 - `V1__init_schema.sql`: tables, constraints, indexes, `set_updated_at()` triggers.
 - `V2__skill_link_staleness.sql`: link-touch triggers that make skill changes visible to
   match staleness (see below).
+- `V3__match_explanation.sql`: persisted AI explanations with prompt-hash staleness
+  (Phase 3; see "AI explanations" below).
 
 ## Entity-Relationship Diagram
 
@@ -61,6 +63,10 @@ erDiagram
         uuid job_id FK
         double score
         text ai_explanation
+        jsonb explanation_payload
+        string explanation_input_hash
+        string explanation_model
+        timestamp explanation_generated_at
         timestamp computed_at
         timestamp updated_at
     }
@@ -103,8 +109,49 @@ every time the dashboard is opened. There is at most one row per
 `job_match` is written **only** by the API's set-based upsert
 (`INSERT ... SELECT FROM unnest(...) ON CONFLICT (candidate_id, job_id) DO UPDATE SET score,
 computed_at`), never through JPA. `computed_at` means "verified fresh at": every upsert
-advances it to `now()`, even when the score is unchanged. `ai_explanation` is never touched
-by the upsert (Phase 3 owns it).
+advances it to `now()`, even when the score is unchanged. `ai_explanation` and the V3
+`explanation_*` columns are never touched by the upsert; they are written only by the guarded
+explanation `UPDATE` (below).
+
+### AI explanations (V3)
+
+| Column | Type | Meaning |
+|---|---|---|
+| `ai_explanation` (V1) | `text` | the AI explanation text (`NULL` = none) |
+| `explanation_payload` | `jsonb` | validated AI output `{headline, explanation, strengths[], gaps[]}` |
+| `explanation_input_hash` | `char(64)` | sha256 hex of the exact prompt (system + user message) it was generated from |
+| `explanation_model` | `varchar(200)` | provider/model label, e.g. `ollama/qwen2.5:7b-instruct` |
+| `explanation_generated_at` | `timestamptz` | when it was generated |
+
+Check constraint `ck_job_match_explanation_complete`: all five columns are `NULL`, or all are
+set (non-blank text, a JSON object payload, a 64-char lower-case hex hash, a non-blank model
+and a timestamp). An explanation is never partially recorded. The new columns are not mapped
+in the `JobMatch` entity (`validate` ignores unmapped columns).
+
+**Explanation staleness rule (not `computed_at`).** A stored explanation is *fresh* iff
+`explanation_input_hash` equals the hash of the prompt the API would send now. If
+`ai_explanation` is set but the hash differs, the explanation is `STALE`. `computed_at` is
+deliberately not used: every score refresh advances it, even when nothing changed. Any change
+the model would see (candidate name/summary/skills, job title/company/description/skills,
+score, truncated context, system prompt) changes the hash; changes it never sees (email, text
+beyond the truncation point, `computed_at`, the model) do not. Rows whose payload cannot be
+parsed are treated as having no explanation.
+
+**Guarded write.** Explanations are generated outside the scoring transaction and saved with
+one autocommit statement:
+
+```sql
+UPDATE job_match m SET ai_explanation = …, explanation_payload = CAST(… AS jsonb), …
+  FROM candidate c, job j
+ WHERE m.job_id = :jobId AND m.candidate_id = :candidateId
+   AND c.id = m.candidate_id AND j.id = m.job_id
+   AND c.updated_at = :candidateUpdatedAt AND j.updated_at = :jobUpdatedAt
+   AND m.score = :expectedScore
+```
+
+The timestamps and score are the values read with the page. Equality detects any committed
+edit of the candidate, the job or their skill links (V2 triggers), and any rescore, so an
+explanation generated from outdated inputs is discarded (0 rows) instead of stored.
 
 ### `updated_at` and the `set_updated_at()` trigger
 `candidate`, `job`, `skill`, and `job_match` each have an `updated_at`

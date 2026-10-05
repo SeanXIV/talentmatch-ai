@@ -1,0 +1,4 @@
+# Local Ollama (also the default without any profile).
+talentmatch:
+  ai:
+    provider: ollama

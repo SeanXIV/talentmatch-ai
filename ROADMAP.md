@@ -46,15 +46,20 @@ no phase depends on a later one being finished to be demonstrable.
 **Demonstrable output:** a working, tested REST API returning real match scores.
 
 ## Phase 3 — AI Explanation Layer
-- [ ] Add LangChain4j and the Ollama Spring Boot starter; run Ollama locally
-- [ ] Define the AI Explanation Service as a LangChain4j `AiServices` interface
-      (candidate + job in, typed explanation object out)
-- [ ] Wire it into the match endpoint, with graceful fallback if the call fails
-- [ ] Persist explanations in the `job_match` table so they aren't regenerated needlessly
+- [x] Add LangChain4j and run Ollama locally: langchain4j-ollama core module + own
+      `@Configuration` (the Spring Boot starters are beta-only); default model
+      `qwen2.5:7b-instruct`
+- [x] Define the AI Explanation Service as a LangChain4j `AiServices` interface
+      (`ExplanationAssistant`: Java-built prompt in, typed `MatchExplanation` out)
+- [x] Wire it into the match endpoint, with graceful fallback if the call fails
+      (deterministic template explanation, request budget + PENDING, single-flight,
+      failure backoff, circuit breaker, regenerate rate limit)
+- [x] Persist explanations in the `job_match` table so they aren't regenerated needlessly
+      (V3: payload, prompt hash for staleness, model, generated-at; guarded write)
 - [ ] Write tests using a mocked `ChatModel` (no real model calls in CI)
-- [ ] Add the OpenAI/Claude Spring Boot starter as an optional profile, so the
-      provider can be swapped via config without code changes (only enable for
-      a final polished demo, since hosted providers are paid)
+- [x] OpenAI/Claude optional profiles (core modules `langchain4j-open-ai` /
+      `langchain4j-anthropic`), so the provider can be swapped via config without code
+      changes (only enable for a final polished demo, since hosted providers are paid)
 
 **Demonstrable output:** matches that explain themselves in plain English.
 

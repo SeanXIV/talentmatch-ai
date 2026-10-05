@@ -7,6 +7,7 @@ import com.talentmatch.support.AbstractApiIT;
 import com.talentmatch.support.Api.Res;
 import java.sql.Timestamp;
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -79,6 +80,21 @@ class MatchCachingIT extends AbstractApiIT {
         assertThat(a.has("aiExplanation")).isTrue();
         assertThat(a.get("aiExplanation").isNull()).isTrue();
         assertThat(a.get("explanationStatus").asText()).isEqualTo("UNAVAILABLE");
+        // Phase 3 (AI disabled in this context): an always-present template explanation
+        assertThat(page.get("explanationsGenerated").asInt()).isZero();
+        JsonNode ex = a.get("explanation");
+        assertThat(ex.get("source").asText()).isEqualTo("TEMPLATE");
+        assertThat(ex.get("headline").asText()).isEqualTo("Strong match: 2 of 2 required skills");
+        assertThat(ex.get("text").asText()).startsWith("Ada Lovelace has all 2 required skills: Java (5 years), SQL.");
+        assertThat(ex.get("reason").asText()).isEqualTo("AI_DISABLED");
+        assertThat(ex.get("note").asText())
+                .isEqualTo("AI explanations are turned off, so this summary was built from the skill breakdown.");
+        assertThat(ex.has("model") && ex.get("model").isNull()).isTrue();
+        assertThat(ex.has("generatedAt") && ex.get("generatedAt").isNull()).isTrue();
+        List<String> order = new java.util.ArrayList<>();
+        a.fieldNames().forEachRemaining(order::add);
+        assertThat(order).containsExactly("rank", "candidateId", "candidateName", "score", "scorePercent", "summary",
+                "breakdown", "aiExplanation", "explanationStatus", "explanation", "computedAt");
         Instant computedAt = Instant.parse(a.get("computedAt").asText());
         Timestamp dbComputed = jdbc.queryForObject(
                 "SELECT computed_at FROM job_match WHERE job_id = ? AND candidate_id = ?", Timestamp.class, job, ada);

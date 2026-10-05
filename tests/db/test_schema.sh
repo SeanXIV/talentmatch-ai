@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_schema.sh - Verify the TalentMatch AI schema (V1 + V2) in the running
+# test_schema.sh - Verify the TalentMatch AI schema (V1 + V2 + V3) in the running
 # talentmatch-postgres container. Behavioral checks run in a transaction that
 # is rolled back, so no test data is left behind.
 #
@@ -32,7 +32,11 @@ BEGIN
                    WHERE version = '2' AND success) THEN
         RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V2';
     END IF;
-    RAISE NOTICE 'PASS: PostgreSQL 16, Flyway V1 + V2 success';
+    IF NOT EXISTS (SELECT 1 FROM flyway_schema_history
+                   WHERE version = '3' AND success) THEN
+        RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V3';
+    END IF;
+    RAISE NOTICE 'PASS: PostgreSQL 16, Flyway V1 + V2 + V3 success';
 END $$;
 
 -- ---------- Tables ----------
@@ -165,6 +169,35 @@ BEGIN
     RAISE NOTICE 'PASS: V2 link-touch triggers present (AFTER, statement-level, transition tables)';
 END $$;
 
+-- ---------- V3 explanation columns + all-or-nothing check ----------
+DO $$
+DECLARE r record; actual text;
+BEGIN
+    FOR r IN SELECT * FROM (VALUES
+        ('ai_explanation',           'text'),
+        ('explanation_payload',      'jsonb'),
+        ('explanation_input_hash',   'character(64)'),
+        ('explanation_model',        'character varying(200)'),
+        ('explanation_generated_at', 'timestamp with time zone')
+    ) AS v(col, typ) LOOP
+        SELECT format_type(a.atttypid, a.atttypmod) INTO actual
+          FROM pg_attribute a
+         WHERE a.attrelid = 'public.job_match'::regclass AND a.attname = r.col AND NOT a.attisdropped;
+        IF actual IS NULL THEN
+            RAISE EXCEPTION 'FAIL: missing column job_match.%', r.col;
+        END IF;
+        IF actual <> r.typ THEN
+            RAISE EXCEPTION 'FAIL: job_match.% is % (expected %)', r.col, actual, r.typ;
+        END IF;
+    END LOOP;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ck_job_match_explanation_complete' AND contype = 'c'
+                     AND conrelid = 'public.job_match'::regclass AND convalidated) THEN
+        RAISE EXCEPTION 'FAIL: missing validated check constraint ck_job_match_explanation_complete';
+    END IF;
+    RAISE NOTICE 'PASS: V3 explanation columns and ck_job_match_explanation_complete present';
+END $$;
+
 -- ---------- Behavioral checks (rolled back) ----------
 BEGIN;
 
@@ -245,6 +278,66 @@ BEGIN
         RAISE EXCEPTION 'FAIL: candidate delete did not cascade (% rows left)', n;
     END IF;
     RAISE NOTICE 'PASS: candidate delete cascades to candidate_skill and job_match';
+END $$;
+
+ROLLBACK;
+
+-- ---------- V3 behavioral checks (rolled back) ----------
+BEGIN;
+
+DO $$
+DECLARE
+    c_id uuid; j_id uuid;
+    h constant text := repeat('a', 64);
+    r record;
+BEGIN
+    INSERT INTO candidate (full_name, email) VALUES ('QA V3', 'qa.v3@example.com') RETURNING id INTO c_id;
+    INSERT INTO job (title, company) VALUES ('QA V3 Engineer', 'QA V3 Corp') RETURNING id INTO j_id;
+    INSERT INTO job_match (candidate_id, job_id, score) VALUES (c_id, j_id, 0.5);
+    RAISE NOTICE 'PASS: a row without any explanation satisfies the V3 check';
+
+    -- a complete explanation is accepted
+    UPDATE job_match SET ai_explanation = 'QA text', explanation_payload = '{"headline":"h"}',
+           explanation_input_hash = h, explanation_model = 'ollama/qa', explanation_generated_at = now()
+     WHERE candidate_id = c_id AND job_id = j_id;
+    RAISE NOTICE 'PASS: complete explanation accepted';
+
+    -- every partial or malformed combination is rejected
+    FOR r IN SELECT * FROM (VALUES
+        ('text only',        'QA text', NULL::jsonb,  NULL::text,     NULL::text,  false),
+        ('no hash',          'QA text', '{}'::jsonb,  NULL,           'ollama/qa', true),
+        ('blank text',       '  ',      '{}'::jsonb,  h,              'ollama/qa', true),
+        ('array payload',    'QA text', '[]'::jsonb,  h,              'ollama/qa', true),
+        ('upper-case hash',  'QA text', '{}'::jsonb,  repeat('A', 64), 'ollama/qa', true),
+        ('blank model',      'QA text', '{}'::jsonb,  h,              ' ',         true),
+        ('no generated_at',  'QA text', '{}'::jsonb,  h,              'ollama/qa', false),
+        ('payload, no text', NULL,      '{}'::jsonb,  NULL,           NULL,        false)
+    ) AS v(label, txt, payload, hash, model, with_ts) LOOP
+        BEGIN
+            UPDATE job_match SET ai_explanation = r.txt, explanation_payload = r.payload,
+                   explanation_input_hash = r.hash, explanation_model = r.model,
+                   explanation_generated_at = CASE WHEN r.with_ts THEN now() END
+             WHERE candidate_id = c_id AND job_id = j_id;
+            RAISE EXCEPTION 'FAIL: partial explanation accepted (%)', r.label;
+        EXCEPTION WHEN check_violation THEN
+            NULL;
+        END;
+    END LOOP;
+    RAISE NOTICE 'PASS: partial / malformed explanations rejected by ck_job_match_explanation_complete';
+
+    -- the hash column is char(64): a shorter hash is rejected (by the regex, after padding)
+    BEGIN
+        UPDATE job_match SET explanation_input_hash = 'abc' WHERE candidate_id = c_id AND job_id = j_id;
+        RAISE EXCEPTION 'FAIL: short hash accepted';
+    EXCEPTION WHEN check_violation THEN
+        RAISE NOTICE 'PASS: short hash rejected';
+    END;
+
+    -- clearing everything at once is allowed
+    UPDATE job_match SET ai_explanation = NULL, explanation_payload = NULL, explanation_input_hash = NULL,
+           explanation_model = NULL, explanation_generated_at = NULL
+     WHERE candidate_id = c_id AND job_id = j_id;
+    RAISE NOTICE 'PASS: clearing a whole explanation accepted';
 END $$;
 
 ROLLBACK;

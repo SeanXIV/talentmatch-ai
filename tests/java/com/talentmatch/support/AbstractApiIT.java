@@ -26,8 +26,13 @@ import org.testcontainers.containers.PostgreSQLContainer;
 /**
  * Base class for API integration tests: full app on a random port against the shared
  * Testcontainers PostgreSQL 16, all data tables truncated before each test.
+ *
+ * <p>Phase 3: the Phase 2 suite runs with the AI layer off ({@code talentmatch.ai.enabled=false}),
+ * so its behaviour is unchanged apart from the template {@code explanation} (AI_DISABLED). AI tests
+ * extend {@link AbstractAiApiIT}, which uses a second context with a fake ChatModel.
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = "talentmatch.ai.enabled=false")
 @Import(TestcontainersConfiguration.class)
 public abstract class AbstractApiIT {
 
@@ -60,6 +65,13 @@ public abstract class AbstractApiIT {
 
     protected UUID skill(String name) {
         return skill(name, null);
+    }
+
+    /** Creates each skill (no category); the skill table is empty at the start of every test. */
+    protected void skills(String... names) {
+        for (String name : names) {
+            skill(name);
+        }
     }
 
     protected UUID skill(String name, String category) {

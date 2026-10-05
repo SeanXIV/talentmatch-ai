@@ -11,18 +11,18 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.env.Environment;
 
-/** §8.1 Startup: Flyway V1+V2, Hibernate validate, health; plus request-id handling. */
+/** §8.1 Startup: Flyway V1..V3, Hibernate validate, health; plus request-id handling. */
 class StartupIT extends AbstractApiIT {
 
     @Autowired
     Environment environment;
 
     @Test
-    void flywayAppliedV1AndV2AndHibernateValidates() {
+    void flywayAppliedV1ToV3AndHibernateValidates() {
         List<String> versions = jdbc.queryForList(
                 "SELECT version FROM flyway_schema_history WHERE success AND version IS NOT NULL ORDER BY installed_rank",
                 String.class);
-        assertThat(versions).containsExactly("1", "2");
+        assertThat(versions).containsExactly("1", "2", "3");
         // The context started with ddl-auto=validate, so the entity mappings match V1.
         assertThat(environment.getProperty("spring.jpa.hibernate.ddl-auto")).isEqualTo("validate");
         assertThat(jdbc.queryForObject("SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'trg_%_skill_touch_%'",
@@ -36,6 +36,9 @@ class StartupIT extends AbstractApiIT {
         assertThat(health.status()).as(health.toString()).isEqualTo(200);
         assertThat(health.json().get("status").asText()).isEqualTo("UP");
         assertThat(health.json().at("/components/db/status").asText()).isEqualTo("UP");
+        // Phase 3: the AI component reports template-only mode when disabled
+        assertThat(health.json().at("/components/ai/status").asText()).isEqualTo("UP");
+        assertThat(health.json().at("/components/ai/details/mode").asText()).isEqualTo("template-only");
         for (String probe : List.of("/actuator/health/liveness", "/actuator/health/readiness")) {
             Res r = api.get(probe);
             assertThat(r.status()).as(probe + " " + r).isEqualTo(200);

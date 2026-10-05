@@ -39,6 +39,7 @@ management:
   endpoint.health:
     show-details: always
     probes.enabled: true
+    status.order: down,out-of-service,up,degraded,unknown   # 'ai' DEGRADED never fails overall health
 
 talentmatch:
   scoring:
@@ -50,5 +51,22 @@ talentmatch:
   recompute:
     history-size: 20
     max-failures-reported: 50
+  ai:
+    enabled: ${AI_ENABLED:true}       # false = Phase 2 behaviour + template explanations, no LLM beans
+    provider: ollama                  # ollama | openai | claude (set by profiles)
+    top-n: 5
+    call-timeout: 60s                 # per model call (HTTP timeout); CPU-only Ollama can be slow
+    request-budget: 8s                # max time a GET waits for explanations; unfinished ones -> PENDING
+    max-concurrency: 2                # Ollama serves few parallel requests
+    queue-capacity: 20
+    max-context-chars: 2000
+    failure-backoff: 60s
+    regenerate-window: 60s
+    circuit: { failure-threshold: 3, open-duration: 30s }
+    ollama:
+      base-url: ${OLLAMA_BASE_URL:http://localhost:11434}
+      model: ${OLLAMA_MODEL:qwen2.5:7b-instruct}
+      temperature: 0.2
+      max-output-tokens: 400
 
 logging.pattern.level: "%5p [%X{requestId:-}]"

@@ -1,0 +1,15 @@
+# Hosted Anthropic Claude (paid; demos only). Requires ANTHROPIC_API_KEY; never commit keys.
+talentmatch:
+  ai:
+    provider: claude
+    call-timeout: 45s
+    request-budget: 15s
+    max-concurrency: 4
+    claude:
+      api-key: ${ANTHROPIC_API_KEY:}
+      base-url: ${ANTHROPIC_BASE_URL:}
+      model: ${CLAUDE_MODEL:claude-sonnet-5-5}
+      max-tokens: 3000              # thinking consumes output tokens; don't lowball
+      effort: ""                    # must stay blank (API default, high): LangChain4j 1.20.2 can't send effort with structured output
+      cache-system-prompt: false    # system prompt < min cacheable prefix; enable only if it grows past ~2-4K tokens
+      # never set temperature/top-p/top-k/thinking for this model (400s)
