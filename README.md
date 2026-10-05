@@ -51,7 +51,10 @@ English — turning a scoring number into something a recruiter can actually act
 that generates, cleans, and loads data. Phase 2 (Spring Boot API) is implemented:
 candidates, jobs and skills CRUD, cached skill-overlap match scoring with a deterministic
 breakdown, batch recompute, and a consistent error format. Phase 3 (AI explanations) is
-next. See [`ROADMAP.md`](./ROADMAP.md) for details.
+implemented: LangChain4j explanations for the top matches (local Ollama by default,
+OpenAI/Claude via profiles), persisted with prompt-hash staleness, with a deterministic
+template fallback so every match always has an explanation. Phase 4 (frontend) is next.
+See [`ROADMAP.md`](./ROADMAP.md) for details.
 
 ## Getting Started
 
@@ -118,6 +121,54 @@ reachable from inside WSL, so enable Docker Desktop's WSL integration for your d
 (`DOCKER=docker.exe` is not enough for Testcontainers).
 
 See [`API_SPEC.md`](./API_SPEC.md) for every endpoint, parameter and error code.
+
+### Quick start (AI explanations)
+
+Match explanations come from a local [Ollama](https://ollama.com) model by default (free, no
+API key). Get the model once, either natively:
+
+```bash
+ollama pull qwen2.5:7b-instruct
+```
+
+or with Docker (add `--gpus=all` after `-d` for NVIDIA GPUs):
+
+```bash
+docker run -d --name talentmatch-ollama -p 11434:11434 -v talentmatch-ollama:/root/.ollama ollama/ollama
+docker exec talentmatch-ollama ollama pull qwen2.5:7b-instruct
+```
+
+Then start the API as usual:
+
+```bash
+./mvnw spring-boot:run
+curl "localhost:8080/api/jobs/<job-id>/matches?limit=5"
+```
+
+The top 5 matches get AI explanations (`explanationStatus: "READY"`, `explanation.source:
+"AI"`); the rest, and any match whose AI explanation is unavailable, get a template
+explanation built from the skill breakdown. The first request for a job may return
+`PENDING` while the model is still writing: reload after a few seconds. The app starts and
+serves matches **without** Ollama too (template explanations, `ai` health component
+`DEGRADED`).
+
+| Variant | How |
+|---|---|
+| Low-RAM machine | `ollama pull qwen2.5:3b-instruct`, then `OLLAMA_MODEL=qwen2.5:3b-instruct ./mvnw spring-boot:run` |
+| Ollama elsewhere | `OLLAMA_BASE_URL=http://host:11434 ./mvnw spring-boot:run` |
+| No AI at all | `AI_ENABLED=false ./mvnw spring-boot:run` (template explanations only) |
+| Hosted Claude (paid; demos only) | `ANTHROPIC_API_KEY=… SPRING_PROFILES_ACTIVE=claude ./mvnw spring-boot:run` |
+| Hosted OpenAI (paid; demos only) | `OPENAI_API_KEY=… SPRING_PROFILES_ACTIVE=openai ./mvnw spring-boot:run` |
+
+Other overrides: `CLAUDE_MODEL`, `ANTHROPIC_BASE_URL`, `OPENAI_MODEL`, `OPENAI_BASE_URL`.
+Never commit API keys. `regenerate=true` forces fresh explanations for the top matches and is
+limited to once per job per minute (`429` otherwise).
+
+**WSL note:** Ollama installed on Windows listens on Windows' `127.0.0.1`. From WSL2, either
+enable mirrored networking (`networkingMode=mirrored` under `[wsl2]` in
+`%UserProfile%\.wslconfig`, then `wsl --shutdown`), or set `OLLAMA_HOST=0.0.0.0` on Windows
+and `OLLAMA_BASE_URL=http://<windows-host-ip>:11434` in WSL. Alternatively run Ollama inside
+WSL or via Docker Desktop (the Docker command above).
 
 _(Full-stack `docker-compose up` instructions will be added once the backend and
 frontend land.)_

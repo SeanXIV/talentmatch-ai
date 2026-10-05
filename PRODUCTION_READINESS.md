@@ -76,7 +76,7 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Done in Phase 2:** `spring.jpa.hibernate.ddl-auto=validate` and
     `spring.flyway.clean-disabled=true` (`src/main/resources/application.yml`);
     `application-prod.yml` sets `spring.flyway.enabled=false`. Schema changes since V1 are
-    additive migrations (`V2__skill_link_staleness.sql`). Still open: the pipeline step,
+    additive migrations (`V2__skill_link_staleness.sql`, `V3__match_explanation.sql`). Still open: the pipeline step,
     least-privilege users, backups.
 
 - [ ] **Local Docker Postgres → AWS RDS**
@@ -119,28 +119,99 @@ shortcuts we took on purpose, written down so they don't get forgotten.
 - [ ] **Local Ollama → hosted provider**
   - **Now (dev):** Ollama local model by default (`ARCHITECTURE.md`, "AI
     Tooling and Provider Choice").
-  - **Production:** hosted provider (OpenAI/Claude) selected by Spring profile.
-    API keys live in the secrets manager. Add per-request timeouts, retries with
-    backoff, rate limits and a monthly cost cap, and log token usage per request.
+  - **Done in Phase 3:** hosted providers selected by Spring profile
+    (`application-openai.yml`, `application-claude.yml`; `SPRING_PROFILES_ACTIVE=claude` or
+    `prod,claude`), keys only from env vars (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`), masked
+    in `toString()`, startup fails with a clear message when missing; per-call HTTP timeouts
+    (`call-timeout`), no blocking retries (`maxRetries=0`), failure backoff, circuit breaker,
+    regenerate rate limit; token counts in the per-generation INFO log line.
+  - **Still open:** secrets manager, monthly cost cap, token-usage metrics/dashboards.
   - **Why:** output quality, plus control over cost and failure modes for a
     paid third-party dependency.
-  - **When:** Phase 3 (profile), before first prod deploy (limits, caps).
+  - **When:** before first prod deploy (secrets manager, caps).
 
 - [ ] **Synchronous explanation generation → async**
-  - **Now (dev):** planned to generate synchronously inside
-    `GET /jobs/{id}/matches`, with a timeout (`API_SPEC.md`).
-  - **Production:** generate in the background (queue/worker). The API returns
-    scores immediately with an explanation status the frontend can poll.
-  - **Why:** LLM latency must not block or time out the match endpoint.
+  - **Now (Phase 3):** `GET /jobs/{id}/matches` waits for the page's explanations up to a
+    request budget (`talentmatch.ai.request-budget`, 8s default) on a bounded in-process
+    executor (`aiExecutor`); unfinished generations keep running in the background, persist
+    themselves, and the item is reported `PENDING` ("reload in a few seconds").
+  - **Production:** a real queue/worker with persisted job state, and polling or SSE so the
+    frontend refreshes without a full reload.
+  - **Why:** LLM latency must not block or time out the match endpoint, and background work
+    must survive restarts.
   - **When:** before first prod deploy.
 
-- [ ] **Deterministic fallback explanation**
-  - **Now (dev):** planned fallback is `aiExplanation: null` when the LLM
-    fails (`API_SPEC.md`, "Notes for Implementation").
-  - **Production:** a template explanation built from matched and missing
-    skills when the LLM is unavailable, clearly labelled as non-AI.
+- [x] **Deterministic fallback explanation** (Phase 3)
+  - **Now:** every match carries an `explanation` object; when no current AI explanation is
+    available it is a deterministic template built from matched and missing skills
+    (`ExplanationFallbackRenderer`), labelled `source: "TEMPLATE"` with a `reason` and a
+    user-facing `note`. `aiExplanation` stays `null` unless the AI text is current.
   - **Why:** recruiters still get a useful reason during an outage.
-  - **When:** Phase 3.
+
+- [ ] **Per-instance AI throttling and dedup**
+  - **Now (dev):** the regenerate rate limiter, single-flight map, failure backoff and circuit
+    breaker (`com.talentmatch.ai`) live in memory, per app instance.
+  - **Production:** a shared rate limiter (Redis/bucket4j or an API gateway), distributed
+    locks or queue-level dedup, and shared circuit state if several instances run.
+  - **Why:** with N instances, limits and dedup are N times looser.
+  - **When:** before running more than one instance.
+
+- [ ] **In-flight generations are lost on restart**
+  - **Now (dev):** background generations run on the in-process `aiExecutor`; a restart drops
+    them (the executor does not wait on shutdown). The next GET regenerates.
+  - **Production:** a persisted queue (see "Synchronous → async").
+  - **When:** before first prod deploy.
+
+- [ ] **Cost caps and quotas**
+  - **Now (dev):** only the per-job regenerate rate limit, top-N and the executor size bound
+    spend.
+  - **Production:** monthly cost caps and per-tenant quotas with alerts.
+  - **When:** before enabling a paid provider in production.
+
+- [ ] **API key management and rotation**
+  - **Now (dev):** keys only from environment variables; never committed, no defaults.
+  - **Production:** keys from a secrets manager, with rotation and least-privilege
+    project keys.
+  - **When:** before first prod deploy.
+
+- [ ] **Candidate PII sent to third-party providers**: OPEN DECISION
+  - **Now (dev):** hosted profiles send the candidate's name and summary (never the email)
+    to OpenAI/Anthropic; data is synthetic. Ollama keeps everything local.
+  - **Production:** DPA with the provider, candidate consent, data-residency review, or
+    pseudonymize names before sending.
+  - **When:** before using real candidate data with a hosted provider.
+
+- [ ] **Prompt-injection review and output-filter hardening**
+  - **Now (dev):** untrusted text is tagged, escaped and truncated; output is validated
+    (grounded skills, length limits, no emails/URLs/prompt echoes) (`ARCHITECTURE.md`).
+  - **Production:** a red-team review, more output filters (e.g. toxicity/PII classifiers),
+    and monitoring of rejected outputs.
+  - **When:** before first prod deploy.
+
+- [ ] **Offline model evaluation**
+  - **Now (dev):** no evaluation set; quality is checked by eye.
+  - **Production:** a golden set with grounding/hallucination metrics, run before switching
+    models or prompts.
+  - **When:** before switching models in production.
+
+- [ ] **A model change does not invalidate explanations** (by design)
+  - **Now (dev):** the staleness hash covers the prompt, not the model, so switching provider
+    keeps existing explanations (labelled with their original `model`). Use
+    `regenerate=true` to refresh them.
+  - **Production:** decide whether a model upgrade should trigger a background refresh.
+  - **When:** when models change in production.
+
+- [ ] **Passive AI health**
+  - **Now (dev):** the `ai` health component reflects the circuit breaker only; it never
+    probes the model, so a provider outage shows up only after real requests fail.
+  - **Production:** optional synthetic probe with alerting, kept out of readiness.
+  - **When:** before first prod deploy.
+
+- [ ] **Explanation retention and deletion**
+  - **Now (dev):** explanations live in `job_match` until the row is deleted (cascades from
+    candidate/job deletion).
+  - **Production:** part of the PII retention/deletion policy (section 1).
+  - **When:** before first prod deploy.
 
 ## 5. Matching behaviour (DECIDED 2026-10-01)
 
@@ -185,6 +256,12 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     one `ApiError` shape with codes and never include stack traces, exception class
     names or SQL (`server.error.include-*=never`, `GlobalExceptionHandler`,
     `ApiErrorAttributes`). Still open: JSON logs, metrics, alerting.
+    **Done in Phase 3:** Micrometer timer `talentmatch.ai.explanations` (tags provider, model,
+    outcome = success|timeout|provider_error|refused|invalid_output|rejected) and counter
+    `talentmatch.ai.fallbacks` (tag reason); one INFO line per generation with
+    provider/model/outcome/latency/token counts (never prompt text, names or keys); passive
+    `ai` health component (DEGRADED never fails overall health). `/actuator/metrics` is not
+    exposed yet.
   - **Production:** Spring Boot Actuator liveness/readiness probes; structured
     (JSON) logs; metrics (latency, error rate, LLM tokens/cost, ETL rejects);
     alerting. Error responses use the `API_SPEC.md` error format and never

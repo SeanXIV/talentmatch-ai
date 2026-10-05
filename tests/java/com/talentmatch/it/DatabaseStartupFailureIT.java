@@ -24,6 +24,7 @@ class DatabaseStartupFailureIT {
         int closedPort = port;
         assertThatThrownBy(() -> new SpringApplicationBuilder(TalentMatchApplication.class).run(
                 "--server.port=0",
+                "--talentmatch.ai.enabled=false",
                 "--spring.datasource.url=jdbc:postgresql://localhost:" + closedPort + "/tmqa",
                 "--spring.datasource.username=qa_user",
                 "--spring.datasource.password=qa-secret-pw-123"))

@@ -4,8 +4,10 @@ import com.talentmatch.domain.scoring.CandidateSkillFact;
 import com.talentmatch.domain.scoring.JobRequirement;
 import java.sql.Connection;
 import java.sql.SQLException;
+import java.sql.Types;
 import java.time.Instant;
 import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -37,7 +39,7 @@ public class MatchJdbcRepository {
     static final String LOCK_TIMEOUT = "10s";
 
     private static final String SQL_JOB = """
-            SELECT id, title, company, updated_at FROM job WHERE id = :jobId""";
+            SELECT id, title, company, description, updated_at FROM job WHERE id = :jobId""";
 
     private static final String SQL_REQUIREMENTS = """
             SELECT js.skill_id, s.name, js.required
@@ -69,7 +71,7 @@ public class MatchJdbcRepository {
 
     // Joined to candidate so rows for candidates deleted in the meantime are skipped instead
     // of failing the whole statement on the foreign key. computed_at always advances;
-    // ai_explanation is never touched.
+    // ai_explanation and the explanation_* columns (V3) are never touched.
     private static final String SQL_UPSERT = """
             INSERT INTO job_match (candidate_id, job_id, score, computed_at)
             SELECT u.c, :jobId, u.s, now()
@@ -79,11 +81,31 @@ public class MatchJdbcRepository {
                SET score = EXCLUDED.score, computed_at = EXCLUDED.computed_at""";
 
     private static final String SQL_RANKED_PAGE = """
-            SELECT m.candidate_id, c.full_name, m.score, m.computed_at, m.ai_explanation
+            SELECT m.candidate_id, c.full_name, m.score, m.computed_at, m.ai_explanation,
+                   c.summary AS candidate_summary, c.updated_at AS candidate_updated_at,
+                   m.explanation_payload::text AS explanation_payload, m.explanation_input_hash,
+                   m.explanation_model, m.explanation_generated_at
             FROM job_match m JOIN candidate c ON c.id = m.candidate_id
             WHERE m.job_id = :jobId AND m.score >= :minScore
             ORDER BY m.score DESC, c.full_name ASC, c.id ASC
             LIMIT :limit OFFSET :offset""";
+
+    // Guarded explanation write (autocommit, outside any request transaction): it only lands if
+    // the candidate, the job (including skill links, via V2 triggers) and the score are exactly
+    // as they were read when the prompt was built. Otherwise 0 rows: the result is discarded.
+    private static final String SQL_SAVE_EXPLANATION = """
+            UPDATE job_match m
+               SET ai_explanation = :text,
+                   explanation_payload = CAST(:payload AS jsonb),
+                   explanation_input_hash = :inputHash,
+                   explanation_model = :model,
+                   explanation_generated_at = :generatedAt
+              FROM candidate c, job j
+             WHERE m.job_id = :jobId AND m.candidate_id = :candidateId
+               AND c.id = m.candidate_id AND j.id = m.job_id
+               AND c.updated_at = :candidateUpdatedAt
+               AND j.updated_at = :jobUpdatedAt
+               AND m.score = :expectedScore""";
 
     private static final String SQL_COUNT_MATCHES = """
             SELECT count(*) FROM job_match m
@@ -101,12 +123,32 @@ public class MatchJdbcRepository {
     }
 
     /** Minimal job header used by the match flow. */
-    public record JobHeader(UUID id, String title, String company, Instant updatedAt) {
+    public record JobHeader(UUID id, String title, String company, String description, Instant updatedAt) {
     }
 
-    /** One row of a ranked match page. */
+    /**
+     * One row of a ranked match page.
+     *
+     * @param aiExplanation      raw job_match.ai_explanation (may be stale; see {@code stored})
+     * @param candidateUpdatedAt candidate.updated_at, used to guard the explanation write
+     * @param stored             the persisted explanation, or null when ai_explanation is null
+     */
     public record RankedRow(UUID candidateId, String candidateName, double score, Instant computedAt,
-                            String aiExplanation) {
+                            String aiExplanation, String candidateSummary, Instant candidateUpdatedAt,
+                            StoredExplanation stored) {
+    }
+
+    /**
+     * A persisted AI explanation (V3 columns).
+     *
+     * @param text        ai_explanation
+     * @param payloadJson explanation_payload as JSON text
+     * @param inputHash   sha256 hex of the prompt it was generated from
+     * @param model       provider/model label
+     * @param generatedAt when it was generated
+     */
+    public record StoredExplanation(String text, String payloadJson, String inputHash, String model,
+                                    Instant generatedAt) {
     }
 
     public Optional<JobHeader> findJob(UUID jobId) {
@@ -115,6 +157,7 @@ public class MatchJdbcRepository {
                         rs.getObject("id", UUID.class),
                         rs.getString("title"),
                         rs.getString("company"),
+                        rs.getString("description"),
                         toInstant(rs.getObject("updated_at", OffsetDateTime.class))));
         return rows.stream().findFirst();
     }
@@ -209,12 +252,48 @@ public class MatchJdbcRepository {
                 .addValue("minScore", minScore)
                 .addValue("limit", limit)
                 .addValue("offset", offset);
-        return jdbc.query(SQL_RANKED_PAGE, params, (rs, i) -> new RankedRow(
-                rs.getObject("candidate_id", UUID.class),
-                rs.getString("full_name"),
-                rs.getDouble("score"),
-                toInstant(rs.getObject("computed_at", OffsetDateTime.class)),
-                rs.getString("ai_explanation")));
+        return jdbc.query(SQL_RANKED_PAGE, params, (rs, i) -> {
+            String aiExplanation = rs.getString("ai_explanation");
+            StoredExplanation stored = aiExplanation == null ? null : new StoredExplanation(
+                    aiExplanation,
+                    rs.getString("explanation_payload"),
+                    rs.getString("explanation_input_hash"),
+                    rs.getString("explanation_model"),
+                    toInstant(rs.getObject("explanation_generated_at", OffsetDateTime.class)));
+            return new RankedRow(
+                    rs.getObject("candidate_id", UUID.class),
+                    rs.getString("full_name"),
+                    rs.getDouble("score"),
+                    toInstant(rs.getObject("computed_at", OffsetDateTime.class)),
+                    aiExplanation,
+                    rs.getString("candidate_summary"),
+                    toInstant(rs.getObject("candidate_updated_at", OffsetDateTime.class)),
+                    stored);
+        });
+    }
+
+    /**
+     * Stores a generated explanation if nothing it was based on has changed. Call outside any
+     * transaction: it autocommits and is one short statement.
+     *
+     * @param expectedScore the raw job_match.score read with the page (not the rounded value)
+     * @return 1 if saved, 0 if the candidate, job or score changed since they were read (result discarded)
+     */
+    public int saveExplanation(UUID jobId, UUID candidateId, double expectedScore, Instant candidateUpdatedAt,
+                               Instant jobUpdatedAt, String text, String payloadJson, String inputHash,
+                               String model, Instant generatedAt) {
+        MapSqlParameterSource params = new MapSqlParameterSource()
+                .addValue("jobId", jobId)
+                .addValue("candidateId", candidateId)
+                .addValue("expectedScore", expectedScore)
+                .addValue("candidateUpdatedAt", toOffset(candidateUpdatedAt), Types.TIMESTAMP_WITH_TIMEZONE)
+                .addValue("jobUpdatedAt", toOffset(jobUpdatedAt), Types.TIMESTAMP_WITH_TIMEZONE)
+                .addValue("text", text)
+                .addValue("payload", payloadJson)
+                .addValue("inputHash", inputHash)
+                .addValue("model", model)
+                .addValue("generatedAt", toOffset(generatedAt), Types.TIMESTAMP_WITH_TIMEZONE);
+        return jdbc.update(SQL_SAVE_EXPLANATION, params);
     }
 
     public long countMatches(UUID jobId, double minScore) {
@@ -260,6 +339,11 @@ public class MatchJdbcRepository {
 
     private static Instant toInstant(OffsetDateTime value) {
         return value == null ? null : value.toInstant();
+    }
+
+    /** PgJDBC does not bind Instant; timestamptz needs an OffsetDateTime. */
+    private static OffsetDateTime toOffset(Instant value) {
+        return value == null ? null : OffsetDateTime.ofInstant(value, ZoneOffset.UTC);
     }
 
     private static SqlTypeValue uuidArray(Collection<UUID> ids) {

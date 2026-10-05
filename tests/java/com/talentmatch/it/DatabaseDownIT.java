@@ -43,7 +43,7 @@ import org.testcontainers.containers.PostgreSQLContainer;
  *   <li>connection acquisition: subsequent requests cannot get a connection at all.</li>
  * </ul>
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "talentmatch.ai.enabled=false")
 @Import(DatabaseDownIT.OwnContainer.class)
 @DirtiesContext
 @ExtendWith(OutputCaptureExtension.class)

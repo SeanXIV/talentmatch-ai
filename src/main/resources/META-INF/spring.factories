@@ -1,2 +1,3 @@
 org.springframework.boot.diagnostics.FailureAnalyzer=\
-com.talentmatch.config.DatabaseStartupFailureAnalyzer
+com.talentmatch.config.DatabaseStartupFailureAnalyzer,\
+com.talentmatch.ai.config.AiStartupFailureAnalyzer

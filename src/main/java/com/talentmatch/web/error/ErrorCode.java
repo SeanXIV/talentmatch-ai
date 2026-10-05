@@ -24,7 +24,7 @@ public enum ErrorCode {
     SKILL_ALREADY_EXISTS,
     DATA_CONFLICT,
     RECOMPUTE_ALREADY_RUNNING,
-    // 429 (reserved for Phase 3)
+    // 429
     REGENERATE_RATE_LIMITED,
     // 503
     MATCHES_BUSY,

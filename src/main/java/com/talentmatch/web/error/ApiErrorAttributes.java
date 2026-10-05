@@ -57,6 +57,7 @@ public class ApiErrorAttributes extends DefaultErrorAttributes {
             case 406 -> ErrorCode.NOT_ACCEPTABLE;
             case 413 -> ErrorCode.PAYLOAD_TOO_LARGE;
             case 415 -> ErrorCode.UNSUPPORTED_MEDIA_TYPE;
+            case 429 -> ErrorCode.REGENERATE_RATE_LIMITED;
             case 503 -> ErrorCode.DATABASE_UNAVAILABLE;
             default -> status.is5xxServerError() ? ErrorCode.INTERNAL_ERROR : ErrorCode.REQUEST_FAILED;
         };
