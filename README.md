@@ -164,6 +164,29 @@ Other overrides: `CLAUDE_MODEL`, `ANTHROPIC_BASE_URL`, `OPENAI_MODEL`, `OPENAI_B
 Never commit API keys. `regenerate=true` forces fresh explanations for the top matches and is
 limited to once per job per minute (`429` otherwise).
 
+**Slow (CPU-only) machines:** the defaults (`call-timeout` 60s, 2 parallel calls, top 5)
+assume a GPU or a fast CPU. Without a GPU, `qwen2.5:7b-instruct` can write as slowly as ~2
+tokens/s (measured on a 4-core, 8 GB WSL2 box), so one explanation (~500 tokens in, ~80 out)
+takes about 2 minutes. Every call then times out, the `ai` circuit opens, and you only ever
+see template explanations. Nothing is broken, the model is just too slow for the defaults.
+Check your speed with `ollama run qwen2.5:7b-instruct --verbose "hi"` (`eval rate`), then
+either give the model more time:
+
+```bash
+TALENTMATCH_AI_CALL_TIMEOUT=300s TALENTMATCH_AI_MAX_CONCURRENCY=1 TALENTMATCH_AI_TOP_N=2 \
+    ./mvnw spring-boot:run
+```
+
+or use a smaller model (faster, somewhat plainer wording):
+
+```bash
+ollama pull qwen2.5:1.5b-instruct
+OLLAMA_MODEL=qwen2.5:1.5b-instruct TALENTMATCH_AI_CALL_TIMEOUT=120s ./mvnw spring-boot:run
+```
+
+Either way the first request returns `PENDING`. Explanations finish in the background and
+are stored, so later requests return them as `READY` straight away.
+
 **WSL note:** Ollama installed on Windows listens on Windows' `127.0.0.1`. From WSL2, either
 enable mirrored networking (`networkingMode=mirrored` under `[wsl2]` in
 `%UserProfile%\.wslconfig`, then `wsl --shutdown`), or set `OLLAMA_HOST=0.0.0.0` on Windows
