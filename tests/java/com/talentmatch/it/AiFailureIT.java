@@ -202,6 +202,7 @@ class AiFailureIT extends AbstractAiApiIT {
                 new Object[] {"t", "{}", "A".repeat(64), "m", now},
                 new Object[] {"t", "{}", "abc", "m", now},
                 new Object[] {"t", "{}", hash, " ", now},
+                new Object[] {"t", "{}", hash, null, now},
                 new Object[] {"t", "{}", hash, "m", null},
                 new Object[] {null, "{}", null, null, null});
         for (Object[] b : bad) {

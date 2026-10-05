@@ -8,6 +8,8 @@ The schema is created by the Flyway migrations in `src/main/resources/db/migrati
   match staleness (see below).
 - `V3__match_explanation.sql`: persisted AI explanations with prompt-hash staleness
   (Phase 3; see "AI explanations" below).
+- `V4__owner_profile.sql`: uploaded CVs (`resume`) and the owner's confirmed master profile
+  (`owner_profile`) (Phase 4; see "Master profile" below).
 
 ## Entity-Relationship Diagram
 
@@ -19,6 +21,10 @@ erDiagram
     SKILL ||--o{ JOB_SKILL : "used in"
     CANDIDATE ||--o{ JOB_MATCH : "scored in"
     JOB ||--o{ JOB_MATCH : "scored in"
+    CANDIDATE ||--o| OWNER_PROFILE : "is the owner (at most one)"
+    RESUME |o--o{ OWNER_PROFILE : "confirmed from"
+    OWNER_PROFILE_VERSION ||--o| OWNER_PROFILE : "current version"
+    RESUME |o--o{ OWNER_PROFILE_VERSION : "confirmed from"
 
     CANDIDATE {
         uuid id PK
@@ -69,6 +75,45 @@ erDiagram
         timestamp explanation_generated_at
         timestamp computed_at
         timestamp updated_at
+    }
+
+    RESUME {
+        uuid id PK
+        string file_name
+        string content_type
+        int size_bytes
+        char sha256
+        bytea content
+        int page_count
+        text extracted_text
+        string status
+        string failure_reason
+        int attempts
+        string extraction_model
+        jsonb draft
+        jsonb warnings
+        timestamp uploaded_at
+        timestamp extraction_started_at
+        timestamp extraction_finished_at
+        timestamp updated_at
+    }
+
+    OWNER_PROFILE {
+        boolean id PK
+        uuid candidate_id FK
+        uuid resume_id FK
+        jsonb profile
+        int version FK
+        timestamp confirmed_at
+        timestamp created_at
+        timestamp updated_at
+    }
+
+    OWNER_PROFILE_VERSION {
+        int version PK
+        jsonb profile
+        uuid resume_id FK
+        timestamp confirmed_at
     }
 ```
 
@@ -153,8 +198,57 @@ The timestamps and score are the values read with the page. Equality detects any
 edit of the candidate, the job or their skill links (V2 triggers), and any rescore, so an
 explanation generated from outdated inputs is discarded (0 rows) instead of stored.
 
+### Master profile (V4)
+
+Both tables hold the owner's personal data (PII; PRODUCTION_READINESS section 11). They are
+read and written through JDBC (`profile.ResumeRepository`, `profile.OwnerProfileRepository`),
+not JPA, because of the `jsonb` and `bytea` columns.
+
+**`resume`**: one row per uploaded CV.
+- `content` is the original PDF (`bytea`); `size_bytes = octet_length(content)` (CHECK).
+  `sha256` (indexed) finds a re-upload of the same file: a non-FAILED row is reused instead of
+  extracted again. Concurrent uploads of one file are serialized with
+  `pg_advisory_xact_lock(hashtext('talentmatch.resume:' || sha256))`.
+- `extracted_text` is the PDF's text layer as sent to the model (NFKC-normalized, format
+  characters removed).
+- `status`: `PENDING` (queued) → `RUNNING` (model reading it) → `SUCCEEDED` | `FAILED`.
+  Every transition is a guarded `UPDATE … WHERE status = …`, so two workers never own one
+  CV. A manual retry puts `FAILED`/`SUCCEEDED` back to `PENDING`.
+- CHECKs: `failure_reason` is set exactly when `FAILED` and is one of `AI_DISABLED`, `TIMEOUT`,
+  `PROVIDER_ERROR`, `REFUSED`, `INVALID_OUTPUT`, `QUEUE_FULL`, `CONTEXT_OVERFLOW`,
+  `TOO_MANY_ATTEMPTS`, `REMOTE_EXTRACTION_DISABLED` (the Java enum `ExtractionFailure`); `draft` (an object) and `warnings`
+  (an array) are set exactly when `SUCCEEDED`, together with `extraction_model`; `RUNNING`
+  needs `extraction_started_at`. Every CHECK uses explicit `IS NOT NULL` (a CHECK that
+  evaluates to NULL passes).
+- `attempts` counts claims since upload or the last manual retry. After 3 (e.g. the app was
+  stopped or crashed mid-extraction three times) the CV becomes `FAILED/TOO_MANY_ATTEMPTS`
+  instead of being re-run on every start.
+- `draft` and `warnings` are the AI-extracted `ProfileDocument` and the grounding warnings
+  (`path`, `value`, `message`) for the owner to review.
+
+**`owner_profile`**: a single row (`id boolean PRIMARY KEY CHECK (id)`): the confirmed
+master profile.
+- `profile` is the reviewed `ProfileDocument` (`jsonb`).
+- `candidate_id` (UNIQUE) is the owner's `candidate` row, kept in sync on every save (name,
+  email, headline + summary, skills with years), so scoring and matching treat the owner
+  like any candidate. `ON DELETE RESTRICT`: deleting that candidate must never silently
+  delete the profile; the API answers `409` first.
+- `resume_id` is the CV the profile came from; `ON DELETE SET NULL` when that upload is
+  deleted (the confirmed profile stays).
+- Saves are serialized with `pg_advisory_xact_lock(hashtext('talentmatch.owner_profile'))`,
+  taken before reading the row, so two first saves cannot create two owner candidates.
+- `version` references the current row of `owner_profile_version`.
+
+**`owner_profile_version`**: append-only history, one row per successful save
+(`version` 1, 2, 3, … = MAX + 1 under the save lock), with the saved `profile`, its `resume_id`
+and `confirmed_at` (equal to `owner_profile.confirmed_at` for the current version). A trigger
+(`owner_profile_version_append_only`) refuses every `DELETE` and every `UPDATE` except the
+foreign key's own `ON DELETE SET NULL` of `resume_id` when an upload is deleted. Phase 7 will
+record which version a tailored CV was built from; Phase 5 refreshes the watchlist when the
+current version changes.
+
 ### `updated_at` and the `set_updated_at()` trigger
-`candidate`, `job`, `skill`, and `job_match` each have an `updated_at`
+`candidate`, `job`, `skill`, `job_match`, `resume` and `owner_profile` each have an `updated_at`
 column. A shared `set_updated_at()` trigger function sets it to `now()` on
 every `UPDATE`, so it stays correct even when the ETL's
 `ON CONFLICT DO UPDATE` upserts don't set it explicitly.

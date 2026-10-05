@@ -145,6 +145,12 @@ public class ExplanationService {
                     continue;
                 }
             }
+            if (generator.localModelBusy()) {
+                // A CV extraction holds the local model for many minutes: don't queue behind it.
+                out.put(row.candidateId(), fresh ? ExplanationResult.ready(stored)
+                        : templateFor(row, hasStored, ExplanationReason.AI_BUSY));
+                continue;
+            }
             Joined joined = join(key, new ExplanationGenerator.GenerationTask(job, row, prompt, hash), regenerate);
             waiting.add(new Waiting(row, joined, fresh, hasStored, stored));
         }

@@ -54,8 +54,9 @@ breakdown, batch recompute, and a consistent error format. Phase 3 (AI explanati
 implemented: LangChain4j explanations for the top matches (local Ollama by default,
 OpenAI/Claude via profiles), persisted with prompt-hash staleness, with a deterministic
 template fallback so every match always has an explanation. The project is now aimed at
-personal job hunting (see [`ROADMAP.md`](./ROADMAP.md)): Phase 4, uploading your CV as a
-structured master profile, is next.
+personal job hunting (see [`ROADMAP.md`](./ROADMAP.md)). Phase 4 (in progress): upload your
+CV as a PDF, let the AI turn it into a draft profile, review it and save it as your master
+profile, which is then matched against jobs like any candidate.
 
 ## Getting Started
 
@@ -104,7 +105,9 @@ curl localhost:8080/actuator/health
 
 Connection settings come from environment variables with local-dev defaults:
 `DB_HOST` (localhost), `DB_PORT` (5432), `DB_NAME` (talentmatch), `DB_USER` (talentmatch),
-`DB_PASSWORD` (talentmatch), plus `DB_POOL_SIZE` and `SERVER_PORT`. If you set `DB_PORT=5433`
+`DB_PASSWORD` (talentmatch), plus `DB_POOL_SIZE`, `SERVER_PORT` and `SERVER_ADDRESS`. The API
+listens on `127.0.0.1` only by default, because it has no authentication and `/api/profile`
+holds your CV; set `SERVER_ADDRESS=0.0.0.0` only on a network you trust. If you set `DB_PORT=5433`
 in `scripts/.env`, export it for the API too (`DB_PORT=5433 ./mvnw spring-boot:run`). If
 the database is unreachable, startup fails with a message telling you how to fix it.
 The `prod` profile (`SPRING_PROFILES_ACTIVE=prod`) has no defaults, requires SSL and does
@@ -166,7 +169,7 @@ Never commit API keys. `regenerate=true` forces fresh explanations for the top m
 limited to once per job per minute (`429` otherwise).
 
 **Slow (CPU-only) machines:** the defaults (`call-timeout` 60s, 2 parallel calls, top 5)
-assume a GPU or a fast CPU. Without a GPU, `qwen2.5:7b-instruct` can write as slowly as ~2
+assume a GPU or a fast CPU. Without a GPU, `qwen2.5:7b-instruct` can write as slowly as ~1.7
 tokens/s (measured on a 4-core, 8 GB WSL2 box), so one explanation (~500 tokens in, ~80 out)
 takes about 2 minutes. Every call then times out, the `ai` circuit opens, and you only ever
 see template explanations. Nothing is broken, the model is just too slow for the defaults.
@@ -188,11 +191,62 @@ OLLAMA_MODEL=qwen2.5:1.5b-instruct TALENTMATCH_AI_CALL_TIMEOUT=120s ./mvnw sprin
 Either way the first request returns `PENDING`. Explanations finish in the background and
 are stored, so later requests return them as `READY` straight away.
 
+**Reading a CV on a slow machine** takes much longer than an explanation, because the model
+copies your whole CV into JSON. At ~1.7 tokens/s, a 2–3 page CV (about 1.3–2.2k tokens in and
+2–3.5k tokens out) takes **20–40 minutes**: a few minutes of prompt evaluation, then the
+writing. The extraction timeout is 60 minutes
+(`TALENTMATCH_PROFILE_EXTRACTION_CALL_TIMEOUT`, at most `2h`). To estimate your time, run
+`ollama run qwen2.5:7b-instruct --verbose "hi"` and read the two rates it prints:
+`prompt eval rate` (tokens/s for reading the input) and `eval rate` (tokens/s for writing).
+Roughly: minutes ≈ (input tokens ÷ prompt eval rate + output tokens ÷ eval rate) ÷ 60. Keep
+the computer **awake** (no sleep or hibernate) until the CV shows `SUCCEEDED`; if the app stops
+meanwhile, the CV is read again from the start on the next start. While a CV is being read,
+match explanations show templates (`reason: "AI_BUSY"`).
+
 **WSL note:** Ollama installed on Windows listens on Windows' `127.0.0.1`. From WSL2, either
 enable mirrored networking (`networkingMode=mirrored` under `[wsl2]` in
 `%UserProfile%\.wslconfig`, then `wsl --shutdown`), or set `OLLAMA_HOST=0.0.0.0` on Windows
 and `OLLAMA_BASE_URL=http://<windows-host-ip>:11434` in WSL. Alternatively run Ollama inside
 WSL or via Docker Desktop (the Docker command above).
+
+### Quick start (your profile from a CV)
+
+With the API running (and Ollama, as above), upload your CV as a PDF (text-based, at most
+5 MB; a scanned image won't work):
+
+```bash
+curl -i -F "file=@/path/to/cv.pdf" localhost:8080/api/profile/resume
+# 202 Accepted, Location: /api/profile/resume/<resume-id>
+```
+
+The AI reads it in the background. Poll until `status` is `SUCCEEDED` (or `FAILED`, whose
+`message` says what to do):
+
+```bash
+curl -s localhost:8080/api/profile/resume/<resume-id> | jq '{status, message, warnings}'
+```
+
+Check the `draft` and each `warnings` entry (things the AI returned that aren't in your CV, or
+years it removed). Then save the draft, edited as needed, as your master profile:
+
+```bash
+curl -s localhost:8080/api/profile/resume/<resume-id> \
+  | jq '{resumeId: .id, createMissingSkills: true, profile: .draft}' > profile.json
+# edit profile.json, then:
+curl -s -X PUT -H 'Content-Type: application/json' -d @profile.json localhost:8080/api/profile
+```
+
+The response's `candidateId` is you as a candidate: your matches appear in
+`GET /api/jobs/<job-id>/matches`. `GET /api/profile` shows the saved profile,
+`GET /api/profile/resumes` lists your uploads and `DELETE /api/profile/resume/<id>` removes one.
+With `createMissingSkills: false` (the default), skills that aren't in the skill table are
+reported as errors instead of created. Without AI (`AI_ENABLED=false`) the upload ends as
+`FAILED/AI_DISABLED`; write `profile.json` by hand and `PUT` it the same way.
+
+Your CV stays on your machine with the default Ollama provider. With the `claude` or
+`openai` profile the upload ends as `FAILED/REMOTE_EXTRACTION_DISABLED` unless you opt in with
+`TALENTMATCH_PROFILE_ALLOW_REMOTE_EXTRACTION=true`; then its whole text is sent to that
+provider. Each save creates a new profile `version` (earlier ones are kept as history).
 
 _(Full-stack `docker-compose up` instructions will be added once the backend and
 frontend land.)_

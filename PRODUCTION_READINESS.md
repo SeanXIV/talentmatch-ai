@@ -34,6 +34,9 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Production:** recorded consent; a retention and deletion policy
     (including `job_match` rows and explanations); encryption at rest (RDS)
     and in transit (TLS); never copy real PII into dev/test.
+  - **Known exception (Phase 4):** the app's purpose is the owner's own job search, so the
+    owner's real CV *is* in the dev database (`resume`, `owner_profile`, the owner's
+    `candidate` row). See section 11, "CV personal data at rest".
   - **Why:** legal obligations (e.g. GDPR) and user trust.
   - **When:** before first prod deploy.
 
@@ -275,6 +278,18 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Why:** candidate PII, LLM cost abuse.
   - **When:** before first prod deploy.
 
+- [ ] **Profile endpoints expose the owner's CV without auth**
+  - **Now (dev, Phase 4):** `GET /api/profile` returns name, email and phone without any id;
+    `GET /api/profile/resume/{id}/file` returns the PDF; `GET /api/profile/resumes` lists every
+    upload. Mitigation: the server binds to loopback by default
+    (`server.address: ${SERVER_ADDRESS:127.0.0.1}` in `application.yml`), so other machines on
+    the network can't reach it. Setting `SERVER_ADDRESS=0.0.0.0`, or WSL mirrored networking with
+    a Windows firewall rule, puts the profile on the LAN.
+  - **Production:** authentication on every `/api/profile` endpoint (owner only), HTTPS, and no
+    profile data in access logs.
+  - **Why:** the CV is the owner's personal data.
+  - **When:** before the app listens on anything but loopback (Phase 9 at the latest).
+
 ## 7. Observability & operations
 
 - [ ] **Health, logs, metrics, alerts**
@@ -411,11 +426,16 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **When:** Phase 5.
 
 - [ ] **Uploaded CV files**
-  - **Now (dev):** not built yet.
-  - **Production:** size and type limits, content-type sniffing (not just the extension),
-    files stored outside the web root, encrypted at rest and covered by backups and the
-    retention policy (section 1).
-  - **When:** Phase 4.
+  - **Now (Phase 4):** built. PDF only, at most 5 MB (`talentmatch.profile.max-resume-bytes`;
+    Spring's multipart limits 6/7 MB sit above it so our 413 message wins, and
+    `server.tomcat.max-swallow-size: 10MB` lets oversized uploads get the 413 JSON instead of a
+    connection reset). The type is sniffed from the `%PDF-` magic bytes, not the extension or
+    content type. The file is stored **in the database** (`resume.content`, `bytea`), never on
+    disk or under a web root; downloads are `attachment` with `X-Content-Type-Options: nosniff`.
+    Not encrypted at rest and not yet covered by a retention policy (section 11).
+  - **Production:** encryption at rest, backups, and the retention policy (section 1); see
+    section 11 for the parser and storage items.
+  - **When:** before first prod deploy.
 
 - [ ] **Never-invent check on tailored documents**
   - **Now (dev):** not built yet.
@@ -433,3 +453,158 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     provider (quality and speed vs. cost and sending the CV off the machine).
   - **When:** before Phase 7 (extraction in Phase 4 can run async on the local model).
 
+## 11. Master profile and CV extraction (Phase 4)
+
+- [ ] **CV personal data at rest**
+  - **Now (dev):** the owner's real CV is stored unencrypted in PostgreSQL: the PDF
+    (`resume.content`, `bytea`), its full text (`resume.extracted_text`), the AI draft
+    (`resume.draft`, `jsonb`), the confirmed profile (`owner_profile.profile`) and every earlier
+    confirmed version (`owner_profile_version`, append-only), plus name,
+    email and summary in the owner's `candidate` row. The dev Docker volume therefore holds real
+    PII, which section 1 otherwise forbids. Uploads can be deleted
+    (`DELETE /api/profile/resume/{id}`); the confirmed profile has no delete endpoint yet.
+  - **Production:** encryption at rest (disk/RDS, or column-level for `content` and
+    `extracted_text`), backups covered by the retention policy, a "delete my profile" action,
+    and never restoring a production dump into dev.
+  - **Why:** a CV is personal data (contact details, employment history).
+  - **When:** before first prod deploy.
+
+- [ ] **Upload retention** (DECIDED 2026-10-05: keep until the owner deletes)
+  - **Now (dev):** every upload is kept until the owner deletes it with
+    `DELETE /api/profile/resume/{id}`, including FAILED and superseded ones
+    (`GET /api/profile/resumes` lists them). Nothing is purged automatically.
+  - **Production:** automatic retention (e.g. delete file and text N days after a newer CV is
+    confirmed, or after account closure) as part of the PII policy (section 1).
+  - **When:** before first prod deploy.
+
+- [ ] **CV sent to a hosted provider only with an explicit flag** (DECIDED 2026-10-05)
+  - **Now (dev):** with the default Ollama provider the CV never leaves the machine. With
+    `SPRING_PROFILES_ACTIVE=claude` or `openai`, CV extraction is **refused** unless
+    `talentmatch.profile.allow-remote-extraction=true` (default `false`): the CV is marked
+    `FAILED/REMOTE_EXTRACTION_DISABLED` and the provider is never called. With the flag, the
+    whole CV text is sent to that provider. (Match explanations with a hosted profile still send
+    names and summaries, section 4.)
+  - **Production:** the provider's DPA and data-retention terms, and a note in the UI before
+    upload when the flag is on (section 4, "Candidate PII sent to third-party providers").
+  - **When:** before turning the flag on with a real CV.
+
+- [ ] **PDF parsing of untrusted files**
+  - **Now (dev):** PDFBox runs in the app's JVM. Bounds: 5 MB upload, 20 pages, PDFBox stream
+    cache limited to 64 MB of heap (the rest spills to temp files), a 30-second parse limit on a
+    2-thread pool (`resumeParserExecutor`, queue 4, then `503 UPLOAD_BUSY`), text extraction
+    stops at 4 × `max-text-chars`, and every parser exception becomes `400 RESUME_UNREADABLE`
+    (never a 500). Remaining risks: a decompression bomb can still use CPU and temp-disk space
+    within those limits; a timed-out parse is abandoned, but PDFBox doesn't check for
+    interruption, so its thread keeps working until it finishes (at most 2 such threads, after
+    which uploads get 503).
+  - **Production:** parse in a sandboxed, resource-limited process or container (CPU, memory,
+    disk, wall-clock limits) that can be killed, and malware-scan uploads.
+  - **Why:** PDF is a complex format with a long history of parser bugs.
+  - **When:** before accepting uploads from anyone but the owner.
+
+- [ ] **Multipart temp files on disk**
+  - **Now (dev):** Tomcat/Spring may buffer an upload in a temp file
+    (`java.io.tmpdir`) while the request is handled; Spring deletes it afterwards, but a crash
+    can leave a CV copy in the temp directory. PDFBox can also spill stream data to temp files.
+  - **Production:** a private, encrypted temp directory (`spring.servlet.multipart.location`)
+    that is wiped on start, or `file-size-threshold` high enough to keep uploads in memory.
+  - **When:** before first prod deploy.
+
+- [ ] **Single-instance, in-process extraction queue**
+  - **Now (dev):** extraction runs on one in-process thread (`profileExecutor`, queue 10; a
+    full queue gives `FAILED/QUEUE_FULL`). State lives in the `resume` row, so nothing is lost
+    on restart: a shutdown leaves the interrupted CV `RUNNING`, and `ProfileRecovery` puts
+    `RUNNING` rows back to `PENDING` and re-queues every `PENDING` CV on start. Each claim
+    counts an attempt (`resume.attempts`); after 3 the CV is `FAILED/TOO_MANY_ATTEMPTS`, so a CV
+    that crashes the JVM is not re-run forever (a manual retry resets the count). Two app
+    instances would both reset and re-queue the same rows (claims are guarded, so each CV still
+    runs once at a time, but recovery could reset a row another instance is processing).
+  - **Production:** a real queue/worker with leases and heartbeats, or one designated worker
+    instance.
+  - **When:** before running more than one instance.
+
+- [ ] **Explanations and CV extraction share one local model**
+  - **Now (dev):** both Ollama models send the same `num_ctx`
+    (`talentmatch.ai.ollama.context-tokens`, default 12288), because a different value per
+    request makes Ollama reload the ~4.7 GB model. A CV extraction holds the model exclusively
+    (`LocalModelGate`, Ollama only) for its 20–40 minutes; meanwhile match explanations return
+    templates with reason `AI_BUSY` (not counted as provider failures, so the circuit stays
+    closed). The 12288 context costs ~0.7 GB of KV cache on top of the model.
+  - **Production:** a GPU host, or separate model servers for interactive explanations and
+    batch extraction.
+  - **Why:** one CPU-bound model can't serve both without starving one of them.
+  - **When:** before relying on AI explanations while CVs are being read.
+
+- [ ] **Extraction speed on CPU-only machines**
+  - **Now (dev):** at ~1.7 tokens/s a 2–3 page CV (≈1.3–2.2k tokens in, 2–3.5k tokens of JSON
+    out) takes 20–40 minutes; `talentmatch.profile.extraction.call-timeout` is 60m (max 2h). The
+    laptop must stay awake. CVs longer than `max-text-chars` (16000) are truncated with a
+    warning; a startup check refuses a `context-tokens` that can't hold
+    `ceil(max-text-chars/3) + 1000 + max-output-tokens`, and a call that used the whole context
+    anyway fails with `CONTEXT_OVERFLOW` instead of producing a draft from a cut-off CV.
+  - **Production:** GPU or hosted model (section 10, "Model choice for CV extraction and
+    tailoring").
+  - **When:** with the model decision.
+
+- [ ] **Local model memory**
+  - **Now (dev):** checked 2026-10-05: WSL has ~8.7 GB and PostgreSQL runs in Docker
+    Desktop's own VM, so `qwen2.5:7b-instruct` (~4.7 GB) plus the 12288-token context (~0.7 GB
+    KV cache) fits. A smaller machine needs a smaller model or a lower `context-tokens` (with a
+    lower `max-text-chars`; the startup check says how much).
+  - **When:** whenever the model or host changes.
+
+- [ ] **Hand-built extraction schema must track `ProfileDocument`**
+  - **Now (dev):** the LLM response schema is built by hand (`ProfileJsonSchema`) so optional
+    fields can be `null`: LangChain4j 1.20.2's record-derived schema marks no field required but
+    never allows `null` (wire probe, 2026-10-05), so under Ollama's grammar a model told to answer
+    null must write a value instead, which forces invented years and "N/A" placeholders.
+    Placeholders that still slip through are turned into null, and skill years are dropped
+    unless the CV states the number next to the skill.
+  - **Production:** a unit test that compares the schema's properties with the record
+    components; revisit when LangChain4j supports nullable record fields.
+  - **When:** whenever `ProfileDocument` changes.
+
+- [ ] **Grounding is heuristic**
+  - **Now (dev):** `ResumeGrounding` warns when a skill, employer, title, project, technology,
+    certification, issuer, institution or qualification is not in the CV text, and drops skill
+    years not stated within ~60 characters of the skill name. `ResumeFactCheck` warns (never
+    drops) when a number in the summary, a description or a highlight, the year of a date, the
+    email, the phone (digits only) or a link (without scheme/`www.`) is not in the CV text, and
+    when under 70% of a highlight's content words (4+ letters) are in the CV ("reworded").
+    Not checked: location, languages, credential ids; word-level checks miss changed meaning
+    with the same words, and numbers are matched anywhere in the CV, not in context.
+  - **Production:** a golden-set evaluation of extraction (section 4, "Offline model
+    evaluation"), and the stricter Phase 7 validator for tailored documents.
+  - **When:** before Phase 7.
+
+- [ ] **Near-duplicate skills**
+  - **Now (dev):** saving a profile with `createMissingSkills=true` warns (does not block) when
+    a new skill looks like an existing one (same letters ignoring case, punctuation and a
+    trailing version, or one name extends the other by up to 3 characters, e.g. "Postgres" vs
+    "PostgreSQL"). It's a heuristic; it misses true synonyms ("JS" vs "JavaScript").
+  - **Production:** a curated alias table (synonyms, versions) used by `SkillResolver`.
+  - **Why:** duplicate skill rows split matching and the Phase 5 watchlist.
+  - **When:** Phase 5.
+
+- [x] **Profile version history** (DECIDED and built 2026-10-05)
+  - **Now:** every successful `PUT /api/profile` appends a row to the append-only
+    `owner_profile_version` table (a trigger refuses UPDATE/DELETE); `owner_profile.version`
+    points at the current one and `ProfileResponse.version` returns it. Phase 7 records the
+    version a tailored CV was built from; Phase 5 refreshes the watchlist when it changes.
+  - **Still open:** history rows are kept forever, which collides with a future "delete my
+    profile" (needs an admin purge path) and the retention policy (section 1).
+
+- [x] **First save with an email an existing candidate already uses** (DECIDED 2026-10-05: reject)
+  - **Now:** the first `PUT /api/profile` returns `409 EMAIL_ALREADY_EXISTS` on field
+    `profile.email` ("Candidate <id> already uses this email. Delete it or change its email,
+    then save your profile again."). An existing candidate is never adopted or merged.
+
+- [ ] **PII-safe logging is by convention**
+  - **Now (dev):** the PostgreSQL driver is told not to put failing rows in error messages
+    (`spring.datasource.hikari.data-source-properties.logServerErrorDetail: false`, which also
+    hides row details for non-profile errors). The profile code and the 500 handler for
+    `/api/profile` log exception class names (plus SQLState) only, never messages, because
+    model parse errors quote the model's output.
+  - **Production:** structured logging with a PII scrubber and a test that scans captured
+    logs for CV content.
+  - **When:** before first prod deploy.

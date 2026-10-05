@@ -44,6 +44,7 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.HttpStatusCode;
+import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.jdbc.CannotGetJdbcConnectionException;
@@ -66,6 +67,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.HandlerMethodValidationException;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.multipart.MultipartException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
 /**
@@ -261,9 +264,26 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(HttpMediaTypeNotSupportedException.class)
     ResponseEntity<ApiError> unsupportedMediaType(HttpMediaTypeNotSupportedException ex, HttpServletRequest req) {
         String type = ex.getContentType() == null ? "(none)" : echo(ex.getContentType().toString());
+        boolean upload = ex.getSupportedMediaTypes().stream().anyMatch(MediaType.MULTIPART_FORM_DATA::includes);
+        String hint = upload
+                ? "Upload the file as multipart/form-data, in a form field named 'file'."
+                : "Send JSON with Content-Type: application/json.";
         return respond(HttpStatus.UNSUPPORTED_MEDIA_TYPE, ErrorCode.UNSUPPORTED_MEDIA_TYPE,
-                "Content type '" + type + "' is not supported. Send JSON with Content-Type: application/json.",
-                List.of(), req, null);
+                "Content type '" + type + "' is not supported. " + hint, List.of(), req, null);
+    }
+
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    ResponseEntity<ApiError> uploadTooLarge(MaxUploadSizeExceededException ex, HttpServletRequest req) {
+        return respond(HttpStatus.PAYLOAD_TOO_LARGE, ErrorCode.PAYLOAD_TOO_LARGE,
+                "The uploaded file is too large. A CV must be a PDF of at most a few megabytes; export it again "
+                        + "with smaller images, or remove pages that aren't your CV.", List.of(), req, null);
+    }
+
+    @ExceptionHandler(MultipartException.class)
+    ResponseEntity<ApiError> badMultipart(MultipartException ex, HttpServletRequest req) {
+        return respond(HttpStatus.BAD_REQUEST, ErrorCode.MALFORMED_REQUEST,
+                "The upload could not be read. Send it as multipart/form-data with the file in a form field "
+                        + "named 'file'.", List.of(), req, null);
     }
 
     @ExceptionHandler(HttpMediaTypeNotAcceptableException.class)
@@ -303,6 +323,24 @@ public class GlobalExceptionHandler {
 
     // ------------------------------------------------------------------ 500
 
+    /** Endpoints whose failures may carry personal data (CV text, profile) in exception messages. */
+    private static final String PII_PATH_PREFIX = "/api/profile";
+
+    private static String classChain(Throwable ex) {
+        StringBuilder sb = new StringBuilder();
+        int depth = 0;
+        for (Throwable t = ex; t != null && depth < 16; t = t.getCause() == t ? null : t.getCause(), depth++) {
+            if (!sb.isEmpty()) {
+                sb.append(" <- ");
+            }
+            sb.append(t.getClass().getName());
+            if (t instanceof java.sql.SQLException sql && sql.getSQLState() != null) {
+                sb.append("[SQLState ").append(sql.getSQLState()).append(']');
+            }
+        }
+        return sb.toString();
+    }
+
     @ExceptionHandler(Exception.class)
     ResponseEntity<ApiError> unexpected(Exception ex, HttpServletRequest req) {
         // Before the 500 path: covers wrappers such as JpaSystemException/TransactionSystemException
@@ -323,7 +361,14 @@ public class GlobalExceptionHandler {
             }
         }
         String requestId = RequestIdFilter.currentRequestId(req);
-        log.error("Unexpected error on {} {} (request {})", req.getMethod(), req.getRequestURI(), requestId, ex);
+        if (req.getRequestURI().startsWith(PII_PATH_PREFIX)) {
+            // Profile requests carry CV data, and exception messages (PostgreSQL row details, JSON
+            // parse errors) can quote it: log the exception classes only.
+            log.error("Unexpected error on {} {} (request {}): {}", req.getMethod(), req.getRequestURI(), requestId,
+                    classChain(ex));
+        } else {
+            log.error("Unexpected error on {} {} (request {})", req.getMethod(), req.getRequestURI(), requestId, ex);
+        }
         return respond(HttpStatus.INTERNAL_SERVER_ERROR, ErrorCode.INTERNAL_ERROR,
                 "Something went wrong on our side. Quote request id " + requestId + " if you report it.",
                 List.of(), req, null);

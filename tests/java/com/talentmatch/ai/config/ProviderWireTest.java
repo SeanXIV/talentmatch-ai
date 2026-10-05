@@ -59,7 +59,7 @@ class ProviderWireTest {
     private AiProperties props(AiProvider provider, AiProperties.Claude claude) {
         return new AiProperties(true, provider, 5, Duration.ofSeconds(5), Duration.ofSeconds(8), 2, 20, 2000,
                 Duration.ofSeconds(60), Duration.ofSeconds(60), null,
-                new AiProperties.Ollama(stub.baseUrl(), null, 0.2, 400),
+                new AiProperties.Ollama(stub.baseUrl(), null, 0.2, 400, 12288),
                 new AiProperties.OpenAi("sk-openai-fake", stub.baseUrl() + "/v1", null, 0.2, 500),
                 claude);
     }
@@ -146,7 +146,9 @@ class ProviderWireTest {
 
         System.out.println("CLAUDE_REFUSAL_OUTCOME " + o);
         assertThat(o).isInstanceOf(GenerationOutcome.Failure.class);
-        assertThat(((GenerationOutcome.Failure) o).kind()).isIn(FailureKind.REFUSED, FailureKind.INVALID_OUTPUT);
+        // N8: pinned to the observed value. AiServices parses the (empty) refusal text before it looks at
+        // stop_reason, so a Claude refusal surfaces as INVALID_OUTPUT; neither counts as a provider fault.
+        assertThat(((GenerationOutcome.Failure) o).kind()).isEqualTo(FailureKind.INVALID_OUTPUT);
         org.mockito.Mockito.verifyNoInteractions(repo);
         assertThat(circuit.consecutiveFailures()).as("a refusal is not a provider fault").isZero();
     }
@@ -208,6 +210,237 @@ class ProviderWireTest {
         assertThat(r.finishReason()).isEqualTo(FinishReason.STOP);
         assertThat(r.tokenUsage().inputTokenCount()).isEqualTo(111);
         assertThat(r.tokenUsage().outputTokenCount()).isEqualTo(22);
+    }
+
+    // ------------------------------------------------------------------ Ollama CV extraction (Phase 4, B3)
+
+    static final String CV_JSON = "{\"fullName\":\"Ada Lovelace\",\"email\":null,\"phone\":null,\"location\":null,"
+            + "\"headline\":null,\"summary\":null,\"links\":[],\"experience\":[{\"title\":\"Engineer\","
+            + "\"company\":\"Acme\",\"location\":null,\"startDate\":\"2020-01\",\"endDate\":null,\"current\":true,"
+            + "\"highlights\":[]}],\"projects\":[],\"skills\":[{\"name\":\"Java\",\"years\":null}],"
+            + "\"certifications\":[],\"education\":[],\"languages\":[]}";
+
+    private static com.talentmatch.profile.ProfileProperties profileProps() {
+        return new com.talentmatch.profile.ProfileProperties(5_242_880, 16_000, null, false);
+    }
+
+    private String ollamaCvResponse() throws Exception {
+        return "{\"model\":\"qwen2.5:7b-instruct\",\"created_at\":\"2026-10-05T09:00:00Z\","
+                + "\"message\":{\"role\":\"assistant\",\"content\":" + JSON.writeValueAsString(CV_JSON) + "},"
+                + "\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":1500,\"eval_count\":300}";
+    }
+
+    /** Captures the Ollama request of one extraction through the production extraction wiring. */
+    private JsonNode ollamaExtractionRequest() throws Exception {
+        stub.respond(200, ollamaCvResponse());
+        com.talentmatch.profile.ResumeExtractionModel model = new OllamaChatModelConfig()
+                .ollamaResumeExtractionModel(props(AiProvider.OLLAMA, null), profileProps());
+        dev.langchain4j.model.chat.response.ChatResponse r = model.chatModel().chat(extractionRequest());
+        assertThat(r.aiMessage().text()).isEqualTo(CV_JSON);
+        assertThat(model.contextTokens()).isEqualTo(12288);
+        String body = stub.last().body();
+        System.out.println("OLLAMA_EXTRACTION_REQUEST_BODY " + body);
+        return JSON.readTree(body);
+    }
+
+    /** Same shape as ResumeExtractionService.request (package-private): system + fenced CV + schema. */
+    static dev.langchain4j.model.chat.request.ChatRequest extractionRequest() {
+        return dev.langchain4j.model.chat.request.ChatRequest.builder()
+                .messages(dev.langchain4j.data.message.SystemMessage.from(
+                                com.talentmatch.profile.ResumeExtractionPrompts.SYSTEM),
+                        dev.langchain4j.data.message.UserMessage.from(
+                                com.talentmatch.profile.ResumeExtractionPrompts.userMessage("Ada Lovelace, Engineer at Acme")))
+                .responseFormat(com.talentmatch.profile.ProfileJsonSchema.responseFormat())
+                .build();
+    }
+
+    /** True if the schema node allows JSON null (type includes "null", or an anyOf/oneOf branch is null). */
+    static boolean allowsNull(JsonNode schema) {
+        if (schema == null || schema.isMissingNode()) {
+            return false;
+        }
+        JsonNode type = schema.get("type");
+        if (type != null && (type.asText().equals("null")
+                || (type.isArray() && java.util.stream.StreamSupport.stream(type.spliterator(), false)
+                        .anyMatch(t -> t.asText().equals("null"))))) {
+            return true;
+        }
+        for (String combo : List.of("anyOf", "oneOf")) {
+            if (schema.has(combo)) {
+                for (JsonNode branch : schema.get(combo)) {
+                    if (allowsNull(branch)) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /** An optional field may be omitted (not in required) or set to null (nullable). */
+    static boolean optional(JsonNode objectSchema, String field) {
+        JsonNode required = objectSchema.get("required");
+        boolean isRequired = required != null && java.util.stream.StreamSupport.stream(required.spliterator(), false)
+                .anyMatch(r -> r.asText().equals(field));
+        return !isRequired || allowsNull(objectSchema.at("/properties/" + field));
+    }
+
+    /** Resolves "items" of an array property, following a local $ref/$defs if used. */
+    static JsonNode items(JsonNode root, JsonNode objectSchema, String arrayField) {
+        JsonNode prop = objectSchema.at("/properties/" + arrayField);
+        JsonNode items = prop.has("items") ? prop.get("items") : firstNonNullBranch(prop).get("items");
+        return deref(root, items);
+    }
+
+    private static JsonNode firstNonNullBranch(JsonNode n) {
+        for (String combo : List.of("anyOf", "oneOf")) {
+            if (n.has(combo)) {
+                for (JsonNode b : n.get(combo)) {
+                    if (!"null".equals(b.path("type").asText())) {
+                        return b;
+                    }
+                }
+            }
+        }
+        return n;
+    }
+
+    private static JsonNode deref(JsonNode root, JsonNode n) {
+        if (n != null && n.has("$ref")) {
+            String ref = n.get("$ref").asText();
+            return root.at(ref.substring(1));
+        }
+        return n;
+    }
+
+    /** DECIDES B3: optional CV fields must be nullable or not required, or the grammar forces invented values. */
+    @Test
+    void ollamaExtractionSchemaLetsOptionalFieldsBeNull() throws Exception {
+        JsonNode body = ollamaExtractionRequest();
+        JsonNode format = body.get("format");
+        assertThat(format != null && format.isObject()).as("format = JSON schema: %s", body).isTrue();
+        System.out.println("B3_FORMAT_SCHEMA " + format);
+
+        List<String> notOptional = new java.util.ArrayList<>();
+        for (String f : List.of("fullName", "email", "phone", "location", "headline", "summary")) {
+            if (!optional(format, f)) {
+                notOptional.add(f);
+            }
+        }
+        JsonNode skill = items(format, format, "skills");
+        if (!optional(skill, "years")) {
+            notOptional.add("skills[].years");
+        }
+        JsonNode exp = items(format, format, "experience");
+        for (String f : List.of("title", "company", "endDate", "startDate", "location", "current")) {
+            if (!optional(exp, f)) {
+                notOptional.add("experience[]." + f);
+            }
+        }
+        JsonNode cert = items(format, format, "certifications");
+        for (String f : List.of("issuer", "expires", "credentialId", "url")) {
+            if (!optional(cert, f)) {
+                notOptional.add("certifications[]." + f);
+            }
+        }
+        assertThat(notOptional).as("fields forced to a non-null value by the Ollama grammar; schema=%s", format)
+                .isEmpty();
+        // the hand-built schema: optional fields are nullable AND required (keys are never omitted)
+        for (JsonNode[] objField : new JsonNode[][] {{format, JSON.valueToTree("email")},
+                {skill, JSON.valueToTree("years")}, {exp, JSON.valueToTree("endDate")}}) {
+            String f = objField[1].asText();
+            assertThat(allowsNull(objField[0].at("/properties/" + f))).as("%s nullable", f).isTrue();
+            assertThat(objField[0].get("required")).as("%s required", f).anyMatch(r -> r.asText().equals(f));
+        }
+        assertThat(allowsNull(skill.at("/properties/name"))).as("skills[].name is never null").isFalse();
+    }
+
+    @Test
+    void ollamaExtractionOptions() throws Exception {
+        JsonNode body = ollamaExtractionRequest();
+        com.talentmatch.profile.ProfileProperties p = profileProps();
+        assertThat(body.at("/options/num_ctx").asInt()).as("shared num_ctx (B2/S8)").isEqualTo(12288);
+        assertThat(body.at("/options/num_predict").asInt()).isEqualTo(p.extraction().maxOutputTokens());
+        assertThat(body.at("/options/temperature").isMissingNode()).as("temperature sent: %s", body).isFalse();
+        assertThat(body.at("/options/temperature").asDouble()).as("N6: extraction temperature 0").isEqualTo(0.0);
+    }
+
+    @Test
+    void ollamaExplanationUsesTheSameNumCtxAsExtraction() throws Exception {
+        stub.respond(200, "{\"model\":\"qwen2.5:7b-instruct\",\"created_at\":\"2026-10-02T09:00:00Z\","
+                + "\"message\":{\"role\":\"assistant\",\"content\":" + JSON.writeValueAsString(ANSWER) + "},"
+                + "\"done\":true,\"done_reason\":\"stop\",\"prompt_eval_count\":1,\"eval_count\":1}");
+        assistant(new OllamaChatModelConfig().ollamaChatModel(props(AiProvider.OLLAMA, null))).explain(USER);
+        int explanationCtx = JSON.readTree(stub.last().body()).at("/options/num_ctx").asInt();
+        int extractionCtx = ollamaExtractionRequest().at("/options/num_ctx").asInt();
+        assertThat(explanationCtx).as("S8: a different num_ctx makes Ollama reload the model").isEqualTo(12288)
+                .isEqualTo(extractionCtx);
+    }
+
+    @Test
+    void ollamaContextBudgetIsCheckedAtStartup() {
+        AiProperties ai = new AiProperties(true, AiProvider.OLLAMA, 5, Duration.ofSeconds(5), Duration.ofSeconds(8), 2,
+                20, 2000, Duration.ofSeconds(60), Duration.ofSeconds(60), null,
+                new AiProperties.Ollama(stub.baseUrl(), null, 0.2, 400, 8192), null, null);
+        com.talentmatch.profile.ProfileProperties big = new com.talentmatch.profile.ProfileProperties(5_242_880, 24_000,
+                null, false);
+        Throwable t = org.assertj.core.api.Assertions.catchThrowable(() ->
+                new OllamaChatModelConfig().ollamaResumeExtractionModel(ai, big));
+        assertThat(t).isInstanceOf(AiConfigurationException.class)
+                .hasMessageContaining("context-tokens is 8192").hasMessageContaining("13096");
+        // the defaults fit exactly: 16000/3 -> 5334 + 1000 + 4096 = 10430 <= 12288
+        assertThat(profileProps().requiredContextTokens()).isEqualTo(10430);
+    }
+
+    @Test
+    void openAiExtractionRequestBody() throws Exception {
+        stub.respond(200, "{\"id\":\"chatcmpl-2\",\"object\":\"chat.completion\",\"created\":1,"
+                + "\"model\":\"gpt-4.1-mini\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\","
+                + "\"content\":" + JSON.writeValueAsString(CV_JSON) + "},\"finish_reason\":\"stop\"}],"
+                + "\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}");
+        com.talentmatch.profile.ResumeExtractionModel model = new OpenAiChatModelConfig()
+                .openAiResumeExtractionModel(props(AiProvider.OPENAI, null), profileProps());
+        model.chatModel().chat(extractionRequest());
+        JsonNode body = JSON.readTree(stub.last().body());
+        System.out.println("OPENAI_EXTRACTION_REQUEST_BODY " + body);
+        assertThat(body.get("max_completion_tokens").asInt()).isEqualTo(4096);
+        assertThat(body.at("/temperature").asDouble()).isEqualTo(0.0);
+        assertThat(body.at("/response_format/type").asText()).isEqualTo("json_schema");
+        assertThat(body.at("/response_format/json_schema/strict").asBoolean()).as("non-strict for extraction").isFalse();
+        JsonNode schema = body.at("/response_format/json_schema/schema");
+        assertThat(allowsNull(schema.at("/properties/email"))).as("schema=%s", schema).isTrue();
+        assertThat(model.contextTokens()).as("provider-managed context").isNull();
+    }
+
+    @Test
+    void claudeExtractionRequestBody() throws Exception {
+        stub.respond(200, claudeResponse(CV_JSON, "end_turn"));
+        com.talentmatch.profile.ResumeExtractionModel model = new ClaudeChatModelConfig()
+                .claudeResumeExtractionModel(claudeProps(""), profileProps());
+        dev.langchain4j.model.chat.response.ChatResponse r = model.chatModel().chat(extractionRequest());
+        String raw = stub.last().body();
+        System.out.println("CLAUDE_EXTRACTION_REQUEST_BODY " + raw);
+        assertThat(duplicateKeys(raw)).as("duplicate keys; body=%s", raw).isEmpty();
+        JsonNode body = JSON.readTree(raw);
+        assertThat(body.get("max_tokens").asInt()).isGreaterThanOrEqualTo(16000);
+        assertThat(body.at("/output_config/effort").isMissingNode()).isTrue();
+        assertThat(body.at("/output_config/format/type").asText()).isEqualTo("json_schema");
+        for (String forbidden : List.of("temperature", "top_p", "top_k")) {
+            assertThat(body.has(forbidden)).as(forbidden).isFalse();
+        }
+        assertThat(raw).contains("<cv>").doesNotContain("budget_tokens");
+        assertThat(r.aiMessage().text()).isEqualTo(CV_JSON);
+    }
+
+    @Test
+    void claudeExtractionRefusalMapsToANonStopFinishReason() throws Exception {
+        stub.respond(200, claudeResponse("", "refusal"));
+        com.talentmatch.profile.ResumeExtractionModel model = new ClaudeChatModelConfig()
+                .claudeResumeExtractionModel(claudeProps(""), profileProps());
+        dev.langchain4j.model.chat.response.ChatResponse r = model.chatModel().chat(extractionRequest());
+        System.out.println("CLAUDE_EXTRACTION_REFUSAL finish=" + r.finishReason() + " text='" + r.aiMessage().text() + "'");
+        assertThat(r.finishReason()).as("ResumeExtractionService maps any non-STOP finish to REFUSED")
+                .isNotNull().isNotEqualTo(FinishReason.STOP).isNotEqualTo(FinishReason.LENGTH);
     }
 
     // ------------------------------------------------------------------ OpenAI

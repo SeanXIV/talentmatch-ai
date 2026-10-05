@@ -10,6 +10,9 @@ import com.talentmatch.ai.ExplanationAssistant;
 import com.talentmatch.ai.ExplanationGenerator;
 import com.talentmatch.ai.ExplanationRateLimiter;
 import com.talentmatch.ai.ExplanationService;
+import com.talentmatch.ai.LocalModelGate;
+import com.talentmatch.config.ProfileConfig;
+import com.talentmatch.profile.ResumeExtractionModel;
 import com.talentmatch.repository.MatchJdbcRepository;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
 import dev.langchain4j.model.chat.Capability;
@@ -30,7 +33,7 @@ class AiProviderWiringTest {
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
             .withUserConfiguration(AiConfiguration.class, AiCircuitBreaker.class, ExplanationRateLimiter.class,
-                    ExplanationService.class, AiHealthIndicator.class)
+                    ExplanationService.class, AiHealthIndicator.class, ProfileConfig.class)
             .withBean(MatchJdbcRepository.class, () -> mock(MatchJdbcRepository.class))
             // never reach a real local Ollama
             .withPropertyValues("talentmatch.ai.ollama.base-url=http://localhost:1");
@@ -60,6 +63,57 @@ class AiProviderWiringTest {
             assertThat(p.claude().effort()).isEmpty();
             assertThat(p.circuit().failureThreshold()).isEqualTo(3);
         });
+    }
+
+    /** Phase 4: exactly one extraction model per provider, and still exactly one ChatModel bean. */
+    @Test
+    void ollamaHasOneExtractionModelSharingNumCtxAndALocalModelGate() {
+        runner.run(ctx -> {
+            assertThat(ctx).hasNotFailed();
+            assertThat(ctx.getBeansOfType(ChatModel.class)).hasSize(1);
+            assertThat(ctx).hasSingleBean(ResumeExtractionModel.class).hasSingleBean(LocalModelGate.class);
+            ResumeExtractionModel m = ctx.getBean(ResumeExtractionModel.class);
+            assertThat(m.chatModel()).isInstanceOf(OllamaChatModel.class).isNotSameAs(ctx.getBean(ChatModel.class));
+            assertThat(m.label()).isEqualTo("ollama/qwen2.5:7b-instruct");
+            assertThat(m.contextTokens()).isEqualTo(12288);
+            assertThat(m.local()).isTrue();
+            ThreadPoolTaskExecutor profile = ctx.getBean("profileExecutor", ThreadPoolTaskExecutor.class);
+            assertThat(profile.getMaxPoolSize()).isEqualTo(1);
+            assertThat(profile.getThreadNamePrefix()).isEqualTo("profile-");
+        });
+    }
+
+    @Test
+    void ollamaContextTooSmallForTheCvBudgetFailsStartup() {
+        runner.withPropertyValues("talentmatch.ai.ollama.context-tokens=8192", "talentmatch.profile.max-text-chars=24000")
+                .run(ctx -> {
+                    assertThat(ctx).hasFailed();
+                    FailureAnalysis a = analyze(ctx.getStartupFailure());
+                    assertThat(a.getDescription()).contains("context-tokens is 8192").contains("13096");
+                    assertThat(a.getAction()).contains("Raise talentmatch.ai.ollama.context-tokens to at least 13096");
+                });
+    }
+
+    @Test
+    void cloudProvidersHaveOneExtractionModelAndNoGate() {
+        runner.withPropertyValues("talentmatch.ai.provider=openai", "talentmatch.ai.openai.api-key=sk-test-123")
+                .run(ctx -> {
+                    assertThat(ctx).hasNotFailed();
+                    assertThat(ctx.getBeansOfType(ChatModel.class)).hasSize(1);
+                    assertThat(ctx).hasSingleBean(ResumeExtractionModel.class).doesNotHaveBean(LocalModelGate.class);
+                    assertThat(ctx.getBean(ResumeExtractionModel.class).chatModel()).isInstanceOf(OpenAiChatModel.class);
+                    assertThat(ctx.getBean(ResumeExtractionModel.class).contextTokens()).isNull();
+                    assertThat(ctx.getBean(ResumeExtractionModel.class).local()).as("hosted").isFalse();
+                });
+        runner.withPropertyValues("talentmatch.ai.provider=claude", "talentmatch.ai.claude.api-key=sk-ant-test")
+                .run(ctx -> {
+                    assertThat(ctx).hasNotFailed();
+                    assertThat(ctx.getBeansOfType(ChatModel.class)).hasSize(1);
+                    assertThat(ctx).hasSingleBean(ResumeExtractionModel.class).doesNotHaveBean(LocalModelGate.class);
+                    assertThat(ctx.getBean(ResumeExtractionModel.class).chatModel())
+                            .isInstanceOf(AnthropicChatModel.class);
+                    assertThat(ctx.getBean(ResumeExtractionModel.class).label()).isEqualTo("claude/claude-sonnet-5-5");
+                });
     }
 
     @Test
@@ -124,7 +178,8 @@ class AiProviderWiringTest {
             assertThat(ctx).hasNotFailed();
             assertThat(ctx).doesNotHaveBean(ChatModel.class).doesNotHaveBean(ExplanationAssistant.class)
                     .doesNotHaveBean("aiExecutor").doesNotHaveBean(ExplanationGenerator.class)
-                    .doesNotHaveBean(ModelInfo.class);
+                    .doesNotHaveBean(ModelInfo.class).doesNotHaveBean(ResumeExtractionModel.class)
+                    .doesNotHaveBean(LocalModelGate.class);
             assertThat(ctx).hasSingleBean(ExplanationService.class).hasSingleBean(AiHealthIndicator.class)
                     .hasSingleBean(ExplanationRateLimiter.class).hasSingleBean(AiCircuitBreaker.class)
                     .hasSingleBean(Clock.class);

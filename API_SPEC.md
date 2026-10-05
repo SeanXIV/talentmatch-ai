@@ -7,7 +7,13 @@ ISO-8601 UTC (`2026-10-01T10:00:00Z`). Ids are UUIDs.
 
 Items marked **(extension)** were added in Phase 2 on top of the Phase 0 draft, and items
 marked **(extension, Phase 3)** were added with the AI explanation layer; they are all
-additive, so clients written against the draft keep working.
+additive, so clients written against the draft keep working. The **Profile** endpoints
+(Phase 4) are new.
+
+> **Personal data, no auth.** `/api/profile/**` returns the owner's CV and contact details
+> (PII) to anyone who can reach the port. The server listens on `127.0.0.1` by default
+> (`SERVER_ADDRESS`); don't expose it until authentication exists (`PRODUCTION_READINESS.md`,
+> section 6).
 
 ## Conventions
 
@@ -104,11 +110,14 @@ Full replace, including skills (same body and rules as `POST`). Skill links are 
 dropped skills are removed, new ones added, years updated only where changed, so an
 identical `PUT` writes nothing (and does not make matches stale). Last write wins.
 
-**Response `200`** candidate detail. **Errors:** `400`, `404 CANDIDATE_NOT_FOUND`, `409 EMAIL_ALREADY_EXISTS`
+**Response `200`** candidate detail. **Errors:** `400`, `404 CANDIDATE_NOT_FOUND`, `409 EMAIL_ALREADY_EXISTS`,
+`409 DATA_CONFLICT` for the owner's own candidate (`"This candidate is your profile; edit it with
+PUT /api/profile."`, Phase 4).
 
 ### `DELETE /candidates/{id}` **(extension)**
 **Response `204`**. Also deletes the candidate's skills and match rows.
-**Errors:** `400 INVALID_ID`, `404 CANDIDATE_NOT_FOUND`
+**Errors:** `400 INVALID_ID`, `404 CANDIDATE_NOT_FOUND`, `409 DATA_CONFLICT` for the owner's own
+candidate (`"This candidate is your profile; it can't be deleted here."`, Phase 4).
 
 ---
 
@@ -296,6 +305,10 @@ Field notes (all **(extension)** except `jobId`, `matches[].candidateId`, `candi
 | `PROVIDER_UNAVAILABLE` | "The AI explanation service is unavailable right now, so this summary was built from the skill breakdown." |
 | `GENERATION_FAILED` | "An AI explanation couldn't be produced for this match, so this summary was built from the skill breakdown." |
 
+`AI_BUSY` is also returned while the local model (Ollama) is reading a CV (Phase 4): the
+extraction holds the model for many minutes, so explanations don't queue behind it. It does
+not count as a provider failure.
+
   For `STALE` items the note is prefixed with "The previous AI explanation is out of date because
   the candidate or job changed. ".
 
@@ -369,6 +382,175 @@ status is kept in memory (last 20 runs) and is lost when the server restarts."`)
 
 ---
 
+## Profile (Phase 4)
+
+The owner's **master profile**: upload a CV (PDF), let the AI turn it into a draft in the
+background, review and edit the draft, then save it. Saving creates or updates the owner's
+candidate row and skills, so `GET /jobs/{id}/matches` scores the owner like any candidate
+(`candidateId` in the profile response). All of these responses contain personal data.
+
+### Profile document
+
+The same shape is used for the AI draft, the `PUT` body and the saved profile. Every field may
+be `null` and every list may be empty; dates are `YYYY-MM` or `YYYY`.
+
+```json
+{
+  "fullName": "Ada Lovelace", "email": "ada@example.com", "phone": "+44 20 7946 0000",
+  "location": "London, UK", "headline": "Backend engineer", "summary": "…",
+  "links": [ { "label": "GitHub", "url": "https://github.com/ada" } ],
+  "experience": [ { "title": "Senior Engineer", "company": "Acme", "location": "London",
+                    "startDate": "2021-03", "endDate": null, "current": true,
+                    "technologies": ["Java", "PostgreSQL"], "highlights": ["Cut p95 latency by 40%"] } ],
+  "projects": [ { "name": "TalentMatch", "description": "…", "technologies": ["Spring Boot"],
+                  "url": null, "highlights": [] } ],
+  "skills": [ { "name": "Java", "years": 8 }, { "name": "Docker", "years": null } ],
+  "certifications": [ { "name": "AWS SAA", "issuer": "Amazon", "issued": "2023-05", "expires": null,
+                        "credentialId": null, "url": null } ],
+  "education": [ { "institution": "University of London", "qualification": "BSc",
+                   "field": "Mathematics", "startDate": "2010", "endDate": "2013" } ],
+  "languages": [ { "name": "English", "level": "Native" } ]
+}
+```
+
+Limits (validated on `PUT`; the AI draft is shortened instead, with a warning): name 200,
+single-line fields 300, URLs 500, summary 5000, descriptions 2000, bullets 1000 characters;
+at most 50 roles, 50 projects, 100 skills, 50 certifications, 20 education entries, 20
+languages, 20 links, 30 bullets/technologies per entry; years 0..60. `current: true` means no
+`endDate`. Accepted date inputs: `2021`, `2021-03`, `03/2021`, `Mar 2021`, `March 2021`;
+`endDate: "Present"` sets `current`.
+
+### `POST /profile/resume`
+Upload a CV as `multipart/form-data`, file in form field `file`. PDF only (detected from the
+file's content, not its name), at most 5 MB and 20 pages, with a text layer (scanned images
+are rejected; no OCR).
+
+- **`202 Accepted`** + `Location: /api/profile/resume/{id}`: a new CV, queued for reading.
+- **`200 OK`**: the same file (same SHA-256) was already uploaded and is not `FAILED`; the
+  existing CV is returned and not read again.
+
+Body: a resume (see `GET /profile/resume/{id}`), usually `status: "PENDING"`.
+
+**Errors:** `400 VALIDATION_FAILED` (no `file` part / empty file), `400 MALFORMED_REQUEST`
+(unreadable multipart body), `400 RESUME_UNREADABLE` (damaged, password- or copy-protected,
+scanned, more than 20 pages, or took more than 30 s to read; the message says which),
+`413 PAYLOAD_TOO_LARGE` (`"This file is 5.5 MB; a CV can be at most 5.0 MB. …"`),
+`415 UNSUPPORTED_MEDIA_TYPE` (the file is not a PDF: `"Only PDF CVs are supported, and this
+file is not a PDF. …"`; or the request is not multipart: `"Content type 'application/json' is
+not supported. Upload the file as multipart/form-data, in a form field named 'file'."`),
+`503 UPLOAD_BUSY` (other files are being read; retry in a minute).
+
+### `GET /profile/resumes`
+Every uploaded CV, newest first; metadata and status only (no draft, no text).
+
+```json
+[ { "id": "…", "fileName": "cv.pdf", "sizeBytes": 183422, "pageCount": 2, "status": "SUCCEEDED",
+    "failureReason": null, "model": "ollama/qwen2.5:7b-instruct", "warningCount": 3,
+    "uploadedAt": "…", "extractionStartedAt": "…", "extractionFinishedAt": "…" } ]
+```
+
+### `GET /profile/resume/{id}`
+One CV and its extraction. Poll it after uploading: with a local CPU-only model, reading a CV
+takes 20–40 minutes.
+
+```json
+{
+  "id": "…", "fileName": "cv.pdf", "sizeBytes": 183422, "pageCount": 2,
+  "status": "SUCCEEDED", "failureReason": null,
+  "message": "Your draft profile is ready, with 2 item(s) to check (see warnings). Review it, then save it with PUT /api/profile.",
+  "model": "ollama/qwen2.5:7b-instruct",
+  "draft": { …profile document… },
+  "warnings": [
+    { "path": "skills[4].name", "value": "Kubernetes", "message": "This skill was not found in your CV text. Check it is correct (the AI may have reworded or invented it) before saving." },
+    { "path": "skills[0].years", "value": "8", "message": "Your CV doesn't state 8 years of Java next to the skill, so the number was removed …" }
+  ],
+  "uploadedAt": "…", "extractionStartedAt": "…", "extractionFinishedAt": "…"
+}
+```
+
+`status`: `PENDING` (queued), `RUNNING` (the model is reading it), `SUCCEEDED` (`draft` and
+`warnings` set), `FAILED` (`failureReason` set, `message` says what to do). `draft` is `null`
+and `warnings` is `null` unless `SUCCEEDED`. Warning `path`s point into `draft` (indices are
+the draft's own); a `null` path is about the whole CV (e.g. it was too long and was cut).
+Warnings never block saving.
+
+`failureReason`: `AI_DISABLED` (AI is off: enter the profile by hand), `TIMEOUT`,
+`PROVIDER_ERROR` (model server unreachable or failed), `REFUSED`, `INVALID_OUTPUT` (malformed
+or cut-off answer), `QUEUE_FULL`, `CONTEXT_OVERFLOW` (CV too long for the model's context
+window), `TOO_MANY_ATTEMPTS` (interrupted 3 times, e.g. by restarts),
+`REMOTE_EXTRACTION_DISABLED` (the provider is hosted — `claude`/`openai` profile — and
+`talentmatch.profile.allow-remote-extraction` is `false`, so the CV was not sent; the default
+Ollama provider keeps it local).
+
+Never invented: the AI may only copy what the CV says. Skill `years` are kept only when the
+number is written within ~60 characters of the skill name in the CV (otherwise `null` plus a
+warning; type them back in before saving if they are right); placeholders such as "N/A"
+become `null`. Everything else is kept but flagged with a warning when it isn't in the CV
+text: names (skills, employers, titles, projects, technologies, certifications, issuers,
+institutions, qualifications), numbers in the summary, descriptions and highlights, the year
+of each date, the email, the phone (compared by digits), links (compared without scheme and
+`www.`), and highlights that share less than 70% of their words (4+ letters) with the CV
+("reworded").
+
+**Errors:** `400 INVALID_ID`, `404 RESUME_NOT_FOUND`
+
+### `GET /profile/resume/{id}/file`
+The original PDF (`application/pdf`, `Content-Disposition: attachment; filename*=UTF-8''…`,
+`X-Content-Type-Options: nosniff`). **Errors:** `400 INVALID_ID`, `404 RESUME_NOT_FOUND`
+
+### `POST /profile/resume/{id}/extract`
+Read the CV again (after a failure, or to replace the draft; the old draft is discarded).
+**Response `202`** the resume, `status: "PENDING"`.
+**Errors:** `400 INVALID_ID`, `404 RESUME_NOT_FOUND`, `409 RESUME_EXTRACTION_IN_PROGRESS`
+(it is `PENDING` or `RUNNING`)
+
+### `DELETE /profile/resume/{id}`
+Delete an uploaded CV (file, text and draft). A saved profile is kept; its `resumeId` becomes
+`null`. **Response `204`**. **Errors:** `400 INVALID_ID`, `404 RESUME_NOT_FOUND`,
+`409 RESUME_EXTRACTION_IN_PROGRESS` (the model is reading it; wait, then delete).
+
+### `PUT /profile`
+Save the reviewed profile as the master profile (creates it on the first call).
+
+```json
+{ "resumeId": "…", "createMissingSkills": true, "profile": { …profile document… } }
+```
+
+- `profile` (required): usually the `draft` from `GET /profile/resume/{id}` after your edits.
+  `fullName` and `email` are required. Validation is strict: nothing is shortened or dropped
+  for you; every problem is a field error on `profile.<path>` (e.g.
+  `profile.experience[1].endDate`, indices as sent). An empty entry is an error ("fill it in or
+  remove it").
+- `createMissingSkills` (default `false`): skills not in the skill table are errors
+  (`profile.skills[i].name`, "Unknown skill …") unless this is `true`; then they are created.
+- `resumeId` (optional): the CV this came from.
+
+The owner's candidate is created or updated in the same transaction: `fullName`, `email`,
+`summary` = headline + summary, skills with years. Skill changes mark the owner's cached
+matches stale, as for any candidate.
+
+**Response `200`**:
+```json
+{ "candidateId": "…", "resumeId": "…", "version": 3, "profile": { … }, "skills": [ { "skillId": "…", "name": "Java", "category": null, "yearsExperience": 8 } ],
+  "confirmedAt": "…", "updatedAt": "…",
+  "warnings": [ { "path": "profile.skills[3].name", "value": "Postgres", "message": "New skill 'Postgres' was created, but 'PostgreSQL' already exists. …" } ] }
+```
+`version` is the confirmed-profile version: every successful `PUT` stores a new one (1, 2, 3, …,
+kept as history) and the response returns it. `warnings` (save only; always `[]` on `GET`)
+flags new skills that look like existing ones.
+
+**Errors:** `400 VALIDATION_FAILED` (`profile` missing, field errors, unknown skills, unknown
+`resumeId`), `400 MALFORMED_REQUEST`, `409 EMAIL_ALREADY_EXISTS` on the first save when another
+candidate already uses this email (field `profile.email`: `"Candidate <id> already uses this
+email. Delete it or change its email, then save your profile again."`; the existing candidate is
+never adopted or merged).
+
+### `GET /profile`
+The saved master profile (same body as the `PUT` response, `warnings: []`).
+**Errors:** `404 PROFILE_NOT_FOUND` ("You have not saved a profile yet. …")
+
+---
+
 ## Health
 
 `GET /actuator/health` (plus `/actuator/health/liveness` and `/actuator/health/readiness`),
@@ -411,16 +593,20 @@ exception class names or SQL.
 | 400 | `INVALID_PARAMETER` | query parameter out of range or wrong type |
 | 400 | `INVALID_ID` | path id is not a UUID (`"'abc' is not a valid id. Ids look like 3f2c0e9a-…"`) |
 | 400 | `MALFORMED_REQUEST` | body is not valid JSON, has an unknown field, or a field has the wrong type |
-| 404 | `CANDIDATE_NOT_FOUND` / `JOB_NOT_FOUND` / `SKILL_NOT_FOUND` / `RECOMPUTE_RUN_NOT_FOUND` | resource missing |
+| 400 | `RESUME_UNREADABLE` | uploaded PDF can't be read (damaged, protected, scanned, too many pages, too slow) **(Phase 4)** |
+| 404 | `CANDIDATE_NOT_FOUND` / `JOB_NOT_FOUND` / `SKILL_NOT_FOUND` / `RECOMPUTE_RUN_NOT_FOUND` / `RESUME_NOT_FOUND` / `PROFILE_NOT_FOUND` | resource missing |
 | 404 | `ENDPOINT_NOT_FOUND` | no such endpoint (`"No endpoint GET /api/foo."`) |
 | 405 | `METHOD_NOT_ALLOWED` | wrong HTTP method (`Allow` header lists the supported ones) |
-| 415 | `UNSUPPORTED_MEDIA_TYPE` | body is not `application/json` |
+| 413 | `PAYLOAD_TOO_LARGE` | uploaded CV over the size limit **(Phase 4)** |
+| 415 | `UNSUPPORTED_MEDIA_TYPE` | body is not `application/json` (upload endpoints: not `multipart/form-data`, or the file is not a PDF); the message says what to send |
 | 409 | `EMAIL_ALREADY_EXISTS` / `JOB_ALREADY_EXISTS` / `SKILL_ALREADY_EXISTS` | natural-key conflict |
 | 409 | `DATA_CONFLICT` | other conflicting concurrent change |
 | 409 | `RECOMPUTE_ALREADY_RUNNING` | a batch recompute is active |
+| 409 | `RESUME_EXTRACTION_IN_PROGRESS` | the CV is queued or being read **(Phase 4)** |
 | 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job within the regenerate window (`Retry-After: n`) **(extension, Phase 3)** |
 | 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`) |
 | 503 | `DATABASE_UNAVAILABLE` | database unreachable (`Retry-After: 5`) |
+| 503 | `UPLOAD_BUSY` | every PDF reader is busy; retry the upload in a minute **(Phase 4)** |
 | 500 | `INTERNAL_ERROR` | unexpected; message includes the request id to quote |
 
 ## Notes for Implementation
@@ -434,3 +620,5 @@ exception class names or SQL.
 - Pagination and filtering are included from the start rather than added later, since
   retrofitting pagination onto an existing API is a common real-world pain point.
 - No authentication: single owner, not public yet (see `PRODUCTION_READINESS.md`, section 6).
+  The `/api/profile/**` endpoints return personal data; the server binds to `127.0.0.1` by
+  default for that reason.

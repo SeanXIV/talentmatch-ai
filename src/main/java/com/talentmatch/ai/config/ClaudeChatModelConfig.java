@@ -1,9 +1,12 @@
 package com.talentmatch.ai.config;
 
 import com.talentmatch.ai.AiProperties;
+import com.talentmatch.profile.ProfileProperties;
+import com.talentmatch.profile.ResumeExtractionModel;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
 import dev.langchain4j.model.chat.Capability;
 import dev.langchain4j.model.chat.ChatModel;
+import java.time.Duration;
 import java.util.Set;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
@@ -26,8 +29,25 @@ import org.springframework.context.annotation.Configuration;
 @ConditionalOnProperty(prefix = "talentmatch.ai", name = "provider", havingValue = "claude")
 public class ClaudeChatModelConfig {
 
+    static final int MIN_EXTRACTION_TOKENS = 16000;
+
     @Bean
     public ChatModel claudeChatModel(AiProperties ai) {
+        return build(ai, ai.callTimeout(), ai.claude().maxTokens());
+    }
+
+    /**
+     * Same model for CV extraction: long timeout, and at least {@value #MIN_EXTRACTION_TOKENS}
+     * output tokens, because adaptive thinking uses output tokens before the JSON is written.
+     */
+    @Bean
+    public ResumeExtractionModel claudeResumeExtractionModel(AiProperties ai, ProfileProperties profile) {
+        ProfileProperties.Extraction x = profile.extraction();
+        return ResumeExtractionModel.remote(build(ai, x.callTimeout(), Math.max(x.maxOutputTokens(), MIN_EXTRACTION_TOKENS)),
+                ModelInfo.of(ai).label());
+    }
+
+    private static ChatModel build(AiProperties ai, Duration timeout, int maxTokens) {
         AiProperties.Claude c = ai.claude();
         if (c.apiKey() == null || c.apiKey().isBlank()) {
             throw AiConfigurationException.missingKey("claude", "ANTHROPIC_API_KEY");
@@ -37,12 +57,13 @@ public class ClaudeChatModelConfig {
         var builder = AnthropicChatModel.builder()
                 .apiKey(c.apiKey().strip())
                 .modelName(c.model())
-                .maxTokens(c.maxTokens())
-                .timeout(ai.callTimeout())
+                .maxTokens(maxTokens)
+                .timeout(timeout)
                 .maxRetries(0)
                 .logRequests(false)
                 .logResponses(false)
-                // Structured output: AiServices sends the MatchExplanation JSON schema.
+                // Structured output: explanations via AiServices (record schema), CV extraction via
+                // ChatRequest.responseFormat (hand-built ProfileJsonSchema).
                 .supportedCapabilities(Set.of(Capability.RESPONSE_FORMAT_JSON_SCHEMA));
         if (c.baseUrl() != null && !c.baseUrl().isBlank()) {
             builder.baseUrl(c.baseUrl().strip());

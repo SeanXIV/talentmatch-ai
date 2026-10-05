@@ -58,7 +58,7 @@ public abstract class AbstractApiIT {
     @BeforeEach
     void resetDatabase() {
         api = new Api(port, mapper);
-        jdbc.execute("TRUNCATE job_match, candidate_skill, job_skill, candidate, job, skill");
+        jdbc.execute("TRUNCATE owner_profile, owner_profile_version, resume, job_match, candidate_skill, job_skill, candidate, job, skill");
     }
 
     // ------------------------------------------------------------------ fixtures via the API
