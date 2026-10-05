@@ -433,4 +433,4 @@ exception class names or SQL.
   reliability decision: an example of designing for a third-party dependency's failure modes.
 - Pagination and filtering are included from the start rather than added later, since
   retrofitting pagination onto an existing API is a common real-world pain point.
-- No authentication in Phases 2–4 (see `PRODUCTION_READINESS.md`).
+- No authentication: single owner, not public yet (see `PRODUCTION_READINESS.md`, section 6).

@@ -29,7 +29,8 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **When:** after Phase 2 (optional for the portfolio); before first prod deploy.
 
 - [ ] **Candidate data is PII**
-  - **Now (dev):** synthetic candidates only (names/emails from Faker).
+  - **Now (dev):** synthetic candidates only (names/emails from Faker). From Phase 4 the
+    owner's real CV (contact details, employment history) is stored too.
   - **Production:** recorded consent; a retention and deletion policy
     (including `job_match` rows and explanations); encryption at rest (RDS)
     and in transit (TLS); never copy real PII into dev/test.
@@ -72,7 +73,7 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     compromised or buggy app can't alter or drop the schema, and rolling
     deploys don't break.
   - **When:** `ddl-auto=validate` and `clean-disabled` in Phase 2; the rest
-    before first prod deploy (Phase 5).
+    before first prod deploy (Phase 9).
   - **Done in Phase 2:** `spring.jpa.hibernate.ddl-auto=validate` and
     `spring.flyway.clean-disabled=true` (`src/main/resources/application.yml`);
     `application-prod.yml` sets `spring.flyway.enabled=false`. Schema changes since V1 are
@@ -87,7 +88,7 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     `max_connections` × app instances.
   - **Why:** durability, managed patching, encrypted connections, no
     connection exhaustion.
-  - **When:** Phase 5.
+  - **When:** Phase 9.
 
 ## 3. Secrets & configuration
 
@@ -129,6 +130,31 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Why:** output quality, plus control over cost and failure modes for a
     paid third-party dependency.
   - **When:** before first prod deploy (secrets manager, caps).
+
+- [ ] **Claude `effort` is not sent**
+  - **Now (Phase 3):** LangChain4j 1.20.2 writes `customParameters` as extra top-level keys,
+    so `output_config.effort` came out as a duplicate `output_config` next to the
+    structured-output `output_config.format`. Structured output wins: `effort` must stay blank
+    (API default, high) and a non-blank `talentmatch.ai.claude.effort` fails startup
+    (`ClaudeChatModelConfig`). Higher effort means more thinking tokens, so more latency and
+    cost per explanation; output cut off at `max-tokens` falls back to the template.
+  - **Production:** upgrade LangChain4j once it merges `output_config` (or gains an effort
+    option), set `effort: low`, and re-enable the wire-test assertion for both keys
+    (`ProviderWireTest`).
+  - **Why:** control over latency and cost with a paid provider.
+  - **When:** before using the `claude` profile beyond demos.
+
+- [ ] **Local model needs real hardware**
+  - **Now (dev):** measured 2026-10-05 on a CPU-only WSL2 box (4 cores, 8 GB):
+    `qwen2.5:7b-instruct` writes ~1.7 tokens/s, so one explanation (~510 tokens in, ~80 out)
+    takes ~2 minutes. With the defaults (`call-timeout` 60s, 2 parallel, top 5) every call
+    times out and only templates appear. The smoke test passed with `call-timeout=300s`,
+    `max-concurrency=1`, `top-n=2` (README, "Slow (CPU-only) machines").
+  - **Production:** run Ollama on a GPU host (or a box with enough RAM for the model plus the
+    app), or use a hosted provider; size `call-timeout`, `max-concurrency` and `top-n` from the
+    measured `eval rate`, not the defaults.
+  - **Why:** explanations that never arrive in time make the AI layer pure overhead.
+  - **When:** before relying on AI explanations day to day.
 
 - [ ] **Synchronous explanation generation → async**
   - **Now (Phase 3):** `GET /jobs/{id}/matches` waits for the page's explanations up to a
@@ -176,7 +202,9 @@ shortcuts we took on purpose, written down so they don't get forgotten.
 
 - [ ] **Candidate PII sent to third-party providers**: OPEN DECISION
   - **Now (dev):** hosted profiles send the candidate's name and summary (never the email)
-    to OpenAI/Anthropic; data is synthetic. Ollama keeps everything local.
+    to OpenAI/Anthropic; data is synthetic. Ollama keeps everything local. From Phase 4 this
+    is the owner's own CV: sending it to a hosted provider is the owner's choice (decide per
+    feature: CV extraction and tailoring send far more than a name and summary).
   - **Production:** DPA with the provider, candidate consent, data-residency review, or
     pseudonymize names before sending.
   - **When:** before using real candidate data with a hosted provider.
@@ -236,7 +264,7 @@ shortcuts we took on purpose, written down so they don't get forgotten.
 ## 6. API, security & UX
 
 - [ ] **No authentication → secured API**
-  - **Now (dev):** no auth in Phases 2 to 4 (`API_SPEC.md`). Since Phase 2 this includes
+  - **Now (dev):** no auth (`API_SPEC.md`); single owner, not public (ROADMAP "Direction change"). Since Phase 2 this includes
     the write endpoints (`POST/PUT/DELETE` candidates and jobs, `POST /skills`) and
     `POST /matches/recompute`: anyone who can reach the API can change data or start a
     batch recompute.
@@ -286,7 +314,8 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Production:** n/a. Enable WSL integration for a smoother setup.
   - **When:** n/a.
 
-- [ ] **Backend CI cache expression unverified**
+- [x] **Backend CI cache expression unverified** (verified 2026-10-05: CI run 37343908865
+  logs `Cache hit for: setup-java-Linux-x64-maven-wrapper-…`)
   - **Now (dev):** `hashFiles(format('{0}/pom.xml', env.BACKEND_DIR))` (resolves to
     `./pom.xml`) in `.github/workflows/ci.yml` hasn't run yet because there's no
     `pom.xml`.
@@ -299,7 +328,7 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Production:** a pipeline that builds and pushes images, runs migrations
     (section 2), then deploys to EC2/Elastic Beanstalk, with a rollback path.
   - **Why:** repeatable, auditable releases.
-  - **When:** Phase 5.
+  - **When:** Phase 9.
 
 - [ ] **Backend integration tests need Docker**
   - **Now (dev):** `./mvnw verify` runs `*IT` tests against Testcontainers PostgreSQL 16.
@@ -356,3 +385,51 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     database is ever sharded.
   - **Why:** advisory locks are not shared across separate databases.
   - **When:** only if the data store changes.
+
+## 10. Job-seeker features (Phases 4–7, PROPOSED 2026-10-05)
+
+- [ ] **Job sources: terms, limits and reliability**
+  - **Now (dev):** no real job source yet (synthetic data only).
+  - **Production:** only sources with official APIs or feeds whose terms allow this use (ATS
+    job-board APIs, aggregator APIs with a key); no scraping of sites that forbid it.
+    Respect rate limits and use conditional requests; back off on errors; alert when a
+    source fails or returns nothing for too long (a silently dead source means missed jobs).
+  - **Why:** banned keys or IPs, legal exposure, and missed postings that defeat "be first".
+  - **When:** Phase 5.
+
+- [ ] **Always-on poller**
+  - **Now (dev):** everything runs on a laptop that sleeps.
+  - **Production:** the poller and notifier run 24/7 on an always-on host, with a heartbeat
+    alert if polling stops; one active poller even with several app instances.
+  - **Why:** postings found hours late lose the speed advantage.
+  - **When:** Phase 9 (until then, polling only while the laptop is awake).
+
+- [ ] **Notification channel secrets and delivery**
+  - **Now (dev):** no notifications yet.
+  - **Production:** channel credentials (bot token, SMTP password, …) from a secrets
+    manager; delivery failures retried and logged; no duplicate alerts for the same posting.
+  - **When:** Phase 5.
+
+- [ ] **Uploaded CV files**
+  - **Now (dev):** not built yet.
+  - **Production:** size and type limits, content-type sniffing (not just the extension),
+    files stored outside the web root, encrypted at rest and covered by backups and the
+    retention policy (section 1).
+  - **When:** Phase 4.
+
+- [ ] **Never-invent check on tailored documents**
+  - **Now (dev):** not built yet.
+  - **Production:** a grounding validator rejects any role, skill, certificate, date or
+    number not in the confirmed master profile, plus a golden-set evaluation before
+    changing models or prompts (section 4, "Offline model evaluation").
+  - **Why:** a fabricated claim on a real application damages the owner's credibility.
+  - **When:** Phase 7.
+
+- [ ] **Model choice for CV extraction and tailoring**: OPEN DECISION
+  - **Now (dev):** local `qwen2.5:7b-instruct` on CPU (~1.7 tokens/s, see section 4 "Local
+    model needs real hardware"): a full CV or cover letter would take many minutes, and a
+    7B model's writing quality may not be good enough for applications.
+  - **Production:** decide per feature between a GPU-backed local model and a hosted
+    provider (quality and speed vs. cost and sending the CV off the machine).
+  - **When:** before Phase 7 (extraction in Phase 4 can run async on the local model).
+

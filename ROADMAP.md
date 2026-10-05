@@ -56,45 +56,116 @@ no phase depends on a later one being finished to be demonstrable.
       failure backoff, circuit breaker, regenerate rate limit)
 - [x] Persist explanations in the `job_match` table so they aren't regenerated needlessly
       (V3: payload, prompt hash for staleness, model, generated-at; guarded write)
-- [ ] Write tests using a mocked `ChatModel` (no real model calls in CI)
+- [x] Write tests using a mocked `ChatModel` (no real model calls in CI): `FakeChatModel`
+      drives the AI integration tests; a stub HTTP server covers the provider wire tests
 - [x] OpenAI/Claude optional profiles (core modules `langchain4j-open-ai` /
       `langchain4j-anthropic`), so the provider can be swapped via config without code
       changes (only enable for a final polished demo, since hosted providers are paid)
 
 **Demonstrable output:** matches that explain themselves in plain English.
 
-## Phase 4 — Frontend
+## Direction change (2026-10-05): job seeker first
+
+The owner will use TalentMatch to **find and apply to jobs for themselves**: upload one
+complete CV, get the newest matching openings as soon as they go live, and have the AI
+draft a tailored CV and cover letter for each one, reviewed by the owner before anything is
+sent. Phases 1–3 carry over unchanged (scoring, caching, explanations and fallbacks work in
+either direction). The recruiter features stay but are no longer the priority. Going public
+for other users is a possible later step; multi-user concerns are out of scope until then.
+
+Principles for everything below:
+- **Speed to apply:** the goal is to be among the first applicants, so new postings must be
+  detected, scored and announced within minutes.
+- **Never invent:** tailored documents may select, reorder and rephrase what is in the
+  master profile, but never add experience, skills, certificates or numbers that aren't
+  there (same rule as "AI explains, never scores").
+- **Human in the loop:** the AI drafts and the owner reviews and submits. Full automation
+  is a later, separate decision (see "Later").
+
+## Phase 4 — Your master profile (resume upload)
+- [ ] `POST /api/profile/resume`: upload a PDF or DOCX; keep the original file
+- [ ] Extract the text (e.g. Apache Tika) and have the AI turn it into a structured
+      profile: contact, summary, experience (roles, dates, achievements), projects, skills
+      (with years where stated), certifications, education
+- [ ] Owner reviews and edits the extracted profile before it is saved (nothing is
+      trusted until confirmed); skills map onto the `skill` table, new ones only after
+      confirmation
+- [ ] Store it as the owner's candidate plus profile tables (V4 migration), so the
+      existing scoring works against real jobs
+- [ ] Tests: extraction with a fake `ChatModel`, malformed and scanned-PDF files, edits
+
+**Demonstrable output:** your full CV as a structured, editable profile in the database.
+
+## Phase 5 — Fresh job feed (be first to apply)
+- [ ] Source adapters for **company applicant-tracking boards** with public JSON APIs
+      (Greenhouse, Lever, Ashby, …) for a watchlist of companies: postings appear there
+      first. Plus one **aggregator API** for breadth, picked for the owner's region. No
+      scraping of sites whose terms forbid it.
+- [ ] Poll on a schedule (every few minutes per source, within each API's limits, using
+      conditional requests where supported); dedup across sources; record
+      `first_seen_at`, `posted_at`, closed postings
+- [ ] Extract skills from each posting's description (real postings have no skill
+      list): AI-suggested skills validated against the `skill` table (see
+      PRODUCTION_READINESS "Jobs with no skills")
+- [ ] Score every new posting against the master profile as it arrives
+- [ ] **Notify** the owner within minutes when a new posting scores above a threshold
+      (channel to be chosen: e.g. email, Telegram, ntfy push)
+- [ ] Decide where polling runs (in the Spring app vs. the Python ETL) at phase start
+
+**Demonstrable output:** a phone notification minutes after a matching job goes live.
+
+## Phase 6 — Jobs for me
+- [ ] `GET /api/candidates/{id}/matches`: rank jobs for a candidate (the reverse of
+      Phase 2), filters for posted-since, location/remote, minimum score, and a
+      newest-first sort
+- [ ] Explanations written for the job seeker: why you fit and what you're missing
+
+**Demonstrable output:** a ranked, explained list of the newest jobs that fit you.
+
+## Phase 7 — Tailored CV and cover letter
+- [ ] For one job, generate a tailored CV (pick, order and rephrase entries from the
+      master profile to match the posting) and a cover letter
+- [ ] Grounding validator: every role, project, skill, certificate and number in the
+      output must exist in the master profile; anything else is rejected or flagged
+- [ ] Export DOCX and PDF; keep every version; owner edits and approves
+- [ ] Application tracker: status (new → shortlisted → applied → interview →
+      offer/rejected), applied date, notes, and which CV/cover-letter version was sent
+
+**Demonstrable output:** from notification to a reviewed, tailored application in minutes.
+
+## Phase 8 — Frontend
 - [ ] Scaffold a React app
-- [ ] Build a jobs list view
-- [ ] Build a job detail view showing ranked candidate matches with explanations
-- [ ] Build a candidates list/detail view
-- [ ] Basic loading and error states
+- [ ] Job feed (newest matches first) with score, explanation and "generate application"
+- [ ] Review screen for the tailored CV and cover letter (edit, approve, download)
+- [ ] Application tracker board; master-profile editor
+- [ ] Basic loading and error states (including `PENDING` explanations)
 
-**Demonstrable output:** a usable dashboard, screenshots for the README.
+**Demonstrable output:** a usable personal job-hunting dashboard.
 
-## Phase 5 — Containerization & Deployment
-- [ ] Dockerfile for the backend
-- [ ] Dockerfile for the frontend
-- [ ] `docker-compose.yml` running Postgres + backend + frontend together locally
-- [ ] Deploy to AWS (RDS for Postgres, EC2 or Elastic Beanstalk for the app)
-- [ ] Add a basic GitHub Actions workflow: run backend and ETL tests on every push
+## Phase 9 — Containerization & always-on deployment
+- [ ] Dockerfiles for the backend and frontend; `docker-compose.yml` with Postgres
+- [ ] Deploy somewhere **always on** (a laptop that sleeps misses new postings): a small
+      VPS or AWS; managed Postgres with backups
+- [x] GitHub Actions CI runs ETL and backend tests (incl. Testcontainers) on every push
+- [ ] Deployment pipeline and a CI badge in the README
 
-**Demonstrable output:** a live URL, and a CI badge in the README.
+**Demonstrable output:** a live service that watches for jobs 24/7.
 
-## Phase 6 — Polish
-- [ ] Add architecture/data-model diagrams as images to the README (already
-      drafted in Phase 0 — just needs final review once the real system exists)
-- [ ] Record a short demo walkthrough (video or GIF)
-- [ ] Write the "what I built and why" section, including the AI-failure
-      fallback decision and the persisted-match design decision as concrete
-      talking points
+## Phase 10 — Polish
+- [ ] Architecture/data-model diagrams as images in the README
+- [ ] Short demo walkthrough (video or GIF)
+- [ ] "What I built and why", including the AI-fallback, persisted-match and
+      never-invent decisions
 
-**Demonstrable output:** a portfolio-ready repository.
+## Later (separate decisions)
+- **Full automation:** submit applications automatically only where the platform allows
+  it, and only after the drafting quality has proven itself under review.
+- **Public, multi-user version:** auth, per-user data isolation, quotas
+  (PRODUCTION_READINESS section 6).
 
 ## Minimum Viable Version
 
-If time is limited, **Phases 1 and 2** alone already produce a genuinely
-resume-worthy result: a cleaned dataset, a real database, a tested Spring Boot
-API doing real matching logic. Everything after that adds breadth, not
-credibility — do them in order, but don't feel behind if you stop after Phase 2
-for a while before continuing.
+For the job-seeker goal, the smallest useful version is **Phases 4, 5 and 7**: your
+profile, a fresh job feed with notifications, and tailored drafts. A UI (Phase 8) and
+always-on hosting (Phase 9) make it pleasant and reliable, but the API can be used
+directly until then.
