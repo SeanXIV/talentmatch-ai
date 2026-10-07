@@ -13,16 +13,17 @@
 
     <groupId>com.talentmatch</groupId>
     <artifactId>talentmatch-api</artifactId>
-    <version>0.3.0-SNAPSHOT</version>
+    <version>0.4.0-SNAPSHOT</version>
     <packaging>jar</packaging>
     <name>talentmatch-api</name>
-    <description>TalentMatch AI REST API: candidates, jobs, skills, skill-overlap match scoring and AI match explanations</description>
+    <description>TalentMatch AI REST API: candidates, jobs, skills, skill-overlap match scoring, AI match explanations and a master profile from an uploaded CV</description>
 
     <properties>
         <java.version>17</java.version>
         <!-- Boot 3.5.6 manages 1.21.3, whose docker-java default API 1.32 is rejected by Docker 29+. -->
         <testcontainers.version>1.21.4</testcontainers.version>
         <langchain4j.version>1.20.2</langchain4j.version>
+        <pdfbox.version>3.0.7</pdfbox.version>
     </properties>
 
     <dependencyManagement>
@@ -87,6 +88,13 @@
         <dependency>
             <groupId>dev.langchain4j</groupId>
             <artifactId>langchain4j-anthropic</artifactId>
+        </dependency>
+
+        <!-- CV upload: PDF text extraction (Phase 4) -->
+        <dependency>
+            <groupId>org.apache.pdfbox</groupId>
+            <artifactId>pdfbox</artifactId>
+            <version>${pdfbox.version}</version>
         </dependency>
 
         <dependency>

@@ -4,6 +4,7 @@ import com.talentmatch.ai.AiCircuitBreaker;
 import com.talentmatch.ai.AiProperties;
 import com.talentmatch.ai.ExplanationAssistant;
 import com.talentmatch.ai.ExplanationGenerator;
+import com.talentmatch.ai.LocalModelGate;
 import com.talentmatch.ai.MatchExplanationValidator;
 import com.talentmatch.repository.MatchJdbcRepository;
 import dev.langchain4j.model.chat.ChatModel;
@@ -85,8 +86,10 @@ public class AiConfiguration {
                                                      ModelInfo modelInfo,
                                                      @Qualifier(AI_EXECUTOR) ThreadPoolTaskExecutor aiExecutor,
                                                      Clock clock,
-                                                     ObjectProvider<MeterRegistry> meterRegistry) {
+                                                     ObjectProvider<MeterRegistry> meterRegistry,
+                                                     ObjectProvider<LocalModelGate> localModelGate) {
         return new ExplanationGenerator(assistant, new MatchExplanationValidator(), matchJdbcRepository,
-                circuitBreaker, modelInfo, aiExecutor, clock, meterRegistry.getIfAvailable());
+                circuitBreaker, modelInfo, aiExecutor, clock, meterRegistry.getIfAvailable(),
+                localModelGate.getIfAvailable());
     }
 }

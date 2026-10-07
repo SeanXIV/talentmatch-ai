@@ -65,6 +65,14 @@ public class CandidateService {
         return toDetail(c, c.getUpdatedAt());
     }
 
+    /** Id of the candidate with this (normalized) email, if any. */
+    @Transactional(readOnly = true)
+    public java.util.Optional<UUID> findIdByEmail(String email) {
+        String normalized = TextNormalizer.email(email);
+        return normalized == null ? java.util.Optional.empty()
+                : candidateRepository.findByEmail(normalized).map(Candidate::getId);
+    }
+
     @Transactional
     public CandidateDetailResponse create(CandidateRequest request) {
         Validated v = validate(request);
@@ -78,8 +86,22 @@ public class CandidateService {
         return toDetail(candidate, candidate.getUpdatedAt());
     }
 
+    /**
+     * Updates a candidate through the candidates API. The owner's own candidate is refused (409):
+     * it mirrors the confirmed profile and is changed only through {@code PUT /api/profile}.
+     */
     @Transactional
     public CandidateDetailResponse update(UUID id, CandidateRequest request) {
+        if (candidateRepository.isOwnerProfileCandidate(id)) {
+            throw new ConflictException(ErrorCode.DATA_CONFLICT,
+                    "This candidate is your profile; edit it with PUT /api/profile.");
+        }
+        return updateProfileCandidate(id, request);
+    }
+
+    /** Update without the owner guard; only for the profile service, which keeps both in sync. */
+    @Transactional
+    public CandidateDetailResponse updateProfileCandidate(UUID id, CandidateRequest request) {
         Candidate candidate = candidateRepository.findWithSkillsById(id)
                 .orElseThrow(() -> NotFoundException.candidate(id));
         Validated v = validate(request);
@@ -120,6 +142,10 @@ public class CandidateService {
 
     @Transactional
     public void delete(UUID id) {
+        if (candidateRepository.isOwnerProfileCandidate(id)) {
+            throw new ConflictException(ErrorCode.DATA_CONFLICT,
+                    "This candidate is your profile; it can't be deleted here.");
+        }
         if (candidateRepository.deleteByIdReturningCount(id) == 0) {
             throw NotFoundException.candidate(id);
         }

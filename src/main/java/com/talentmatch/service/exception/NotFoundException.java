@@ -25,6 +25,15 @@ public class NotFoundException extends ApiException {
         return new NotFoundException(ErrorCode.SKILL_NOT_FOUND, "No skill with id " + id + ".");
     }
 
+    public static NotFoundException resume(UUID id) {
+        return new NotFoundException(ErrorCode.RESUME_NOT_FOUND, "No uploaded CV with id " + id + ".");
+    }
+
+    public static NotFoundException profile() {
+        return new NotFoundException(ErrorCode.PROFILE_NOT_FOUND, "You have not saved a profile yet. Upload your CV "
+                + "with POST /api/profile/resume, review the draft, then save it with PUT /api/profile.");
+    }
+
     public static NotFoundException recomputeRun(UUID id, int historySize) {
         return new NotFoundException(ErrorCode.RECOMPUTE_RUN_NOT_FOUND, "No recompute run with id " + id
                 + ". Run status is kept in memory (last " + historySize

@@ -44,6 +44,10 @@ public interface CandidateRepository extends JpaRepository<Candidate, UUID> {
     @Query("select c.updatedAt from Candidate c where c.id = :id")
     Optional<Instant> findUpdatedAt(@Param("id") UUID id);
 
+    /** True if this candidate is the owner's master profile (owner_profile, V4). */
+    @Query(value = "SELECT EXISTS (SELECT 1 FROM owner_profile WHERE candidate_id = :id)", nativeQuery = true)
+    boolean isOwnerProfileCandidate(@Param("id") UUID id);
+
     /** Bulk delete; the database cascades candidate_skill and job_match rows. */
     @Modifying
     @Query("delete from Candidate c where c.id = :id")

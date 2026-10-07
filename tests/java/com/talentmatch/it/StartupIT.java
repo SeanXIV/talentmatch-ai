@@ -11,18 +11,18 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.core.env.Environment;
 
-/** §8.1 Startup: Flyway V1..V3, Hibernate validate, health; plus request-id handling. */
+/** §8.1 Startup: Flyway V1..V4, Hibernate validate, health; plus request-id handling. */
 class StartupIT extends AbstractApiIT {
 
     @Autowired
     Environment environment;
 
     @Test
-    void flywayAppliedV1ToV3AndHibernateValidates() {
+    void flywayAppliedV1ToV4AndHibernateValidates() {
         List<String> versions = jdbc.queryForList(
                 "SELECT version FROM flyway_schema_history WHERE success AND version IS NOT NULL ORDER BY installed_rank",
                 String.class);
-        assertThat(versions).containsExactly("1", "2", "3");
+        assertThat(versions).containsExactly("1", "2", "3", "4");
         // The context started with ddl-auto=validate, so the entity mappings match V1.
         assertThat(environment.getProperty("spring.jpa.hibernate.ddl-auto")).isEqualTo("validate");
         assertThat(jdbc.queryForObject("SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'trg_%_skill_touch_%'",

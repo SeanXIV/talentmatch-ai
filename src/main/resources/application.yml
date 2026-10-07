@@ -6,6 +6,9 @@ spring:
     password: ${DB_PASSWORD:talentmatch}        # local dev only (PRODUCTION_READINESS §3)
     hikari:
       pool-name: talentmatch-pool
+      # Never put the failing row ("Detail: Failing row contains ...") in exception messages: for
+      # the resume table that row is the owner's CV text (PII) and would reach the logs.
+      data-source-properties.logServerErrorDetail: false
       maximum-pool-size: ${DB_POOL_SIZE:10}
       minimum-idle: 2
       connection-timeout: 5000
@@ -22,10 +25,15 @@ spring:
     deserialization.fail-on-unknown-properties: true
     serialization.write-dates-as-timestamps: false
   mvc.problemdetails.enabled: false
+  servlet.multipart:
+    max-file-size: 6MB            # above talentmatch.profile.max-resume-bytes so our own 413 message wins
+    max-request-size: 7MB
   lifecycle.timeout-per-shutdown-phase: 30s
 
 server:
+  address: ${SERVER_ADDRESS:127.0.0.1}  # loopback only: no auth yet, and /api/profile is personal data (PRODUCTION_READINESS §6)
   port: ${SERVER_PORT:8080}
+  tomcat.max-swallow-size: 10MB   # read past an oversized upload so the client gets our 413 JSON, not a reset
   shutdown: graceful
   error:
     include-stacktrace: never
@@ -68,5 +76,15 @@ talentmatch:
       model: ${OLLAMA_MODEL:qwen2.5:7b-instruct}
       temperature: 0.2
       max-output-tokens: 400
+      context-tokens: 12288           # num_ctx for explanations AND CV extraction (one value: no model reloads)
+
+  profile:
+    max-resume-bytes: 5242880         # 5 MB
+    allow-remote-extraction: false    # true = send the CV text to the claude/openai provider; Ollama keeps it local
+    max-text-chars: 16000             # longer CV text is truncated (with a warning); must fit context-tokens
+    extraction:
+      call-timeout: 60m               # one model call for the whole CV; CPU-only Ollama (~1.7 tok/s) takes 20-40 min
+      max-output-tokens: 4096
+      temperature: 0.0                # copy the CV faithfully
 
 logging.pattern.level: "%5p [%X{requestId:-}]"

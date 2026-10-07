@@ -5,6 +5,7 @@ import static org.awaitility.Awaitility.await;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.talentmatch.ai.AiCircuitBreaker;
+import com.talentmatch.profile.ResumeExtractionModel;
 import com.talentmatch.support.Api.Res;
 import java.time.Duration;
 import java.util.LinkedHashMap;
@@ -50,8 +51,20 @@ public abstract class AbstractAiApiIT extends AbstractApiIT {
     @Qualifier("aiExecutor")
     protected ThreadPoolTaskExecutor aiExecutor;
 
+    @Autowired
+    protected ResumeExtractionModel extractionModel;
+
+    @Autowired
+    @Qualifier("profileExecutor")
+    protected ThreadPoolTaskExecutor profileExecutor;
+
+    /** The scripted CV extraction model (Phase 4). */
+    protected FakeExtractionModel extractor;
+
     @BeforeEach
     void resetAi() {
+        extractor = (FakeExtractionModel) extractionModel.chatModel();
+        extractor.reset();
         fake.reset();
         circuit.recordSuccess(); // a previous test may have opened the shared circuit
     }
@@ -65,14 +78,23 @@ public abstract class AbstractAiApiIT extends AbstractApiIT {
     @AfterEach
     void drainAi() {
         fake.releaseAll();
+        extractor.releaseAll();
         awaitAiIdle();
         fake.reset();
+        extractor.reset();
     }
 
-    /** Waits until no generation is running or queued (background flights persist themselves). */
+    /**
+     * Waits until no explanation generation and no CV extraction is running or queued (background
+     * work persists itself and must not leak into the next test's truncated tables).
+     */
     protected void awaitAiIdle() {
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(50)).until(() ->
-                aiExecutor.getActiveCount() == 0 && aiExecutor.getThreadPoolExecutor().getQueue().isEmpty());
+                idle(aiExecutor) && idle(profileExecutor));
+    }
+
+    private static boolean idle(ThreadPoolTaskExecutor executor) {
+        return executor.getActiveCount() == 0 && executor.getThreadPoolExecutor().getQueue().isEmpty();
     }
 
     // ------------------------------------------------------------------ fixtures

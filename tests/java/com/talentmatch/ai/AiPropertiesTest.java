@@ -34,6 +34,7 @@ class AiPropertiesTest {
         assertThat(p.ollama().baseUrl()).isEqualTo("http://localhost:11434");
         assertThat(p.ollama().model()).isEqualTo("qwen2.5:7b-instruct");
         assertThat(p.ollama().maxOutputTokens()).isEqualTo(400);
+        assertThat(p.ollama().contextTokens()).as("Phase 4: shared num_ctx").isEqualTo(12288);
         assertThat(p.openai().model()).isEqualTo("gpt-4.1-mini");
         assertThat(p.claude().model()).isEqualTo("claude-sonnet-5-5");
         assertThat(p.claude().effort()).isEmpty();

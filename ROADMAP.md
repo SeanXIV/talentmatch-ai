@@ -83,10 +83,15 @@ Principles for everything below:
   is a later, separate decision (see "Later").
 
 ## Phase 4 — Your master profile (resume upload)
-- [ ] `POST /api/profile/resume`: upload a PDF or DOCX; keep the original file
-- [ ] Extract the text (e.g. Apache Tika) and have the AI turn it into a structured
-      profile: contact, summary, experience (roles, dates, achievements), projects, skills
-      (with years where stated), certifications, education
+- [ ] `POST /api/profile/resume`: upload a **PDF** (DOCX later, see "Later"); keep the
+      original file; list (`GET /api/profile/resumes`) and delete uploads
+- [ ] Extract the text with **Apache PDFBox** (bounded memory and time; scanned PDFs are
+      rejected, no OCR) and have the AI turn it into a structured profile in the background:
+      contact, summary, experience (roles, dates, technologies, achievements), projects,
+      skills (with years only where the CV states them), certifications, education, languages
+- [ ] Never invent: a hand-built response schema lets the model answer `null`; names not
+      found in the CV become warnings for the owner; years not stated next to the skill are
+      dropped
 - [ ] Owner reviews and edits the extracted profile before it is saved (nothing is
       trusted until confirmed); skills map onto the `skill` table, new ones only after
       confirmation
@@ -111,6 +116,10 @@ Principles for everything below:
 - [ ] **Notify** the owner within minutes when a new posting scores above a threshold
       (channel to be chosen: e.g. email, Telegram, ntfy push)
 - [ ] Decide where polling runs (in the Spring app vs. the Python ETL) at phase start
+- [ ] **Job preferences** (V5): target job titles, regions (South Africa + remote), seniority,
+      salary floor, work permits, notice period. Entered by hand by the owner and never
+      AI-extracted from the CV; stored separately from the CV profile and used to filter the
+      feed. The watchlist is refreshed when the confirmed profile `version` changes (Phase 4)
 
 **Demonstrable output:** a phone notification minutes after a matching job goes live.
 
@@ -158,6 +167,9 @@ Principles for everything below:
       never-invent decisions
 
 ## Later (separate decisions)
+- **DOCX CVs:** Phase 4 accepts PDF only (PDFBox). DOCX would need another parser (e.g.
+  Apache POI, or Tika) with the same size, time and memory bounds; until then, export the CV
+  as PDF.
 - **Full automation:** submit applications automatically only where the platform allows
   it, and only after the drafting quality has proven itself under review.
 - **Public, multi-user version:** auth, per-user data isolation, quotas

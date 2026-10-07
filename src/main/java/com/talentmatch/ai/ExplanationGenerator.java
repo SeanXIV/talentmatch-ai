@@ -57,10 +57,19 @@ public class ExplanationGenerator {
     private final Executor executor;
     private final Clock clock;
     private final MeterRegistry meterRegistry;
+    private final LocalModelGate gate; // null unless the provider is a single local model
 
     public ExplanationGenerator(ExplanationAssistant assistant, MatchExplanationValidator validator,
                                 MatchJdbcRepository repository, AiCircuitBreaker circuit, ModelInfo modelInfo,
                                 Executor executor, Clock clock, MeterRegistry meterRegistry) {
+        this(assistant, validator, repository, circuit, modelInfo, executor, clock, meterRegistry, null);
+    }
+
+    /** @param gate shared with CV extraction when the model is local (Ollama); null otherwise */
+    public ExplanationGenerator(ExplanationAssistant assistant, MatchExplanationValidator validator,
+                                MatchJdbcRepository repository, AiCircuitBreaker circuit, ModelInfo modelInfo,
+                                Executor executor, Clock clock, MeterRegistry meterRegistry, LocalModelGate gate) {
+        this.gate = gate;
         this.assistant = Objects.requireNonNull(assistant, "assistant");
         this.validator = Objects.requireNonNull(validator, "validator");
         this.repository = Objects.requireNonNull(repository, "repository");
@@ -73,6 +82,11 @@ public class ExplanationGenerator {
 
     public ModelInfo modelInfo() {
         return modelInfo;
+    }
+
+    /** True while a CV extraction holds the local model; explanations then use templates (AI_BUSY). */
+    public boolean localModelBusy() {
+        return gate != null && gate.exclusiveHeld();
     }
 
     /**
@@ -92,6 +106,22 @@ public class ExplanationGenerator {
 
     /** Runs the task on the calling thread. Never throws. */
     GenerationOutcome run(GenerationTask task) {
+        if (gate != null && !gate.tryAcquireShared()) {
+            log.info("AI explanation job={} candidate={} outcome=local_model_busy (a CV is being read)",
+                    task.job().jobId(), task.match().candidateId());
+            recordTimer("rejected", 0L);
+            return new GenerationOutcome.Rejected(); // AI_BUSY; not a provider failure
+        }
+        try {
+            return call(task);
+        } finally {
+            if (gate != null) {
+                gate.releaseShared();
+            }
+        }
+    }
+
+    private GenerationOutcome call(GenerationTask task) {
         long t0 = System.nanoTime();
         GenerationOutcome outcome = null;
         TokenUsage usage = null;

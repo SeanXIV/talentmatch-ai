@@ -95,7 +95,8 @@ cleaner or loader.
 | `domain.scoring` | **pure** `ScoringEngine` (no Spring, no JPA): score, breakdown, summary | — |
 | `config` | typed properties (`talentmatch.*`), executor, startup failure analyzer | — |
 | `ai` | AI explanation layer: prompt builder + hasher, LangChain4j `ExplanationAssistant`, generator, validator, template renderer, single-flight/backoff (`ExplanationService`), circuit breaker, regenerate rate limiter, `ai` health indicator | `repository`, `domain.scoring`, `ai.config` |
-| `ai.config` | `AiConfiguration` (model info, `aiExecutor`, assistant, generator, `Clock`), one `ChatModel` config per provider, startup failure analyzer | `ai` |
+| `ai.config` | `AiConfiguration` (model info, `aiExecutor`, assistant, generator, `Clock`), one `ChatModel` config per provider (each also builds the CV `ResumeExtractionModel`; Ollama also the `LocalModelGate`), startup failure analyzer | `ai`, `profile` (properties, model holder) |
+| `profile` | owner's master profile (Phase 4): PDF upload and text extraction (`ResumeService`, `ResumeTextExtractor`, PDFBox), background AI extraction (`ResumeExtractionService`, hand-built `ProfileJsonSchema`), cleaning (`ProfileNormalizer`), never-invent checks (`ResumeGrounding`), saving the confirmed profile (`ProfileService`), restart recovery (`ProfileRecovery`), JDBC repositories for `resume` / `owner_profile` | `service`, `repository`, `ai` (`FailureKind`, `LocalModelGate`) |
 
 The schema is owned by Flyway; Hibernate only validates it. `job_match` is read through
 JDBC/JPA; scores are written only by one SQL upsert, and explanations only by one guarded
@@ -233,6 +234,51 @@ preference:
   to the structured-output `output_config.format` instead of being merged. Structured output
   wins: `effort` stays blank (API default, high) and a non-blank value fails startup. The Claude
   wire test checks the request has no duplicate keys and keeps `output_config.format`.
+
+### Master profile from a CV (Phase 4)
+
+```
+POST /api/profile/resume (multipart 'file')
+  > 5 MB → 413 · no %PDF- magic → 415 · same file already uploaded (not FAILED) → 200 existing
+  PDFBox on resumeParserExecutor (64 MB heap cache, 30 s, ≤ 20 pages) ─ fails → 400 RESUME_UNREADABLE
+  tx { advisory lock on sha256 → INSERT resume PENDING } → 202 + Location → enqueue
+profileExecutor (1 thread):
+  claim PENDING → RUNNING (guarded UPDATE, attempts + 1; > 3 → FAILED/TOO_MANY_ATTEMPTS)
+  no AI beans → FAILED/AI_DISABLED
+  hosted provider without allow-remote-extraction → FAILED/REMOTE_EXTRACTION_DISABLED (CV not sent)
+  truncate to max-text-chars (+ warning) → LocalModelGate exclusive (Ollama only)
+  ChatModel.chat(system prompt, <cv>…</cv>, ResponseFormat JSON + ProfileJsonSchema)
+    interrupted (shutdown) → stays RUNNING, re-run on next start
+    timeout / provider error / refusal / bad JSON / cut off → FAILED/<reason>
+    prompt + output ≥ num_ctx − 32 → FAILED/CONTEXT_OVERFLOW
+  ProfileNormalizer LENIENT (placeholders → null, dates, limits) → ResumeGrounding
+  (names, numbers, date years, contacts, links not in the CV, reworded highlights → warnings;
+  years not stated next to the skill → null) → SUCCEEDED
+GET /api/profile/resume/{id} → owner reviews draft + warnings
+PUT /api/profile → tx { advisory lock → STRICT validation → skills (create only if asked)
+  → email clash on first save → 409 profile.email
+  → create/update owner candidate + skills (V2 triggers mark matches stale)
+  → append owner_profile_version (MAX + 1) → upsert owner_profile (current version) }
+startup (ProfileRecovery): RUNNING → PENDING, re-queue all PENDING
+```
+
+- **The CV only reaches the model as data.** It goes in the user message inside `<cv>` tags
+  (tags inside the CV are neutralized); the system prompt says it is data, not instructions.
+- **Nullable schema, built by hand.** `ProfileJsonSchema` mirrors `ProfileDocument`, with every
+  optional scalar as `anyOf: [type, null]`, so a grammar-constrained local model can say "not
+  stated" instead of inventing a value. The call is a plain `ChatModel.chat(ChatRequest)` with a
+  `ResponseFormat`, parsed with Jackson, so it works the same for Ollama, OpenAI and Claude.
+- **One local model, one context size.** Explanation and extraction requests send the same
+  `num_ctx` (`talentmatch.ai.ollama.context-tokens`) so Ollama never reloads the model between
+  them; startup checks that the context can hold the longest CV text plus prompt and output.
+  While an extraction runs (20–40 minutes on a CPU), `LocalModelGate` makes explanations return
+  templates (`AI_BUSY`) instead of queueing behind it.
+- **The CV leaves the machine only on purpose.** With Ollama it never does. With a hosted
+  provider, extraction runs only when `talentmatch.profile.allow-remote-extraction=true`.
+- **The owner's candidate is the profile's mirror.** Saving the profile writes the candidate
+  row and its skills, so the Phase 2 scoring and matching see the owner like any candidate. The
+  candidates API refuses to change (`PUT`) or delete that candidate (`409`); it is edited only
+  through `PUT /api/profile`.
 
 ### AI explains, never scores
 

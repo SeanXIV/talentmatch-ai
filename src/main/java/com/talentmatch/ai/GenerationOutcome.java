@@ -26,7 +26,7 @@ public sealed interface GenerationOutcome
         }
     }
 
-    /** The AI executor was full; no call was made (AI_BUSY). */
+    /** The AI executor was full, or the local model is busy reading a CV; no call was made (AI_BUSY). */
     record Rejected() implements GenerationOutcome {
     }
 }

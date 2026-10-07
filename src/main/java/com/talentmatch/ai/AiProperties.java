@@ -54,7 +54,7 @@ public record AiProperties(
         requireBetween("failure-backoff", failureBackoff, Duration.ZERO, null);
         requireBetween("regenerate-window", regenerateWindow, Duration.ofSeconds(1), null);
         circuit = circuit == null ? new Circuit(3, Duration.ofSeconds(30)) : circuit;
-        ollama = ollama == null ? new Ollama(null, null, 0.2, 400) : ollama;
+        ollama = ollama == null ? new Ollama(null, null, 0.2, 400, Ollama.DEFAULT_CONTEXT_TOKENS) : ollama;
         openai = openai == null ? new OpenAi(null, null, null, 0.2, 500) : openai;
         claude = claude == null ? new Claude(null, null, null, 3000, "", false) : claude;
     }
@@ -106,12 +106,23 @@ public record AiProperties(
         }
     }
 
-    /** Local Ollama (default provider). */
+    /**
+     * Local Ollama (default provider).
+     *
+     * @param contextTokens context window ({@code num_ctx}) for BOTH the explanation and the CV
+     *                      extraction model. One value on purpose: Ollama reloads the model
+     *                      (~4.7 GB) whenever num_ctx changes between requests. Must fit the CV
+     *                      extraction budget (checked at startup). The KV cache costs about
+     *                      56 KB per token for qwen2.5-7B (12288 ≈ 0.7 GB on top of the model).
+     */
     public record Ollama(
             @DefaultValue("http://localhost:11434") String baseUrl,
             @DefaultValue("qwen2.5:7b-instruct") String model,
             @DefaultValue("0.2") double temperature,
-            @DefaultValue("400") int maxOutputTokens) {
+            @DefaultValue("400") int maxOutputTokens,
+            @DefaultValue("12288") @Min(2048) @Max(131072) int contextTokens) {
+
+        public static final int DEFAULT_CONTEXT_TOKENS = 12288;
 
         public Ollama {
             baseUrl = isBlank(baseUrl) ? "http://localhost:11434" : baseUrl.strip();
