@@ -10,6 +10,9 @@ The schema is created by the Flyway migrations in `src/main/resources/db/migrati
   (Phase 3; see "AI explanations" below).
 - `V4__owner_profile.sql`: uploaded CVs (`resume`) and the owner's confirmed master profile
   (`owner_profile`) (Phase 4; see "Master profile" below).
+- `V5__job_feed.sql`: job origin (`MANUAL` | `FEED`), skill aliases, and the job feed tables
+  (`feed_source`, `feed_job`, `job_posting`, `job_preferences`, `notification_settings`,
+  `feed_notification`, `feed_state`, `feed_api_usage`) (Phase 5; see "Job origin" below).
 
 ## Entity-Relationship Diagram
 
@@ -40,6 +43,7 @@ erDiagram
         string title
         string company
         text description
+        string origin
         timestamp created_at
         timestamp updated_at
     }
@@ -127,7 +131,17 @@ and is unique.
 
 ### `job`
 Core job record. `description` provides context for AI explanations in the
-same way `candidate.summary` does. The pair `(title, company)` is unique.
+same way `candidate.summary` does.
+
+**Job origin (V5).** `origin` is `MANUAL` (created through the API or loaded by the ETL; the
+default) or `FEED` (created and kept up to date by the Phase 5 job feed). The pair
+`(title, company)` is unique **among MANUAL jobs only** (partial unique index
+`uq_job_title_company_manual`): real postings repeat a title and company (one role in several
+cities, a re-post), so feed jobs are deduplicated by `feed_job.dedup_key` instead. Upserts by the
+natural key must say `ON CONFLICT (title, company) WHERE origin = 'MANUAL'`. `UNIQUE (id, origin)`
+lets `feed_job` reference `(job_id, 'FEED')`, so only FEED jobs can have feed rows. FEED jobs are
+read-only in `/api/jobs` (`PUT`/`DELETE` → 409 `DATA_CONFLICT`). The remaining V5 feed tables
+are documented with the rest of Phase 5.
 
 ### `skill`
 A normalized skill lookup table (e.g. "Java", "SQL", "React") shared between

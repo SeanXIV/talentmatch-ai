@@ -15,10 +15,16 @@ import java.util.UUID;
 import org.hibernate.annotations.Generated;
 import org.hibernate.generator.EventType;
 
-/** A job opening; (title, company) is unique. */
+/**
+ * A job opening. {@code origin} is MANUAL (API / ETL; (title, company) is unique among these) or FEED
+ * (created and kept up to date by the job feed through JDBC; read-only here).
+ */
 @Entity
 @Table(name = "job")
 public class Job {
+
+    public static final String ORIGIN_MANUAL = "MANUAL";
+    public static final String ORIGIN_FEED = "FEED";
 
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)
@@ -32,6 +38,10 @@ public class Job {
 
     @Column(name = "description", columnDefinition = "text")
     private String description;
+
+    /** Never written through JPA: the column default is MANUAL; FEED jobs are inserted by the feed (JDBC). */
+    @Column(name = "origin", nullable = false, length = 10, insertable = false, updatable = false)
+    private String origin;
 
     @Generated(event = EventType.INSERT)
     @Column(name = "created_at", insertable = false, updatable = false)
@@ -51,6 +61,7 @@ public class Job {
         this.title = title;
         this.company = company;
         this.description = description;
+        this.origin = ORIGIN_MANUAL;   // matches the column default the insert relies on
     }
 
     public UUID getId() {
@@ -79,6 +90,14 @@ public class Job {
 
     public void setDescription(String description) {
         this.description = description;
+    }
+
+    public String getOrigin() {
+        return origin;
+    }
+
+    public boolean isFeed() {
+        return ORIGIN_FEED.equals(origin);
     }
 
     public Instant getCreatedAt() {

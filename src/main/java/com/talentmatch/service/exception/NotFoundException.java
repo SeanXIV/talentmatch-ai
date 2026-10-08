@@ -34,6 +34,16 @@ public class NotFoundException extends ApiException {
                 + "with POST /api/profile/resume, review the draft, then save it with PUT /api/profile.");
     }
 
+    public static NotFoundException preferences() {
+        return new NotFoundException(ErrorCode.PREFERENCES_NOT_FOUND,
+                "No job preferences saved yet; the feed is not filtered. Save them with PUT /api/preferences.");
+    }
+
+    public static NotFoundException skillAlias(UUID skillId, UUID aliasId) {
+        return new NotFoundException(ErrorCode.SKILL_ALIAS_NOT_FOUND,
+                "Skill " + skillId + " has no alias with id " + aliasId + ".");
+    }
+
     public static NotFoundException recomputeRun(UUID id, int historySize) {
         return new NotFoundException(ErrorCode.RECOMPUTE_RUN_NOT_FOUND, "No recompute run with id " + id
                 + ". Run status is kept in memory (last " + historySize

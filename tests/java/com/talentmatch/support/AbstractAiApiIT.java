@@ -34,7 +34,14 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
         "talentmatch.ai.call-timeout=3s",
         "talentmatch.ai.top-n=3",
         "talentmatch.ai.failure-backoff=60s",
-        "talentmatch.ai.regenerate-window=60s"})
+        "talentmatch.ai.regenerate-window=60s",
+        // Phase 5: no feed scheduling, no real provider network (same as AbstractApiIT)
+        "talentmatch.feed.scheduler.enabled=false",
+        "talentmatch.feed.greenhouse.base-url=http://localhost:1",
+        "talentmatch.feed.lever.base-url=http://localhost:1",
+        "talentmatch.feed.lever.eu-base-url=http://localhost:1",
+        "talentmatch.feed.ashby.base-url=http://localhost:1",
+        "talentmatch.feed.adzuna.base-url=http://localhost:1"})
 @Import({TestcontainersConfiguration.class, FakeChatModelConfig.class})
 public abstract class AbstractAiApiIT extends AbstractApiIT {
 

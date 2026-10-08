@@ -90,14 +90,19 @@ public class GlobalExceptionHandler {
     private static final int MAX_CAUSES_INSPECTED = 64;
     private static final String HIKARI_CLOSED_CONNECTION = "Connection is closed";
 
-    /** Unique constraint / index name (verified against V1__init_schema.sql) -> conflict. */
+    /**
+     * Unique constraint / index name (verified against V1__init_schema.sql; the job key is the V5
+     * partial index over MANUAL jobs) -> conflict.
+     */
     private static final Map<String, Conflict> CONFLICTS = Map.of(
             "uq_candidate_email", new Conflict(ErrorCode.EMAIL_ALREADY_EXISTS,
                     "A candidate with this email already exists."),
-            "uq_job_title_company", new Conflict(ErrorCode.JOB_ALREADY_EXISTS,
+            "uq_job_title_company_manual", new Conflict(ErrorCode.JOB_ALREADY_EXISTS,
                     "A job with this title and company already exists."),
             "uq_skill_name_lower", new Conflict(ErrorCode.SKILL_ALREADY_EXISTS,
-                    "A skill with this name already exists (names are case-insensitive)."));
+                    "A skill with this name already exists (names are case-insensitive)."),
+            "uq_skill_alias_lower", new Conflict(ErrorCode.SKILL_ALIAS_ALREADY_EXISTS,
+                    "This alias already exists (aliases are case-insensitive)."));
 
     private record Conflict(ErrorCode code, String message) {
     }

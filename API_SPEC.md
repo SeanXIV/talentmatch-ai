@@ -134,13 +134,16 @@ Sorted by `title`, `company`, `id`.
 {
   "content": [
     { "id": "uuid", "title": "Backend Engineer", "company": "Acme", "description": "...",
-      "skillCount": 4, "matchable": true }
+      "skillCount": 4, "matchable": true, "origin": "MANUAL" }
   ],
   "page": 0, "size": 20, "totalPages": 3, "totalElements": 50
 }
 ```
 `skillCount` and `matchable` are **(extension)**. `matchable` is `false` for jobs with no
 skills (possible for ETL-loaded jobs).
+`origin` **(extension, Phase 5)** is `MANUAL` (created here or by the ETL) or `FEED` (found by
+the job feed). FEED jobs are listed and can be matched like any other job, but they are
+read-only here: `PUT` and `DELETE` answer `409 DATA_CONFLICT`.
 
 ### `GET /jobs/{id}`
 **Response `200`**
@@ -149,7 +152,8 @@ skills (possible for ETL-loaded jobs).
   "id": "uuid", "title": "Backend Engineer", "company": "Acme", "description": "...",
   "matchable": true,
   "skills": [ { "skillId": "uuid", "name": "Java", "category": "Language", "required": true } ],
-  "createdAt": "2026-10-01T10:00:00Z", "updatedAt": "2026-10-01T10:00:00Z"
+  "createdAt": "2026-10-01T10:00:00Z", "updatedAt": "2026-10-01T10:00:00Z",
+  "origin": "MANUAL"
 }
 ```
 **Errors:** `400 INVALID_ID`, `404 JOB_NOT_FOUND`
@@ -164,7 +168,7 @@ skills (possible for ETL-loaded jobs).
 | Field | Rule |
 |---|---|
 | `title` | required, max 300 |
-| `company` | required, max 200; `(title, company)` unique after trimming |
+| `company` | required, max 200; `(title, company)` unique after trimming among MANUAL jobs (a FEED job with the same pair doesn't conflict) |
 | `description` | optional, max 20000 |
 | `skills` | **at least 1**, max 100 (`"Add at least one skill so candidates can be ranked for this job."`) |
 | `skills[i].name` | required, must exist, no duplicates |
@@ -174,10 +178,14 @@ skills (possible for ETL-loaded jobs).
 
 ### `PUT /jobs/{id}` **(extension)**
 Full replace, links diffed like candidates. **Response `200`**.
-**Errors:** `400`, `404 JOB_NOT_FOUND`, `409 JOB_ALREADY_EXISTS`
+**Errors:** `400`, `404 JOB_NOT_FOUND`, `409 JOB_ALREADY_EXISTS`, `409 DATA_CONFLICT` for a FEED
+job (checked before the body is validated): `"This job comes from the job feed (source
+greenhouse:acme) and is kept up to date automatically. It can't be edited or deleted here."`
+(the source part is omitted when the job has no posting).
 
 ### `DELETE /jobs/{id}` **(extension)**
-**Response `204`** (also deletes the job's skills and match rows). **Errors:** `400`, `404`
+**Response `204`** (also deletes the job's skills and match rows). **Errors:** `400`, `404`,
+`409 DATA_CONFLICT` for a FEED job (same message as `PUT`).
 
 ---
 
@@ -197,9 +205,73 @@ Sorted by `lower(name)`, then `id`. Items: `{ "id", "name", "category" }`.
 `name` required, max 100 (whitespace normalized); `category` optional, max 100.
 **Response `201`** with `Location: /api/skills/{id}`.
 **Errors:** `400 VALIDATION_FAILED`, `409 SKILL_ALREADY_EXISTS`
-(`"A skill named 'kubernetes' already exists as 'Kubernetes' (id …)."`)
+(`"A skill named 'kubernetes' already exists as 'Kubernetes' (id …)."`). Since Phase 5, also
+`409 SKILL_ALREADY_EXISTS` when the name is already an alias of a skill
+(`"'Postgres' is already another name (alias) for 'PostgreSQL' (skill id …). Use that skill, or delete the alias first."`).
 
 No `PUT`/`DELETE` for skills in Phase 2.
+
+**Aliases in requests (Phase 5).** Wherever a request names skills (candidates, jobs, the
+profile), a name that is not a skill name but is an alias resolves to the alias's skill
+("Postgres" → PostgreSQL). An exact skill name always wins. Two names for the same skill in one
+list are a duplicate (`400`, at the second entry).
+
+### `GET /skills/{id}/aliases` (Phase 5)
+**Response `200`** `[ { "id", "alias", "createdAt" } ]`, sorted by alias.
+**Errors:** `400 INVALID_ID`, `404 SKILL_NOT_FOUND`
+
+### `POST /skills/{id}/aliases` (Phase 5)
+```json
+{ "alias": "Postgres" }
+```
+`alias` required, max 100 (whitespace normalized). **Response `201`** with
+`Location: /api/skills/{id}/aliases/{aliasId}`.
+**Errors:** `400 VALIDATION_FAILED`, `404 SKILL_NOT_FOUND`, `409 SKILL_ALIAS_ALREADY_EXISTS` (the
+alias exists already, on any skill, or it is the name of a skill).
+
+### `DELETE /skills/{id}/aliases/{aliasId}` (Phase 5)
+**Response `204`**. **Errors:** `400 INVALID_ID`, `404 SKILL_NOT_FOUND`, `404 SKILL_ALIAS_NOT_FOUND`
+
+---
+
+## Preferences (Phase 5)
+
+Hand-entered filters for the job feed. Nothing derives them from the CV or from AI.
+
+### `GET /preferences`
+**Response `200`** `{ "version": 3, "preferences": { … }, "updatedAt": "…" }`.
+**Errors:** `404 PREFERENCES_NOT_FOUND` (`"No job preferences saved yet; the feed is not filtered. …"`)
+
+### `PUT /preferences`
+Full replace; the version goes up by one on every save. **Response `200`** (same shape as `GET`).
+```json
+{ "preferences": {
+    "targetTitles": ["Backend Engineer"],
+    "excludedTitleKeywords": ["Intern", "Sales"],
+    "regions": { "countries": ["ZA"], "includeRemote": true, "remoteScope": "ELIGIBLE_FROM_COUNTRIES",
+                 "remoteLocationKeywords": ["worldwide", "anywhere", "global", "emea", "africa", "south africa"] },
+    "seniority": ["MID", "SENIOR"],
+    "salaryFloor": { "amount": 600000, "currency": "ZAR", "period": "YEAR" },
+    "workAuthorization": ["ZA"],
+    "noticePeriodDays": 30 } }
+```
+| Field | Rule (every field optional) |
+|---|---|
+| `targetTitles` | 0–20 items, each 2–100 characters; empty = any title |
+| `excludedTitleKeywords` | 0–30 items, each 2–50 characters |
+| `regions` | omitted → the defaults shown above |
+| `regions.countries` | ISO 3166 alpha-2 (case-insensitive), at most 50; omitted → `["ZA"]`; empty = any country |
+| `regions.includeRemote` | default `true` |
+| `regions.remoteScope` | `ANYWHERE` or `ELIGIBLE_FROM_COUNTRIES` (default) |
+| `regions.remoteLocationKeywords` | 0–30 items, each 2–50 characters; omitted → the defaults above |
+| `seniority` | `INTERN`, `JUNIOR`, `MID`, `SENIOR`, `LEAD`, `PRINCIPAL`, `MANAGER`; empty = any |
+| `salaryFloor` | optional; `amount` > 0, `currency` ISO 4217, `period` `YEAR` or `MONTH` |
+| `workAuthorization` | ISO 3166 alpha-2, at most 50; empty = not checked |
+| `noticePeriodDays` | 0–365 |
+
+Text is trimmed and whitespace runs are collapsed; duplicates (ignoring case) are dropped.
+Field errors use full paths, e.g. `preferences.regions.countries[1]`: `"'XX' is not an ISO country code."`
+**Errors:** `400 VALIDATION_FAILED`; `400 MALFORMED_REQUEST` for unknown fields or enum values.
 
 ---
 
@@ -594,12 +666,12 @@ exception class names or SQL.
 | 400 | `INVALID_ID` | path id is not a UUID (`"'abc' is not a valid id. Ids look like 3f2c0e9a-…"`) |
 | 400 | `MALFORMED_REQUEST` | body is not valid JSON, has an unknown field, or a field has the wrong type |
 | 400 | `RESUME_UNREADABLE` | uploaded PDF can't be read (damaged, protected, scanned, too many pages, too slow) **(Phase 4)** |
-| 404 | `CANDIDATE_NOT_FOUND` / `JOB_NOT_FOUND` / `SKILL_NOT_FOUND` / `RECOMPUTE_RUN_NOT_FOUND` / `RESUME_NOT_FOUND` / `PROFILE_NOT_FOUND` | resource missing |
+| 404 | `CANDIDATE_NOT_FOUND` / `JOB_NOT_FOUND` / `SKILL_NOT_FOUND` / `RECOMPUTE_RUN_NOT_FOUND` / `RESUME_NOT_FOUND` / `PROFILE_NOT_FOUND` / `PREFERENCES_NOT_FOUND` / `SKILL_ALIAS_NOT_FOUND` | resource missing |
 | 404 | `ENDPOINT_NOT_FOUND` | no such endpoint (`"No endpoint GET /api/foo."`) |
 | 405 | `METHOD_NOT_ALLOWED` | wrong HTTP method (`Allow` header lists the supported ones) |
 | 413 | `PAYLOAD_TOO_LARGE` | uploaded CV over the size limit **(Phase 4)** |
 | 415 | `UNSUPPORTED_MEDIA_TYPE` | body is not `application/json` (upload endpoints: not `multipart/form-data`, or the file is not a PDF); the message says what to send |
-| 409 | `EMAIL_ALREADY_EXISTS` / `JOB_ALREADY_EXISTS` / `SKILL_ALREADY_EXISTS` | natural-key conflict |
+| 409 | `EMAIL_ALREADY_EXISTS` / `JOB_ALREADY_EXISTS` / `SKILL_ALREADY_EXISTS` / `SKILL_ALIAS_ALREADY_EXISTS` | natural-key conflict |
 | 409 | `DATA_CONFLICT` | other conflicting concurrent change |
 | 409 | `RECOMPUTE_ALREADY_RUNNING` | a batch recompute is active |
 | 409 | `RESUME_EXTRACTION_IN_PROGRESS` | the CV is queued or being read **(Phase 4)** |

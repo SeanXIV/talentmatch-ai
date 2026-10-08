@@ -1,6 +1,7 @@
 package com.talentmatch.service;
 
 import com.talentmatch.domain.entity.Skill;
+import com.talentmatch.repository.SkillAliasRepository;
 import com.talentmatch.repository.SkillRepository;
 import com.talentmatch.service.exception.ConflictException;
 import com.talentmatch.service.exception.NotFoundException;
@@ -21,9 +22,11 @@ public class SkillService {
     public static final int MAX_CATEGORY_LENGTH = 100;
 
     private final SkillRepository skillRepository;
+    private final SkillAliasRepository aliasRepository;
 
-    public SkillService(SkillRepository skillRepository) {
+    public SkillService(SkillRepository skillRepository, SkillAliasRepository aliasRepository) {
         this.skillRepository = skillRepository;
+        this.aliasRepository = aliasRepository;
     }
 
     @Transactional(readOnly = true)
@@ -56,10 +59,17 @@ public class SkillService {
         errors.maxLength("category", category, MAX_CATEGORY_LENGTH, "Category");
         errors.throwIfAny();
 
+        aliasRepository.lockVocabulary(); // a skill name must never equal an alias (V5, skill_alias)
         skillRepository.findByNameIgnoringCase(name).ifPresent(existing -> {
             throw new ConflictException(ErrorCode.SKILL_ALREADY_EXISTS,
                     "A skill named '" + name + "' already exists as '" + existing.getName()
                             + "' (id " + existing.getId() + ").");
+        });
+        aliasRepository.findByAliasIgnoringCase(name).ifPresent(alias -> {
+            String target = skillRepository.findById(alias.skillId()).map(Skill::getName).orElse("another skill");
+            throw new ConflictException(ErrorCode.SKILL_ALREADY_EXISTS,
+                    "'" + name + "' is already another name (alias) for '" + target + "' (skill id "
+                            + alias.skillId() + "). Use that skill, or delete the alias first.");
         });
         Skill saved = skillRepository.saveAndFlush(new Skill(name, category));
         return toResponse(saved);

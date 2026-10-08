@@ -82,6 +82,13 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     `application-prod.yml` sets `spring.flyway.enabled=false`. Schema changes since V1 are
     additive migrations (`V2__skill_link_staleness.sql`, `V3__match_explanation.sql`). Still open: the pipeline step,
     least-privilege users, backups.
+  - **Phase 5 (V5, not purely additive):** `V5__job_feed.sql` adds `job.origin` (`MANUAL` | `FEED`)
+    and replaces the `uq_job_title_company` constraint with the partial unique index
+    `uq_job_title_company_manual ON job (title, company) WHERE origin = 'MANUAL'`. Any external
+    writer that upserts jobs must use `ON CONFLICT (title, company) WHERE origin = 'MANUAL'`
+    (PostgreSQL only infers a partial index when the predicate is repeated); the ETL loader does.
+    The old app version's JPA lookups ignore `origin`, so don't run it against a V5 database
+    that holds feed jobs.
 
 - [ ] **Local Docker Postgres → AWS RDS**
   - **Now (dev):** container `talentmatch-postgres` (`postgres:16`, volume
