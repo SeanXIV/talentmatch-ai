@@ -87,9 +87,12 @@ talentmatch:
       max-output-tokens: 4096
       temperature: 0.0                # copy the CV faithfully
 
-  # Job feed (Phase 5). Source layer (com.talentmatch.feed.source.SourceProperties); the scheduler,
-  # intervals, closing and skills keys arrive with the poller (FeedProperties).
+  # Job feed (Phase 5). Source layer: com.talentmatch.feed.source.SourceProperties (max-postings,
+  # http, provider hosts). Feed level: com.talentmatch.feed.FeedProperties (intervals, probe-timeout;
+  # the scheduler, lease, closing and skills keys arrive with the poller).
   feed:
+    probe-timeout: 10s                # POST /api/feed/sources waits this long for the board check
+    intervals: { ats: 5m, ats-min: 2m, aggregator: 15m, aggregator-min: 10m, max-backoff: 1h, not-found-backoff: 6h }
     max-postings-per-source: 5000     # more in one listing -> INVALID_RESPONSE (runaway data)
     http:
       connect-timeout: 5s

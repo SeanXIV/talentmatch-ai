@@ -44,6 +44,11 @@ public class NotFoundException extends ApiException {
                 "Skill " + skillId + " has no alias with id " + aliasId + ".");
     }
 
+    public static NotFoundException feedSource(UUID id) {
+        return new NotFoundException(ErrorCode.FEED_SOURCE_NOT_FOUND, "No feed source with id " + id
+                + ". List your sources with GET /api/feed/sources.");
+    }
+
     public static NotFoundException recomputeRun(UUID id, int historySize) {
         return new NotFoundException(ErrorCode.RECOMPUTE_RUN_NOT_FOUND, "No recompute run with id " + id
                 + ". Run status is kept in memory (last " + historySize

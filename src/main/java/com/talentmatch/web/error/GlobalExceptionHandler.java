@@ -92,7 +92,8 @@ public class GlobalExceptionHandler {
 
     /**
      * Unique constraint / index name (verified against V1__init_schema.sql; the job key is the V5
-     * partial index over MANUAL jobs) -> conflict.
+     * partial index over MANUAL jobs; feed_source_source_key_key is PostgreSQL's name for the V5
+     * column-level UNIQUE on feed_source.source_key) -> conflict.
      */
     private static final Map<String, Conflict> CONFLICTS = Map.of(
             "uq_candidate_email", new Conflict(ErrorCode.EMAIL_ALREADY_EXISTS,
@@ -102,7 +103,10 @@ public class GlobalExceptionHandler {
             "uq_skill_name_lower", new Conflict(ErrorCode.SKILL_ALREADY_EXISTS,
                     "A skill with this name already exists (names are case-insensitive)."),
             "uq_skill_alias_lower", new Conflict(ErrorCode.SKILL_ALIAS_ALREADY_EXISTS,
-                    "This alias already exists (aliases are case-insensitive)."));
+                    "This alias already exists (aliases are case-insensitive)."),
+            // Safety net: FeedSourceService inserts with ON CONFLICT and reports the existing id itself.
+            "feed_source_source_key_key", new Conflict(ErrorCode.FEED_SOURCE_ALREADY_EXISTS,
+                    "This source is already on your watchlist. List your sources with GET /api/feed/sources."));
 
     private record Conflict(ErrorCode code, String message) {
     }

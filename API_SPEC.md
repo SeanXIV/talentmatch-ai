@@ -275,6 +275,79 @@ Field errors use full paths, e.g. `preferences.regions.countries[1]`: `"'XX' is 
 
 ---
 
+## Job feed sources (Phase 5)
+
+The watchlist of company job boards the feed polls. Polling starts with a later step.
+
+**`FeedSourceResponse`**
+```json
+{ "id": "…", "kind": "LEVER", "managedBy": "OWNER", "state": "ACTIVE", "companyName": "Acme",
+  "boardToken": "acme", "options": { "leverInstance": "eu" }, "pollIntervalSeconds": null,
+  "effectivePollIntervalSeconds": 300, "nextPollAt": "…", "lastPolledAt": null, "lastSuccessAt": null,
+  "lastStatus": null, "lastError": null, "consecutiveFailures": 0, "openPostings": 0,
+  "baselineAt": null, "createdAt": "…", "warnings": [] }
+```
+`effectivePollIntervalSeconds` is the interval actually used: `pollIntervalSeconds`, or the default
+for the kind (company boards: 300), and never below the minimum (company boards: 120).
+`warnings` is filled only by `POST`. No ETag, body hash or API key is ever returned.
+
+### `GET /feed/sources`
+**Query params:** `page`, `size`, `kind` (`GREENHOUSE` | `LEVER` | `ASHBY` | `ADZUNA`), `state`
+(`ACTIVE` | `PAUSED`). Newest first. **Response `200`** `PageResponse<FeedSourceResponse>`.
+**Errors:** `400 INVALID_PARAMETER`
+
+### `GET /feed/sources/{id}`
+**Response `200`**. **Errors:** `400 INVALID_ID`, `404 FEED_SOURCE_NOT_FOUND`
+
+### `POST /feed/sources`
+```json
+{ "kind": "LEVER", "boardToken": "acme", "companyName": "Acme",
+  "options": { "leverInstance": "eu" }, "pollIntervalSeconds": 600, "verify": true }
+```
+| Field | Rule |
+|---|---|
+| `kind` | required: `GREENHOUSE`, `LEVER` or `ASHBY`. `ADZUNA` is not available yet (`400` on `kind`) |
+| `boardToken` | required; `[A-Za-z0-9._-]{1,100}`, the board name from the URL (`boards.greenhouse.io/<token>`, `jobs.lever.co/<site>`, `jobs.ashbyhq.com/<name>`) |
+| `companyName` | optional, max 200; Greenhouse fills it from the board when omitted |
+| `options.leverInstance` | Lever only: `"eu"` (jobs.eu.lever.co) or `"global"` (default) |
+| `pollIntervalSeconds` | optional, 120..86400 for company boards |
+| `verify` | default `true`: check the board with the provider first (waits at most 10 s) |
+
+Greenhouse and Ashby tokens are case-insensitive (`Acme` and `acme` are the same source). **Lever
+site names are case-sensitive** and kept as given.
+
+**Response `201`** with `Location: /api/feed/sources/{id}`. `warnings` explains anything to watch:
+- `"The board exists but has no open postings right now."`
+- `"Couldn't reach Lever to check the board; it will be checked on the first poll."` (network
+  error, timeout or 5xx; the source is saved anyway). Rate limits and odd answers get a similar note.
+- `verify: false` saves without a check and says so.
+
+**Errors:**
+- `400 VALIDATION_FAILED`: invalid fields, or the provider has no such board (field `boardToken`:
+  `"Greenhouse has no job board 'acme'. Check the token in the board URL (boards.greenhouse.io/<token>)."`).
+- `400 MALFORMED_REQUEST`: unknown fields or an unknown `kind`.
+- `409 FEED_SOURCE_ALREADY_EXISTS`: `"Lever site 'acme' is already on your watchlist (source id …)."`
+
+### `PUT /feed/sources/{id}`
+```json
+{ "companyName": "Acme", "state": "PAUSED", "pollIntervalSeconds": null }
+```
+Full replace of the editable fields: `state` is required; a missing `companyName` or
+`pollIntervalSeconds` clears it (the interval goes back to the default). `kind`, `boardToken` and
+`options` can't be changed (`400 MALFORMED_REQUEST`, unknown field). A paused source set back to
+`ACTIVE` is due at once. **Response `200`**.
+**Errors:** `400 VALIDATION_FAILED`, `400 INVALID_ID`, `404 FEED_SOURCE_NOT_FOUND`,
+`409 DATA_CONFLICT` (the source is managed by your job preferences; change those instead).
+
+### `DELETE /feed/sources/{id}`
+**Response `204`**. The source's postings are deleted, and so are feed jobs left with no posting
+(with their skills, matches and notifications). A job that still has a posting from another source
+is kept.
+**Errors:** `400 INVALID_ID`, `404 FEED_SOURCE_NOT_FOUND`, `409 DATA_CONFLICT` (managed by your job
+preferences).
+
+---
+
 ## Matches
 
 ### `GET /jobs/{id}/matches`
@@ -666,12 +739,12 @@ exception class names or SQL.
 | 400 | `INVALID_ID` | path id is not a UUID (`"'abc' is not a valid id. Ids look like 3f2c0e9a-…"`) |
 | 400 | `MALFORMED_REQUEST` | body is not valid JSON, has an unknown field, or a field has the wrong type |
 | 400 | `RESUME_UNREADABLE` | uploaded PDF can't be read (damaged, protected, scanned, too many pages, too slow) **(Phase 4)** |
-| 404 | `CANDIDATE_NOT_FOUND` / `JOB_NOT_FOUND` / `SKILL_NOT_FOUND` / `RECOMPUTE_RUN_NOT_FOUND` / `RESUME_NOT_FOUND` / `PROFILE_NOT_FOUND` / `PREFERENCES_NOT_FOUND` / `SKILL_ALIAS_NOT_FOUND` | resource missing |
+| 404 | `CANDIDATE_NOT_FOUND` / `JOB_NOT_FOUND` / `SKILL_NOT_FOUND` / `RECOMPUTE_RUN_NOT_FOUND` / `RESUME_NOT_FOUND` / `PROFILE_NOT_FOUND` / `PREFERENCES_NOT_FOUND` / `SKILL_ALIAS_NOT_FOUND` / `FEED_SOURCE_NOT_FOUND` | resource missing |
 | 404 | `ENDPOINT_NOT_FOUND` | no such endpoint (`"No endpoint GET /api/foo."`) |
 | 405 | `METHOD_NOT_ALLOWED` | wrong HTTP method (`Allow` header lists the supported ones) |
 | 413 | `PAYLOAD_TOO_LARGE` | uploaded CV over the size limit **(Phase 4)** |
 | 415 | `UNSUPPORTED_MEDIA_TYPE` | body is not `application/json` (upload endpoints: not `multipart/form-data`, or the file is not a PDF); the message says what to send |
-| 409 | `EMAIL_ALREADY_EXISTS` / `JOB_ALREADY_EXISTS` / `SKILL_ALREADY_EXISTS` / `SKILL_ALIAS_ALREADY_EXISTS` | natural-key conflict |
+| 409 | `EMAIL_ALREADY_EXISTS` / `JOB_ALREADY_EXISTS` / `SKILL_ALREADY_EXISTS` / `SKILL_ALIAS_ALREADY_EXISTS` / `FEED_SOURCE_ALREADY_EXISTS` | natural-key conflict |
 | 409 | `DATA_CONFLICT` | other conflicting concurrent change |
 | 409 | `RECOMPUTE_ALREADY_RUNNING` | a batch recompute is active |
 | 409 | `RESUME_EXTRACTION_IN_PROGRESS` | the CV is queued or being read **(Phase 4)** |
