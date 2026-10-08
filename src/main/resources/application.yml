@@ -87,4 +87,19 @@ talentmatch:
       max-output-tokens: 4096
       temperature: 0.0                # copy the CV faithfully
 
+  # Job feed (Phase 5). Source layer (com.talentmatch.feed.source.SourceProperties); the scheduler,
+  # intervals, closing and skills keys arrive with the poller (FeedProperties).
+  feed:
+    max-postings-per-source: 5000     # more in one listing -> INVALID_RESPONSE (runaway data)
+    http:
+      connect-timeout: 5s
+      read-timeout: 30s               # whole response, body included
+      max-body-bytes: 20971520        # 20 MB, counted after gzip decompression (and on plain bodies)
+      poll-threads: 2
+      min-host-spacing: 1s
+      user-agent: "TalentMatch/0.5 (personal job search${FEED_CONTACT:})"   # e.g. FEED_CONTACT="; mailto:you@x"
+    greenhouse: { base-url: https://boards-api.greenhouse.io, max-detail-calls-per-poll: 20 }
+    lever: { base-url: https://api.lever.co, eu-base-url: https://api.eu.lever.co }
+    ashby: { base-url: https://api.ashbyhq.com }
+
 logging.pattern.level: "%5p [%X{requestId:-}]"
