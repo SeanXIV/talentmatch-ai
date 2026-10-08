@@ -16,21 +16,43 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.Function;
 
 /**
  * Local JDK HTTP stub for integration tests (127.0.0.1, random port): routes by exact path, records
- * every request, unrouted paths answer 404 text/plain. Lives for the JVM (one per IT context).
+ * every request (with its headers), unrouted paths answer 404 text/plain. A route can be a fixed
+ * {@link Reply} or a function of the request (conditional requests, sequences). Lives for the JVM
+ * (one per IT context).
  */
 public final class RouteStubServer {
 
-    public record Captured(String method, URI uri) {
+    public record Captured(String method, URI uri, Map<String, List<String>> headers) {
+
+        public Captured(String method, URI uri) {
+            this(method, uri, Map.of());
+        }
+
         public String path() {
             return uri.getPath();
         }
+
+        /** First value of a request header (case-insensitive), or null. */
+        public String header(String name) {
+            return headers.entrySet().stream().filter(e -> e.getKey().equalsIgnoreCase(name))
+                    .map(e -> e.getValue().get(0)).findFirst().orElse(null);
+        }
     }
 
-    /** A canned answer: status, content type, body, and an optional delay before answering. */
-    public record Reply(int status, String contentType, String body, Duration delay) {
+    /** A canned answer: status, content type, body, an optional delay, and extra response headers. */
+    public record Reply(int status, String contentType, String body, Duration delay, Map<String, String> headers) {
+
+        public Reply {
+            headers = headers == null ? Map.of() : Map.copyOf(headers);
+        }
+
+        public Reply(int status, String contentType, String body, Duration delay) {
+            this(status, contentType, body, delay, Map.of());
+        }
 
         public static Reply json(int status, String body) {
             return new Reply(status, "application/json", body, Duration.ZERO);
@@ -41,7 +63,13 @@ public final class RouteStubServer {
         }
 
         public Reply delayed(Duration d) {
-            return new Reply(status, contentType, body, d);
+            return new Reply(status, contentType, body, d, headers);
+        }
+
+        public Reply withHeader(String name, String value) {
+            Map<String, String> h = new java.util.LinkedHashMap<>(headers);
+            h.put(name, value);
+            return new Reply(status, contentType, body, delay, h);
         }
     }
 
@@ -51,7 +79,7 @@ public final class RouteStubServer {
         t.setDaemon(true);
         return t;
     });
-    private final Map<String, Reply> routes = new ConcurrentHashMap<>();
+    private final Map<String, Function<Captured, Reply>> routes = new ConcurrentHashMap<>();
     private final List<Captured> requests = new CopyOnWriteArrayList<>();
 
     public RouteStubServer() {
@@ -68,8 +96,11 @@ public final class RouteStubServer {
     private void handle(HttpExchange exchange) throws IOException {
         try (exchange) {
             exchange.getRequestBody().readAllBytes();
-            requests.add(new Captured(exchange.getRequestMethod(), exchange.getRequestURI()));
-            Reply reply = routes.getOrDefault(exchange.getRequestURI().getPath(), Reply.text(404, "Not Found"));
+            Captured captured = new Captured(exchange.getRequestMethod(), exchange.getRequestURI(),
+                    Map.copyOf(exchange.getRequestHeaders()));
+            requests.add(captured);
+            Function<Captured, Reply> route = routes.get(exchange.getRequestURI().getPath());
+            Reply reply = route == null ? Reply.text(404, "Not Found") : route.apply(captured);
             if (!reply.delay().isZero()) {
                 try {
                     Thread.sleep(reply.delay().toMillis());
@@ -81,6 +112,10 @@ public final class RouteStubServer {
             byte[] body = reply.body() == null ? new byte[0] : reply.body().getBytes(StandardCharsets.UTF_8);
             if (reply.contentType() != null) {
                 exchange.getResponseHeaders().add("Content-Type", reply.contentType());
+            }
+            reply.headers().forEach((k, v) -> exchange.getResponseHeaders().add(k, v));
+            if (reply.status() == 304 || reply.status() == 204) {
+                body = new byte[0];
             }
             exchange.sendResponseHeaders(reply.status(), body.length == 0 ? -1 : body.length);
             if (body.length > 0) {
@@ -98,7 +133,12 @@ public final class RouteStubServer {
     }
 
     public void route(String path, Reply reply) {
-        routes.put(path, reply);
+        routes.put(path, request -> reply);
+    }
+
+    /** A route answering per request (conditional requests, sequences of replies). */
+    public void route(String path, Function<Captured, Reply> handler) {
+        routes.put(path, handler);
     }
 
     public void reset() {

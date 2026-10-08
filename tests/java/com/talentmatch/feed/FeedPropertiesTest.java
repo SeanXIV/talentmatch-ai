@@ -8,7 +8,7 @@ import com.talentmatch.feed.source.SourceKind;
 import java.time.Duration;
 import org.junit.jupiter.api.Test;
 
-/** §7 feed-level properties used by step 5: intervals and the probe timeout. */
+/** §7 feed-level properties: intervals and the probe timeout (step 5); switches, scheduler, window, lease, closing (step 6). */
 class FeedPropertiesTest {
 
     private static final Duration H1 = Duration.ofHours(1);
@@ -87,5 +87,95 @@ class FeedPropertiesTest {
         assertThatThrownBy(() -> new FeedProperties(null, Duration.ofSeconds(61)))
                 .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> new FeedProperties(null, null)).isInstanceOf(IllegalArgumentException.class);
+    }
+    // ------------------------------------------------------------------ step 6 keys
+
+    private static FeedProperties full(Duration freshWindow, Duration lease, FeedProperties.Closing closing) {
+        return new FeedProperties(true, null, null, Duration.ofSeconds(10), freshWindow, lease, closing);
+    }
+
+    @Test
+    void stepSixDefaults() {
+        FeedProperties p = FeedProperties.defaults();
+        assertThat(p.enabled()).isTrue();
+        assertThat(p.scheduler()).isEqualTo(FeedProperties.Scheduler.defaults());
+        assertThat(p.scheduler().enabled()).isTrue();
+        assertThat(p.scheduler().tick()).isEqualTo(Duration.ofSeconds(15));
+        assertThat(p.scheduler().initialDelay()).isEqualTo(Duration.ofSeconds(20));
+        assertThat(p.freshWindow()).isEqualTo(Duration.ofHours(24));
+        assertThat(p.lease()).isEqualTo(Duration.ofMinutes(5));
+        assertThat(p.closing().suspiciousDropRatio()).isEqualTo(0.5);
+        assertThat(p.schedulerRunning()).isTrue();
+        // nulls in the full constructor take the defaults
+        FeedProperties nulls = new FeedProperties(false, null, null, Duration.ofSeconds(10), null, null, null);
+        assertThat(nulls.freshWindow()).isEqualTo(Duration.ofHours(24));
+        assertThat(nulls.lease()).isEqualTo(Duration.ofMinutes(5));
+        assertThat(nulls.closing()).isEqualTo(FeedProperties.Closing.defaults());
+        assertThat(nulls.intervals()).isEqualTo(Intervals.defaults());
+    }
+
+    @Test
+    void twoArgumentConstructorKeepsStepFiveShape() {
+        FeedProperties p = new FeedProperties(Intervals.defaults(), Duration.ofSeconds(7));
+        assertThat(p.enabled()).isTrue();
+        assertThat(p.probeTimeout()).isEqualTo(Duration.ofSeconds(7));
+        assertThat(p.freshWindow()).isEqualTo(Duration.ofHours(24));
+        assertThat(p.lease()).isEqualTo(Duration.ofMinutes(5));
+        assertThat(p.scheduler().enabled()).isTrue();
+    }
+
+    @Test
+    void schedulerRunningNeedsBothSwitches() {
+        FeedProperties.Scheduler off = new FeedProperties.Scheduler(false, null, null);
+        assertThat(new FeedProperties(true, off, null, Duration.ofSeconds(10), null, null, null).schedulerRunning())
+                .isFalse();
+        assertThat(new FeedProperties(false, null, null, Duration.ofSeconds(10), null, null, null).schedulerRunning())
+                .isFalse();
+    }
+
+    @Test
+    void freshWindowRange() {
+        assertThat(full(Duration.ofHours(1), null, null).freshWindow()).isEqualTo(Duration.ofHours(1));
+        assertThat(full(Duration.ofDays(7), null, null).freshWindow()).isEqualTo(Duration.ofDays(7));
+        assertThatThrownBy(() -> full(Duration.ofMinutes(59), null, null))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("fresh-window");
+        assertThatThrownBy(() -> full(Duration.ofDays(7).plusSeconds(1), null, null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void leaseRange() {
+        assertThat(full(null, Duration.ofMinutes(1), null).lease()).isEqualTo(Duration.ofMinutes(1));
+        assertThat(full(null, Duration.ofHours(1), null).lease()).isEqualTo(Duration.ofHours(1));
+        assertThatThrownBy(() -> full(null, Duration.ofSeconds(59), null))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("lease");
+        assertThatThrownBy(() -> full(null, Duration.ofMinutes(61), null))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void closingRatioRange() {
+        assertThat(new FeedProperties.Closing(0.1).suspiciousDropRatio()).isEqualTo(0.1);
+        assertThat(new FeedProperties.Closing(0.95).suspiciousDropRatio()).isEqualTo(0.95);
+        assertThatThrownBy(() -> new FeedProperties.Closing(0.09)).isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("suspicious-drop-ratio");
+        assertThatThrownBy(() -> new FeedProperties.Closing(0.96)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new FeedProperties.Closing(Double.NaN)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void schedulerRanges() {
+        FeedProperties.Scheduler edge = new FeedProperties.Scheduler(true, Duration.ofSeconds(1), Duration.ZERO);
+        assertThat(edge.tick()).isEqualTo(Duration.ofSeconds(1));
+        assertThat(new FeedProperties.Scheduler(true, Duration.ofMinutes(10), Duration.ofMinutes(10)).tick())
+                .isEqualTo(Duration.ofMinutes(10));
+        assertThatThrownBy(() -> new FeedProperties.Scheduler(true, Duration.ofMillis(999), null))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("scheduler.tick");
+        assertThatThrownBy(() -> new FeedProperties.Scheduler(true, Duration.ofMinutes(11), null))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new FeedProperties.Scheduler(true, null, Duration.ofSeconds(-1)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("initial-delay");
+        assertThatThrownBy(() -> new FeedProperties.Scheduler(true, null, Duration.ofMinutes(11)))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 }

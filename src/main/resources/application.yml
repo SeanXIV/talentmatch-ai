@@ -88,9 +88,14 @@ talentmatch:
       temperature: 0.0                # copy the CV faithfully
 
   # Job feed (Phase 5). Source layer: com.talentmatch.feed.source.SourceProperties (max-postings,
-  # http, provider hosts). Feed level: com.talentmatch.feed.FeedProperties (intervals, probe-timeout;
-  # the scheduler, lease, closing and skills keys arrive with the poller).
+  # http, provider hosts). Feed level: com.talentmatch.feed.FeedProperties (switches, scheduler,
+  # intervals, probe-timeout, fresh window, lease, closing).
   feed:
+    enabled: ${FEED_ENABLED:true}     # false: no scheduler, no polling; endpoints still answer
+    scheduler: { enabled: true, tick: 15s, initial-delay: 20s }   # tests: enabled=false, they call tick()
+    fresh-window: 24h                 # first poll of a source: older postings are baseline (not new)
+    lease: 5m                         # a claimed source is leased this long (> connect + read timeout)
+    closing: { suspicious-drop-ratio: 0.5 }
     probe-timeout: 10s                # POST /api/feed/sources waits this long for the board check
     intervals: { ats: 5m, ats-min: 2m, aggregator: 15m, aggregator-min: 10m, max-backoff: 1h, not-found-backoff: 6h }
     max-postings-per-source: 5000     # more in one listing -> INVALID_RESPONSE (runaway data)

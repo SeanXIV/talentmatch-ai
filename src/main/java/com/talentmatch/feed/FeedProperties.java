@@ -4,39 +4,113 @@ import com.talentmatch.feed.source.SourceKind;
 import jakarta.validation.Valid;
 import java.time.Duration;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
 /**
  * The feed-level part of {@code talentmatch.feed.*} (§7). The source layer (HTTP, provider hosts,
- * posting cap) is bound by {@code feed.source.SourceProperties}; the two bind disjoint keys under the
- * same prefix. Step 5 needs the intervals and the probe timeout; the poller (step 6) adds the
- * scheduler, lease, fresh window and closing keys here.
+ * posting cap, poll threads) is bound by {@code feed.source.SourceProperties}; the two bind disjoint
+ * keys under the same prefix.
  *
+ * @param enabled      false: no scheduler and no polling; the endpoints still answer (poll → 409 FEED_DISABLED)
+ * @param scheduler    the poll scheduler (§4.1); off in tests ({@code scheduler.enabled=false})
  * @param intervals    polling cadence per kind (§4.3)
  * @param probeTimeout how long {@code POST /api/feed/sources} waits for the board check (1s..60s)
+ * @param freshWindow  how old a posting may be and still count as new: the first poll of a source
+ *                     marks older postings as baseline (1h..7d)
+ * @param lease        how long a claimed source stays leased to one poll (1m..1h); must outlast the
+ *                     HTTP deadline (checked by {@code SourcePoller})
+ * @param closing      the suspicious-drop guard (§4.5)
  */
 @Validated
 @ConfigurationProperties("talentmatch.feed")
 public record FeedProperties(
+        @DefaultValue("true") boolean enabled,
+        @DefaultValue @Valid Scheduler scheduler,
         @DefaultValue @Valid Intervals intervals,
-        @DefaultValue("10s") Duration probeTimeout) {
+        @DefaultValue("10s") Duration probeTimeout,
+        @DefaultValue("24h") Duration freshWindow,
+        @DefaultValue("5m") Duration lease,
+        @DefaultValue @Valid Closing closing) {
 
     /** The V5 CHECK on {@code feed_source.poll_interval_seconds}. */
     public static final int MIN_INTERVAL_SECONDS = 60;
     public static final int MAX_INTERVAL_SECONDS = 86_400;
 
+    static final Duration DEFAULT_FRESH_WINDOW = Duration.ofHours(24);
+    static final Duration DEFAULT_LEASE = Duration.ofMinutes(5);
+
+    @ConstructorBinding
     public FeedProperties {
+        scheduler = scheduler == null ? Scheduler.defaults() : scheduler;
         intervals = intervals == null ? Intervals.defaults() : intervals;
+        closing = closing == null ? Closing.defaults() : closing;
         if (probeTimeout == null || probeTimeout.compareTo(Duration.ofSeconds(1)) < 0
                 || probeTimeout.compareTo(Duration.ofSeconds(60)) > 0) {
             throw new IllegalArgumentException("talentmatch.feed.probe-timeout is " + probeTimeout
                     + " but must be between PT1S and PT1M");
         }
+        freshWindow = freshWindow == null ? DEFAULT_FRESH_WINDOW : freshWindow;
+        requireBetween("talentmatch.feed.fresh-window", freshWindow, Duration.ofHours(1), Duration.ofDays(7));
+        lease = lease == null ? DEFAULT_LEASE : lease;
+        requireBetween("talentmatch.feed.lease", lease, Duration.ofMinutes(1), Duration.ofHours(1));
+    }
+
+    /** Step-5 shape (intervals and probe timeout); everything else takes its default. */
+    public FeedProperties(Intervals intervals, Duration probeTimeout) {
+        this(true, null, intervals, probeTimeout, null, null, null);
     }
 
     public static FeedProperties defaults() {
         return new FeedProperties(Intervals.defaults(), Duration.ofSeconds(10));
+    }
+
+    /** True when the scheduler actually runs: the feed and the scheduler are both enabled. */
+    public boolean schedulerRunning() {
+        return enabled && scheduler.enabled();
+    }
+
+    /**
+     * @param enabled      false: no automatic polling (tests drive {@code FeedScheduler.tick()} themselves)
+     * @param tick         delay between two scheduler ticks (1s..10m)
+     * @param initialDelay delay before the first tick after startup (0..10m)
+     */
+    public record Scheduler(
+            @DefaultValue("true") boolean enabled,
+            @DefaultValue("15s") Duration tick,
+            @DefaultValue("20s") Duration initialDelay) {
+
+        public Scheduler {
+            tick = tick == null ? Duration.ofSeconds(15) : tick;
+            initialDelay = initialDelay == null ? Duration.ofSeconds(20) : initialDelay;
+            requireBetween("talentmatch.feed.scheduler.tick", tick, Duration.ofSeconds(1), Duration.ofMinutes(10));
+            requireBetween("talentmatch.feed.scheduler.initial-delay", initialDelay, Duration.ZERO,
+                    Duration.ofMinutes(10));
+        }
+
+        public static Scheduler defaults() {
+            return new Scheduler(true, Duration.ofSeconds(15), Duration.ofSeconds(20));
+        }
+    }
+
+    /**
+     * @param suspiciousDropRatio a complete listing missing more than this share of the open postings
+     *                            (with at least 6 open) is suspicious: closing waits for a second such
+     *                            poll (0.1..0.95)
+     */
+    public record Closing(@DefaultValue("0.5") double suspiciousDropRatio) {
+
+        public Closing {
+            if (Double.isNaN(suspiciousDropRatio) || suspiciousDropRatio < 0.1 || suspiciousDropRatio > 0.95) {
+                throw new IllegalArgumentException("talentmatch.feed.closing.suspicious-drop-ratio is "
+                        + suspiciousDropRatio + " but must be between 0.1 and 0.95");
+            }
+        }
+
+        public static Closing defaults() {
+            return new Closing(0.5);
+        }
     }
 
     /**
@@ -100,6 +174,12 @@ public record FeedProperties(
             if (value == null || value.toSeconds() < MIN_INTERVAL_SECONDS || value.toSeconds() > MAX_INTERVAL_SECONDS) {
                 throw new IllegalArgumentException(name + " is " + value + " but must be between PT1M and PT24H");
             }
+        }
+    }
+
+    private static void requireBetween(String name, Duration value, Duration min, Duration max) {
+        if (value == null || value.compareTo(min) < 0 || value.compareTo(max) > 0) {
+            throw new IllegalArgumentException(name + " is " + value + " but must be between " + min + " and " + max);
         }
     }
 }

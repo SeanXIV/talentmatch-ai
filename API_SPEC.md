@@ -277,7 +277,24 @@ Field errors use full paths, e.g. `preferences.regions.countries[1]`: `"'XX' is 
 
 ## Job feed sources (Phase 5)
 
-The watchlist of company job boards the feed polls. Polling starts with a later step.
+The watchlist of company job boards the feed polls. Each ACTIVE source is polled every
+`effectivePollIntervalSeconds` (±10% jitter) by a background scheduler, or on request with
+`POST /feed/sources/{id}/poll`. The outcome of the last poll is in `lastStatus`:
+
+| `lastStatus` | Meaning | Next poll |
+|---|---|---|
+| `OK` | the listing was read and stored | after the interval |
+| `NOT_MODIFIED` | `304`, or the same body as last time; nothing to store | after the interval |
+| `SUSPICIOUS_EMPTY` | the listing suddenly lacks most open postings (or all of at least 3); nothing was closed. A second such poll in a row closes them | after the interval |
+| `RATE_LIMITED` | the provider said `429` | after its `Retry-After` (at least the interval, at most 1 h), else as `ERROR` |
+| `ERROR` | 5xx, network error or timeout (or saving failed) | interval × 2^failures, at most 1 h |
+| `INVALID_RESPONSE` / `TOO_LARGE` | unreadable listing, more than half of the postings unreadable, or a body over 20 MB; nothing was saved | as `ERROR` |
+| `NOT_FOUND` / `UNAUTHORIZED` | the board is gone or refused access; the source stays `ACTIVE` in case it comes back | after 6 h |
+
+`consecutiveFailures` resets on `OK`/`NOT_MODIFIED`; `lastError` is a short sanitized note (no
+response body, no URL query, no key). The first successful poll sets `baselineAt`: postings seen
+then count as already known (not new) unless they were published within the last 24 h. A posting
+that leaves a board's listing is closed; one that comes back is reopened.
 
 **`FeedSourceResponse`**
 ```json
@@ -345,6 +362,44 @@ Full replace of the editable fields: `state` is required; a missing `companyName
 is kept.
 **Errors:** `400 INVALID_ID`, `404 FEED_SOURCE_NOT_FOUND`, `409 DATA_CONFLICT` (managed by your job
 preferences).
+
+### `POST /feed/sources/{id}/poll`
+Polls the source now, whatever its schedule (a `PAUSED` source too). The poll runs in the
+background; check `lastStatus` with `GET /feed/sources/{id}` a moment later.
+
+**Response `202`**
+```json
+{ "sourceId": "…", "queued": true }
+```
+If every poll thread is busy, the source is made due and the scheduler polls it on its next tick
+(still `202`).
+
+**Errors:**
+- `400 INVALID_ID`, `404 FEED_SOURCE_NOT_FOUND`
+- `409 FEED_DISABLED`: the feed is switched off (`FEED_ENABLED=false`).
+- `409 FEED_POLL_IN_PROGRESS`: the source is being polled right now.
+- `429 FEED_POLL_RATE_LIMITED` with `Retry-After: n`: the source was polled less than 60 s ago
+  (`"This source was polled less than a minute ago. You can poll it again in 42 seconds; …"`).
+
+---
+
+## Job feed (Phase 5)
+
+### `GET /feed/status`
+**Response `200`** (this step reports the poller; more sections are added as the feed grows)
+```json
+{ "enabled": true, "schedulerEnabled": true,
+  "sources": { "total": 4, "active": 3, "failing": 1, "lastSuccessAt": "…" },
+  "processing": { "pending": 12 } }
+```
+- `schedulerEnabled`: sources are polled automatically (the feed and its scheduler are both on).
+- `sources.failing`: ACTIVE sources whose last poll failed.
+- `processing.pending`: feed jobs found or changed by a poll and waiting to be processed (skills,
+  filter, score).
+
+The actuator health component `feed` is `UP`, or `DEGRADED` when an ACTIVE source failed 3 times
+in a row or has had no successful poll for more than 3 × its interval (details: counts and source
+ids). It never turns overall health `DOWN`.
 
 ---
 
@@ -748,7 +803,10 @@ exception class names or SQL.
 | 409 | `DATA_CONFLICT` | other conflicting concurrent change |
 | 409 | `RECOMPUTE_ALREADY_RUNNING` | a batch recompute is active |
 | 409 | `RESUME_EXTRACTION_IN_PROGRESS` | the CV is queued or being read **(Phase 4)** |
+| 409 | `FEED_POLL_IN_PROGRESS` | the feed source is being polled right now **(Phase 5)** |
+| 409 | `FEED_DISABLED` | the job feed is switched off (`FEED_ENABLED=false`) **(Phase 5)** |
 | 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job within the regenerate window (`Retry-After: n`) **(extension, Phase 3)** |
+| 429 | `FEED_POLL_RATE_LIMITED` | a poll on request within 60 s of the source's last poll (`Retry-After: n`) **(Phase 5)** |
 | 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`) |
 | 503 | `DATABASE_UNAVAILABLE` | database unreachable (`Retry-After: 5`) |
 | 503 | `UPLOAD_BUSY` | every PDF reader is busy; retry the upload in a minute **(Phase 4)** |

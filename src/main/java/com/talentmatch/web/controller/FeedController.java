@@ -1,17 +1,22 @@
 package com.talentmatch.web.controller;
 
+import com.talentmatch.feed.FeedPollService;
 import com.talentmatch.feed.FeedSourceService;
 import com.talentmatch.feed.FeedSourceState;
+import com.talentmatch.feed.FeedStatusService;
 import com.talentmatch.feed.source.SourceKind;
 import com.talentmatch.service.Paging;
+import com.talentmatch.web.dto.FeedPollResponse;
 import com.talentmatch.web.dto.FeedSourceRequest;
 import com.talentmatch.web.dto.FeedSourceResponse;
 import com.talentmatch.web.dto.FeedSourceUpdateRequest;
+import com.talentmatch.web.dto.FeedStatusResponse;
 import com.talentmatch.web.dto.PageResponse;
 import jakarta.validation.constraints.Max;
 import jakarta.validation.constraints.Min;
 import java.net.URI;
 import java.util.UUID;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -25,8 +30,8 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * The job feed (Phase 5). Step 5: the watchlist of sources. Polling ({@code POST …/poll}), the feed
- * jobs and the status endpoint arrive with steps 6 and 7.
+ * The job feed (Phase 5): the watchlist of sources (step 5), polling on request and the feed status
+ * (step 6). The feed jobs arrive with step 7.
  */
 @RestController
 @RequestMapping("/api/feed")
@@ -34,9 +39,14 @@ import org.springframework.web.bind.annotation.RestController;
 public class FeedController {
 
     private final FeedSourceService sourceService;
+    private final FeedPollService pollService;
+    private final FeedStatusService statusService;
 
-    public FeedController(FeedSourceService sourceService) {
+    public FeedController(FeedSourceService sourceService, FeedPollService pollService,
+                          FeedStatusService statusService) {
         this.sourceService = sourceService;
+        this.pollService = pollService;
+        this.statusService = statusService;
     }
 
     @GetMapping("/sources")
@@ -72,5 +82,15 @@ public class FeedController {
     public ResponseEntity<Void> deleteSource(@PathVariable("id") UUID id) {
         sourceService.delete(id);
         return ResponseEntity.noContent().build();
+    }
+
+    @PostMapping("/sources/{id}/poll")
+    public ResponseEntity<FeedPollResponse> pollSource(@PathVariable("id") UUID id) {
+        return ResponseEntity.status(HttpStatus.ACCEPTED).body(FeedPollResponse.of(pollService.pollNow(id)));
+    }
+
+    @GetMapping("/status")
+    public FeedStatusResponse status() {
+        return FeedStatusResponse.of(statusService.status());
     }
 }

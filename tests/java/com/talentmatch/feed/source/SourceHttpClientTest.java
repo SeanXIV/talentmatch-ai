@@ -62,14 +62,24 @@ class SourceHttpClientTest {
         stub.close();
     }
 
-    private SourceHttpClient client(long maxBody) {
+    /** Tight timeouts: the timeout tests depend on these firing well before their stubs finish. */
+    private static final Duration TIGHT = Duration.ofSeconds(1);
+    /** Body-cap tests are not about timing; a generous timeout keeps them from flaking TIMEOUT under load. */
+    private static final Duration GENEROUS = Duration.ofSeconds(15);
+
+    private SourceHttpClient client(Duration timeout, long maxBody) {
         SourceProperties props = new SourceProperties(5000,
-                Fixtures.http(Duration.ofSeconds(1), Duration.ofSeconds(1), maxBody, Duration.ZERO), null, null, null);
+                Fixtures.http(timeout, timeout, maxBody, Duration.ZERO), null, null, null);
         return new SourceHttpClient(props, Clock.fixed(NOW, ZoneOffset.UTC));
     }
 
+    /** Client with a small body cap and a generous timeout, for the cap tests. */
+    private SourceHttpClient client(long maxBody) {
+        return client(GENEROUS, maxBody);
+    }
+
     private SourceHttpClient client() {
-        return client(20_971_520L);
+        return client(TIGHT, 20_971_520L);
     }
 
     private URI uri() {
@@ -296,7 +306,7 @@ class SourceHttpClientTest {
     void gzipBodyIsDecodedAndHashedDecompressed() throws IOException {
         byte[] plain = "{\"jobs\":[{\"id\":1}]}".getBytes(StandardCharsets.UTF_8);
         stub.handler(FeedStubServer.bytes(200, "application/json", gzip(plain), Map.of("Content-Encoding", "gzip")));
-        SourceResponse r = client().get(uri(), FetchRequest.NONE);
+        SourceResponse r = client(GENEROUS, 20_971_520L).get(uri(), FetchRequest.NONE);
         assertThat(r.body()).isEqualTo(plain);
         assertThat(r.bodyHash()).isEqualTo(SourceHttpClient.sha256(plain));
     }

@@ -141,7 +141,36 @@ cities, a re-post), so feed jobs are deduplicated by `feed_job.dedup_key` instea
 natural key must say `ON CONFLICT (title, company) WHERE origin = 'MANUAL'`. `UNIQUE (id, origin)`
 lets `feed_job` reference `(job_id, 'FEED')`, so only FEED jobs can have feed rows. FEED jobs are
 read-only in `/api/jobs` (`PUT`/`DELETE` → 409 `DATA_CONFLICT`). The remaining V5 feed tables
-are documented with the rest of Phase 5.
+are documented with the rest of Phase 5; the poller's use of them is below.
+
+### `feed_source`, `job_posting`, `feed_job` (V5, written by the poller)
+```
+feed_source 1──* job_posting *──1 feed_job 1──1 job (origin FEED)
+```
+- **`feed_source`** is one watched board. The poller claims due ACTIVE rows by setting
+  `lease_until` (`UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)`), fetches without any
+  transaction open, then writes everything for that source in one transaction. Every statement that
+  finishes a poll is guarded with `lease_until = <its lease>`, so a poll whose lease expired (and was
+  taken over) writes nothing. A poll also records `last_status`, `last_error` (sanitized),
+  `consecutive_failures`, `next_poll_at` (backoff on failure), `etag`/`content_hash` (conditional
+  requests: a `304` or an identical body is `NOT_MODIFIED`), `open_postings`, and `baseline_at`
+  (first successful poll). `suspicious_since` holds back closing when a complete listing suddenly
+  lacks most open postings, until a second such poll. Leases left by a stopped app are dropped at
+  startup.
+- **`job_posting`** is one provider posting, unique per `(source_id, external_id)`; `content_hash`
+  (sha256 of the cleaned content) detects changes. A posting missing from a complete (ATS) listing
+  gets `closed_at`; one that reappears is reopened. `baseline` marks postings of a source's first
+  poll that weren't published within the fresh window (24 h). A Greenhouse posting can be stored
+  with `description` NULL until its detail is fetched (at most 20 detail requests per poll).
+- **`feed_job`** is the canonical, deduplicated job. A new posting attaches to the **open** feed
+  job with the same `dedup_key` (`normalized company | normalized title | remote|onsite`), otherwise
+  a new `job` (origin FEED) and `feed_job` are created; the partial unique index on open keys makes
+  concurrent creates safe. The canonical title, company, description, URL, salary, countries and
+  workplace come from the open postings (ATS before aggregator, then the most complete
+  description). A job closes when its last open posting closes. `baseline` is true only while all
+  its postings are baseline. A changed description resets `enrichment_status` to `PENDING`. Every
+  job a poll touches gets `process_after = now`, the hand-off to the processor (skills, filter,
+  score).
 
 ### `skill`
 A normalized skill lookup table (e.g. "Java", "SQL", "React") shared between
