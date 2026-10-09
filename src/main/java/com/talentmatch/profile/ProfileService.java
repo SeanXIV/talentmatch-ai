@@ -1,6 +1,7 @@
 package com.talentmatch.profile;
 
 import com.talentmatch.domain.entity.Skill;
+import com.talentmatch.repository.SkillAliasRepository;
 import com.talentmatch.repository.SkillRepository;
 import com.talentmatch.service.CandidateService;
 import com.talentmatch.service.FieldErrors;
@@ -17,13 +18,16 @@ import com.talentmatch.web.dto.ProfileRequest;
 import com.talentmatch.web.dto.ProfileResponse;
 import java.time.Clock;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -42,8 +46,10 @@ public class ProfileService {
     private final OwnerProfileRepository profiles;
     private final ResumeRepository resumes;
     private final SkillRepository skills;
+    private final SkillAliasRepository aliases;
     private final CandidateService candidates;
     private final Clock clock;
+    private final ApplicationEventPublisher events;
 
     /** Punctuation, spaces and trailing version numbers are ignored when comparing skill names. */
     private static final Pattern NOT_SKILL_CHAR = Pattern.compile("[^\\p{L}\\p{N}+#]");
@@ -53,12 +59,15 @@ public class ProfileService {
     private static final int NEAR_DUPLICATE_MIN_LENGTH = 4;
 
     public ProfileService(OwnerProfileRepository profiles, ResumeRepository resumes, SkillRepository skills,
-                          CandidateService candidates, Clock clock) {
+                          SkillAliasRepository aliases, CandidateService candidates, Clock clock,
+                          ApplicationEventPublisher events) {
         this.profiles = profiles;
         this.resumes = resumes;
         this.skills = skills;
+        this.aliases = aliases;
         this.candidates = candidates;
         this.clock = clock;
+        this.events = events;
     }
 
     @Transactional(readOnly = true)
@@ -104,6 +113,8 @@ public class ProfileService {
 
         profiles.save(candidate.id(), request.resumeId(), ProfileJson.write(doc));
         OwnerProfileRepository.StoredProfile stored = profiles.find().orElseThrow();
+        // Listeners run after commit (the feed re-scores its open jobs against the new version).
+        events.publishEvent(new OwnerProfileConfirmedEvent(stored.version(), candidate.id()));
         return new ProfileResponse(candidate.id(), stored.resumeId(), stored.version(), doc, candidate.skills(),
                 stored.confirmedAt(), stored.updatedAt(), List.copyOf(warnings));
     }
@@ -136,15 +147,42 @@ public class ProfileService {
         if (keys.isEmpty()) {
             return;
         }
-        Set<String> known = new HashSet<>();
-        skills.findAllByLowerNameIn(keys).forEach(s -> known.add(TextNormalizer.skillKey(s.getName())));
+        if (create) {
+            aliases.lockVocabulary(); // a created skill must never take an alias's name (V5)
+        }
+        // Skill id per known name: exact skill names, then aliases ("Postgres" → PostgreSQL's id).
+        Map<String, UUID> known = new HashMap<>();
+        Map<UUID, String> canonical = new HashMap<>();
+        skills.findAllByLowerNameIn(keys).forEach(s -> {
+            known.put(TextNormalizer.skillKey(s.getName()), s.getId());
+            canonical.put(s.getId(), s.getName());
+        });
+        Set<String> rest = new HashSet<>(keys);
+        rest.removeAll(known.keySet());
+        if (!rest.isEmpty()) {
+            Map<String, UUID> aliasIds = aliases.findSkillIdsByLowerAliases(rest);
+            known.putAll(aliasIds);
+            skills.findAllById(new HashSet<>(aliasIds.values())).forEach(s -> canonical.put(s.getId(), s.getName()));
+        }
         List<Skill> toCreate = new ArrayList<>();
         List<Integer> createdAt = new ArrayList<>();
         Set<String> queued = new HashSet<>();
+        Map<UUID, Integer> firstBySkill = new HashMap<>();
         for (int i = 0; i < doc.skills().size(); i++) {
             String name = doc.skills().get(i).name();
             String key = TextNormalizer.skillKey(name);
-            if (known.contains(key) || !queued.add(key)) {
+            UUID skillId = known.get(key);
+            if (skillId != null) {
+                // Two names for one skill would be a duplicate on the owner's candidate.
+                Integer first = firstBySkill.putIfAbsent(skillId, i);
+                if (first != null && !TextNormalizer.skillKey(doc.skills().get(first).name()).equals(key)) {
+                    errors.add("profile.skills[" + i + "].name", "'" + name + "' is another name for '"
+                            + canonical.getOrDefault(skillId, name) + "', already listed at profile.skills[" + first
+                            + "]. Keep one of them.");
+                }
+                continue;
+            }
+            if (!queued.add(key)) {
                 continue;
             }
             if (create) {

@@ -28,7 +28,7 @@ class StalenessTriggerIT extends AbstractApiIT {
     private static final String UPSERT_JOB = """
             INSERT INTO job (title, company, description)
             SELECT * FROM unnest(?::text[], ?::text[], ?::text[])
-            ON CONFLICT (title, company) DO UPDATE
+            ON CONFLICT (title, company) WHERE origin = 'MANUAL' DO UPDATE
                 SET description = EXCLUDED.description
                 WHERE job.description IS DISTINCT FROM EXCLUDED.description
             RETURNING (xmax = 0) AS inserted""";

@@ -13,7 +13,7 @@
 
     <groupId>com.talentmatch</groupId>
     <artifactId>talentmatch-api</artifactId>
-    <version>0.4.0-SNAPSHOT</version>
+    <version>0.5.0-SNAPSHOT</version>
     <packaging>jar</packaging>
     <name>talentmatch-api</name>
     <description>TalentMatch AI REST API: candidates, jobs, skills, skill-overlap match scoring, AI match explanations and a master profile from an uploaded CV</description>
@@ -24,6 +24,7 @@
         <testcontainers.version>1.21.4</testcontainers.version>
         <langchain4j.version>1.20.2</langchain4j.version>
         <pdfbox.version>3.0.7</pdfbox.version>
+        <jsoup.version>1.21.2</jsoup.version>
     </properties>
 
     <dependencyManagement>
@@ -95,6 +96,13 @@
             <groupId>org.apache.pdfbox</groupId>
             <artifactId>pdfbox</artifactId>
             <version>${pdfbox.version}</version>
+        </dependency>
+
+        <!-- Job feed: HTML (and entity-escaped HTML) from job boards to plain text (Phase 5) -->
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>${jsoup.version}</version>
         </dependency>
 
         <dependency>

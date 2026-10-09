@@ -357,3 +357,38 @@ def test_existing_skill_spelling_not_renamed(db, scratch_db, clean_raw):
     assert db.execute("SELECT name, category FROM skill WHERE lower(name) = 'java'"
                       ).fetchall() == [("JAVA", "Languages")]
     assert stats["skill"].updated == 1
+
+
+# --------------------------------------------------------------------------
+# Phase 5 (V5): the ETL only touches MANUAL jobs
+# --------------------------------------------------------------------------
+
+def test_load_ignores_feed_jobs_with_the_same_title_and_company(db, scratch_db, clean_raw):
+    """V5 partial key: FEED jobs sharing (title, company) are neither updated nor linked."""
+    import psycopg
+    from conftest import _conninfo
+    raw, _ = clean_raw
+    clean = clean_bundle(read_raw(raw))
+    keys = sorted({(r["title"], r["company"]) for r in clean.jobs.to_dict("records")})
+    for title, company in keys:
+        db.execute("INSERT INTO job (title, company, description, origin, updated_at) "
+                   "VALUES (%s, %s, 'feed text', 'FEED', now() - interval '1 day')", (title, company))
+    feed_before = db.execute("SELECT id, description, updated_at FROM job WHERE origin = 'FEED' "
+                             "ORDER BY id").fetchall()
+
+    with psycopg.connect(_conninfo(scratch_db)) as conn:
+        stats = load(conn, clean)
+        conn.commit()
+    assert stats["job"].inserted == len(keys)
+    assert db.execute("SELECT count(*) FROM job WHERE origin = 'MANUAL'").fetchone()[0] == len(keys)
+    assert db.execute("SELECT id, description, updated_at FROM job WHERE origin = 'FEED' "
+                      "ORDER BY id").fetchall() == feed_before
+    assert db.execute("SELECT count(*) FROM job_skill js JOIN job j ON j.id = js.job_id "
+                      "WHERE j.origin = 'FEED'").fetchone()[0] == 0
+
+    # a rerun is still a no-op for jobs (the partial-index ON CONFLICT matches the MANUAL rows)
+    with psycopg.connect(_conninfo(scratch_db)) as conn:
+        again = load(conn, clean)
+        conn.commit()
+    assert (again["job"].inserted, again["job"].updated) == (0, 0)
+    assert db.execute("SELECT count(*) FROM job").fetchone()[0] == 2 * len(keys)

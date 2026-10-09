@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.exc.MismatchedInputException;
 import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import com.talentmatch.service.exception.ApiException;
+import com.talentmatch.service.exception.FeedPollRateLimitedException;
 import com.talentmatch.service.exception.MatchesBusyException;
 import com.talentmatch.service.exception.RecomputeAlreadyRunningException;
 import com.talentmatch.service.exception.RegenerateRateLimitedException;
@@ -84,20 +85,33 @@ public class GlobalExceptionHandler {
     static final String DB_UNAVAILABLE_MESSAGE =
             "The database is temporarily unavailable. Please try again in a moment.";
     static final int DB_RETRY_AFTER_SECONDS = 5;
+    static final String SERVICE_BUSY_MESSAGE =
+            "The server is busy with a conflicting update. Please try again in a few seconds.";
+    static final int SERVICE_BUSY_RETRY_AFTER_SECONDS = 2;
+    private static final Pattern MATCHES_PATH = Pattern.compile("^/api/(jobs/[^/]+/matches|matches)(/.*)?$");
     private static final String EXAMPLE_ID = "3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6";
     private static final Pattern CONSTRAINT_IN_MESSAGE = Pattern.compile("constraint \"([^\"]+)\"");
     private static final int MAX_ECHO = 64;
     private static final int MAX_CAUSES_INSPECTED = 64;
     private static final String HIKARI_CLOSED_CONNECTION = "Connection is closed";
 
-    /** Unique constraint / index name (verified against V1__init_schema.sql) -> conflict. */
+    /**
+     * Unique constraint / index name (verified against V1__init_schema.sql; the job key is the V5
+     * partial index over MANUAL jobs; feed_source_source_key_key is PostgreSQL's name for the V5
+     * column-level UNIQUE on feed_source.source_key) -> conflict.
+     */
     private static final Map<String, Conflict> CONFLICTS = Map.of(
             "uq_candidate_email", new Conflict(ErrorCode.EMAIL_ALREADY_EXISTS,
                     "A candidate with this email already exists."),
-            "uq_job_title_company", new Conflict(ErrorCode.JOB_ALREADY_EXISTS,
+            "uq_job_title_company_manual", new Conflict(ErrorCode.JOB_ALREADY_EXISTS,
                     "A job with this title and company already exists."),
             "uq_skill_name_lower", new Conflict(ErrorCode.SKILL_ALREADY_EXISTS,
-                    "A skill with this name already exists (names are case-insensitive)."));
+                    "A skill with this name already exists (names are case-insensitive)."),
+            "uq_skill_alias_lower", new Conflict(ErrorCode.SKILL_ALIAS_ALREADY_EXISTS,
+                    "This alias already exists (aliases are case-insensitive)."),
+            // Safety net: FeedSourceService inserts with ON CONFLICT and reports the existing id itself.
+            "feed_source_source_key_key", new Conflict(ErrorCode.FEED_SOURCE_ALREADY_EXISTS,
+                    "This source is already on your watchlist. List your sources with GET /api/feed/sources."));
 
     private record Conflict(ErrorCode code, String message) {
     }
@@ -116,6 +130,14 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(RegenerateRateLimitedException.class)
     ResponseEntity<ApiError> regenerateRateLimited(RegenerateRateLimitedException ex, HttpServletRequest req) {
         log.info("Regenerate rate-limited on {} (retry after {}s)", req.getRequestURI(), ex.getRetryAfterSeconds());
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.RETRY_AFTER, String.valueOf(ex.getRetryAfterSeconds()));
+        return respond(ex.getStatus(), ex.getCode(), ex.getMessage(), ex.getFieldErrors(), req, headers);
+    }
+
+    @ExceptionHandler(FeedPollRateLimitedException.class)
+    ResponseEntity<ApiError> feedPollRateLimited(FeedPollRateLimitedException ex, HttpServletRequest req) {
+        log.info("Feed poll rate-limited on {} (retry after {}s)", req.getRequestURI(), ex.getRetryAfterSeconds());
         HttpHeaders headers = new HttpHeaders();
         headers.set(HttpHeaders.RETRY_AFTER, String.valueOf(ex.getRetryAfterSeconds()));
         return respond(ex.getStatus(), ex.getCode(), ex.getMessage(), ex.getFieldErrors(), req, headers);
@@ -307,10 +329,27 @@ public class GlobalExceptionHandler {
                         + "Reload and try again.", List.of(), req, null);
     }
 
+    /**
+     * A lock timeout or deadlock. On the matches endpoints it means another request is recomputing
+     * the job's matches (MATCHES_BUSY); anywhere else the generic SERVICE_BUSY, so e.g. a preferences
+     * save never claims matches are being recalculated.
+     */
     @ExceptionHandler(PessimisticLockingFailureException.class)
     ResponseEntity<ApiError> lockFailure(PessimisticLockingFailureException ex, HttpServletRequest req) {
         log.info("Lock failure on {}: {}", req.getRequestURI(), ex.getClass().getSimpleName());
-        return busy(req);
+        if (isMatchesEndpoint(req)) {
+            return busy(req);
+        }
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.RETRY_AFTER, String.valueOf(SERVICE_BUSY_RETRY_AFTER_SECONDS));
+        return respond(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.SERVICE_BUSY, SERVICE_BUSY_MESSAGE,
+                List.of(), req, headers);
+    }
+
+    /** {@code /api/jobs/{id}/matches} and {@code /api/matches/**}. */
+    static boolean isMatchesEndpoint(HttpServletRequest req) {
+        String uri = req.getRequestURI();
+        return uri != null && MATCHES_PATH.matcher(uri).matches();
     }
 
     @ExceptionHandler({DataAccessResourceFailureException.class, CannotCreateTransactionException.class,

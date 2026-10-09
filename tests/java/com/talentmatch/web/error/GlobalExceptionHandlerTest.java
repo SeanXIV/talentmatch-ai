@@ -190,4 +190,40 @@ class GlobalExceptionHandlerTest {
         assertThat(res.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).isNull();
         assertThat(res.getBody().code()).isEqualTo("INTERNAL_ERROR");
     }
+
+    // ------------------------------------------------------------------ lock failures (Phase 5)
+
+    private static ResponseEntity<ApiError> lockFailure(String method, String uri) {
+        MockHttpServletRequest req = new MockHttpServletRequest(method, uri);
+        req.setAttribute(RequestIdFilter.ATTRIBUTE, "req-1");
+        return new GlobalExceptionHandler().lockFailure(new CannotAcquireLockException("deadlock"), req);
+    }
+
+    @Test
+    void lockFailureOnMatchesPathsIsMatchesBusy() {
+        for (String uri : new String[] {"/api/jobs/3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6/matches",
+                "/api/jobs/x/matches/", "/api/matches", "/api/matches/recompute", "/api/matches/recompute/abc"}) {
+            ResponseEntity<ApiError> res = lockFailure("GET", uri);
+            assertThat(res.getStatusCode().value()).as(uri).isEqualTo(503);
+            assertThat(res.getBody().code()).as(uri).isEqualTo("MATCHES_BUSY");
+            assertThat(res.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).as(uri).isNotNull();
+        }
+    }
+
+    @Test
+    void lockFailureElsewhereIsServiceBusy() {
+        for (String uri : new String[] {"/api/preferences", "/api/profile", "/api/jobs/x", "/api/jobs",
+                "/api/feed/sources/x", "/api/jobs/x/matchesextra", "/api/matchesx", "/api/skills/x/aliases",
+                "/x/api/matches"}) {
+            ResponseEntity<ApiError> res = lockFailure("PUT", uri);
+            assertThat(res.getStatusCode().value()).as(uri).isEqualTo(503);
+            ApiError body = res.getBody();
+            assertThat(body.code()).as(uri).isEqualTo("SERVICE_BUSY");
+            assertThat(body.message()).as(uri).isEqualTo(GlobalExceptionHandler.SERVICE_BUSY_MESSAGE)
+                    .doesNotContainIgnoringCase("match");
+            assertThat(body.path()).isEqualTo(uri);
+            assertThat(body.requestId()).isEqualTo("req-1");
+            assertThat(res.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).as(uri).isEqualTo("2");
+        }
+    }
 }

@@ -59,7 +59,8 @@ public class JobService {
                 : jobRepository.findListPageBySkill(skillName, Paging.of(page, size));
         return PageResponse.of(rows, r -> {
             int count = r.skillCount() == null ? 0 : r.skillCount().intValue();
-            return new JobSummaryResponse(r.id(), r.title(), r.company(), r.description(), count, count > 0);
+            return new JobSummaryResponse(r.id(), r.title(), r.company(), r.description(), count, count > 0,
+                    r.origin());
         });
     }
 
@@ -82,9 +83,13 @@ public class JobService {
         return toDetail(job, job.getUpdatedAt());
     }
 
+    /** Updates a MANUAL job. FEED jobs are owned by the job feed and refused (409) before validation. */
     @Transactional
     public JobDetailResponse update(UUID id, JobRequest request) {
         Job job = jobRepository.findWithSkillsById(id).orElseThrow(() -> NotFoundException.job(id));
+        if (job.isFeed()) {
+            throw feedJobReadOnly(id);
+        }
         Validated v = validate(request);
         ensureTitleCompanyFree(v.title(), v.company(), id);
 
@@ -120,9 +125,14 @@ public class JobService {
         return toDetail(job, updatedAt);
     }
 
+    /** Deletes a MANUAL job; a FEED job → 409 (the job feed owns it), an unknown id → 404. */
     @Transactional
     public void delete(UUID id) {
-        if (jobRepository.deleteByIdReturningCount(id) == 0) {
+        if (jobRepository.deleteManualByIdReturningCount(id) == 0) {
+            // Nothing deleted: either no such job, or a FEED job (origin never changes, so no race).
+            if (jobRepository.findOriginById(id).isPresent()) {
+                throw feedJobReadOnly(id);
+            }
             throw NotFoundException.job(id);
         }
     }
@@ -185,8 +195,15 @@ public class JobService {
         return new Validated(title, company, description, desired);
     }
 
+    private ConflictException feedJobReadOnly(UUID id) {
+        String source = jobRepository.findFeedSourceKey(id).map(k -> " (source " + k + ")").orElse("");
+        return new ConflictException(ErrorCode.DATA_CONFLICT, "This job comes from the job feed" + source
+                + " and is kept up to date automatically. It can't be edited or deleted here.");
+    }
+
+    /** The natural key applies to MANUAL jobs only; FEED jobs may share a title and company. */
     private void ensureTitleCompanyFree(String title, String company, UUID selfId) {
-        jobRepository.findByTitleAndCompany(title, company).ifPresent(existing -> {
+        jobRepository.findManualByTitleAndCompany(title, company).ifPresent(existing -> {
             if (!existing.getId().equals(selfId)) {
                 throw new ConflictException(ErrorCode.JOB_ALREADY_EXISTS,
                         "A job titled '" + title + "' at " + company + " already exists (id "
@@ -202,6 +219,6 @@ public class JobService {
                 .sorted(SKILL_ORDER)
                 .toList();
         return new JobDetailResponse(job.getId(), job.getTitle(), job.getCompany(), job.getDescription(),
-                !skills.isEmpty(), skills, job.getCreatedAt(), updatedAt);
+                !skills.isEmpty(), skills, job.getCreatedAt(), updatedAt, job.getOrigin());
     }
 }
