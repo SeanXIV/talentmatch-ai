@@ -85,6 +85,10 @@ public class GlobalExceptionHandler {
     static final String DB_UNAVAILABLE_MESSAGE =
             "The database is temporarily unavailable. Please try again in a moment.";
     static final int DB_RETRY_AFTER_SECONDS = 5;
+    static final String SERVICE_BUSY_MESSAGE =
+            "The server is busy with a conflicting update. Please try again in a few seconds.";
+    static final int SERVICE_BUSY_RETRY_AFTER_SECONDS = 2;
+    private static final Pattern MATCHES_PATH = Pattern.compile("^/api/(jobs/[^/]+/matches|matches)(/.*)?$");
     private static final String EXAMPLE_ID = "3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6";
     private static final Pattern CONSTRAINT_IN_MESSAGE = Pattern.compile("constraint \"([^\"]+)\"");
     private static final int MAX_ECHO = 64;
@@ -325,10 +329,27 @@ public class GlobalExceptionHandler {
                         + "Reload and try again.", List.of(), req, null);
     }
 
+    /**
+     * A lock timeout or deadlock. On the matches endpoints it means another request is recomputing
+     * the job's matches (MATCHES_BUSY); anywhere else the generic SERVICE_BUSY, so e.g. a preferences
+     * save never claims matches are being recalculated.
+     */
     @ExceptionHandler(PessimisticLockingFailureException.class)
     ResponseEntity<ApiError> lockFailure(PessimisticLockingFailureException ex, HttpServletRequest req) {
         log.info("Lock failure on {}: {}", req.getRequestURI(), ex.getClass().getSimpleName());
-        return busy(req);
+        if (isMatchesEndpoint(req)) {
+            return busy(req);
+        }
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.RETRY_AFTER, String.valueOf(SERVICE_BUSY_RETRY_AFTER_SECONDS));
+        return respond(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.SERVICE_BUSY, SERVICE_BUSY_MESSAGE,
+                List.of(), req, headers);
+    }
+
+    /** {@code /api/jobs/{id}/matches} and {@code /api/matches/**}. */
+    static boolean isMatchesEndpoint(HttpServletRequest req) {
+        String uri = req.getRequestURI();
+        return uri != null && MATCHES_PATH.matcher(uri).matches();
     }
 
     @ExceptionHandler({DataAccessResourceFailureException.class, CannotCreateTransactionException.class,

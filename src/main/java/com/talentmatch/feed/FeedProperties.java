@@ -22,6 +22,7 @@ import org.springframework.validation.annotation.Validated;
  * @param lease        how long a claimed source stays leased to one poll (1m..1h); must outlast the
  *                     HTTP deadline (checked by {@code SourcePoller})
  * @param closing      the suspicious-drop guard (§4.5)
+ * @param processor    the feed-job processor (§1.2 step 7): sweep interval, batch size, retry delay
  */
 @Validated
 @ConfigurationProperties("talentmatch.feed")
@@ -32,7 +33,8 @@ public record FeedProperties(
         @DefaultValue("10s") Duration probeTimeout,
         @DefaultValue("24h") Duration freshWindow,
         @DefaultValue("5m") Duration lease,
-        @DefaultValue @Valid Closing closing) {
+        @DefaultValue @Valid Closing closing,
+        @DefaultValue @Valid Processor processor) {
 
     /** The V5 CHECK on {@code feed_source.poll_interval_seconds}. */
     public static final int MIN_INTERVAL_SECONDS = 60;
@@ -55,6 +57,13 @@ public record FeedProperties(
         requireBetween("talentmatch.feed.fresh-window", freshWindow, Duration.ofHours(1), Duration.ofDays(7));
         lease = lease == null ? DEFAULT_LEASE : lease;
         requireBetween("talentmatch.feed.lease", lease, Duration.ofMinutes(1), Duration.ofHours(1));
+        processor = processor == null ? Processor.defaults() : processor;
+    }
+
+    /** Step-6 shape (no processor settings); the processor takes its defaults. */
+    public FeedProperties(boolean enabled, Scheduler scheduler, Intervals intervals, Duration probeTimeout,
+                          Duration freshWindow, Duration lease, Closing closing) {
+        this(enabled, scheduler, intervals, probeTimeout, freshWindow, lease, closing, null);
     }
 
     /** Step-5 shape (intervals and probe timeout); everything else takes its default. */
@@ -110,6 +119,37 @@ public record FeedProperties(
 
         public static Closing defaults() {
             return new Closing(0.5);
+        }
+    }
+
+    /**
+     * The feed-job processor (dictionary skills, preference filter, score, notification row). It runs
+     * in the background only while the scheduler runs ({@link #schedulerRunning()}); with the scheduler
+     * off (tests), nothing processes until {@code FeedProcessor.processDue()} is called.
+     *
+     * @param sweep      how often the processor looks for due jobs without being woken (1s..10m)
+     * @param batchSize  jobs claimed per round (1..500)
+     * @param retryDelay how long a job whose processing failed waits before the next try (1s..1h)
+     */
+    public record Processor(
+            @DefaultValue("30s") Duration sweep,
+            @DefaultValue("50") int batchSize,
+            @DefaultValue("1m") Duration retryDelay) {
+
+        public Processor {
+            sweep = sweep == null ? Duration.ofSeconds(30) : sweep;
+            retryDelay = retryDelay == null ? Duration.ofMinutes(1) : retryDelay;
+            requireBetween("talentmatch.feed.processor.sweep", sweep, Duration.ofSeconds(1), Duration.ofMinutes(10));
+            if (batchSize < 1 || batchSize > 500) {
+                throw new IllegalArgumentException("talentmatch.feed.processor.batch-size is " + batchSize
+                        + " but must be between 1 and 500");
+            }
+            requireBetween("talentmatch.feed.processor.retry-delay", retryDelay, Duration.ofSeconds(1),
+                    Duration.ofHours(1));
+        }
+
+        public static Processor defaults() {
+            return new Processor(Duration.ofSeconds(30), 50, Duration.ofMinutes(1));
         }
     }
 

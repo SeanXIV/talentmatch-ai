@@ -216,6 +216,19 @@ public class FeedSourceRepository {
                 + " WHERE id = :id AND lease_until = :lease", params) == 1;
     }
 
+    /**
+     * Gives a lease back after a poll whose save lost a lock conflict: the source is due again at
+     * {@code retryAt}. Nothing else changes (no failure counted, status and error kept). One
+     * autocommit statement (it runs after the rolled-back write transaction).
+     *
+     * @return false when the lease was no longer ours
+     */
+    public boolean releaseForRetry(UUID id, Instant lease, Instant retryAt) {
+        MapSqlParameterSource params = leaseParams(id, lease).addValue("retryAt", ts(retryAt), Types.TIMESTAMP);
+        return jdbc.update("UPDATE feed_source SET lease_until = NULL, next_poll_at = :retryAt "
+                + "WHERE id = :id AND lease_until = :lease", params) == 1;
+    }
+
     /** Drops every lease (startup: with one instance a lease that survived a restart is stale). @return rows */
     public int releaseAllLeases() {
         return jdbc.update("UPDATE feed_source SET lease_until = NULL WHERE lease_until IS NOT NULL",

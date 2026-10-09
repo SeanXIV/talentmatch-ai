@@ -26,6 +26,9 @@ class FeedDisabledIT extends AbstractApiIT {
     @Autowired
     private ApplicationContext context;
 
+    @Autowired
+    private com.talentmatch.feed.FeedProcessor processor;
+
     private UUID source() {
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("kind", "LEVER");
@@ -76,5 +79,19 @@ class FeedDisabledIT extends AbstractApiIT {
                 .noneMatch(n -> n.toLowerCase().contains("feedscheduling"));
         // nothing else in the app enables scheduling either
         assertThat(context.getBeanNamesForType(ScheduledAnnotationBeanPostProcessor.class)).isEmpty();
+    }
+
+    @Test
+    void processDueReturnsZero() {
+        skills("Java");
+        UUID job = jdbc.queryForObject("INSERT INTO job (title, company, description, origin) "
+                + "VALUES ('Backend Engineer', 'Acme', 'Java', 'FEED') RETURNING id", UUID.class);
+        jdbc.update("INSERT INTO feed_job (job_id, dedup_key, primary_url, process_after) "
+                + "VALUES (?, 'k', 'https://x.test/j', now() - interval '1 minute')", job);
+        assertThat(processor.processDue()).isZero();
+        assertThat(processor.process(job)).isFalse();
+        assertThat(jdbc.queryForObject("SELECT process_after IS NOT NULL FROM feed_job WHERE job_id = ?",
+                Boolean.class, job)).as("left untouched").isTrue();
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM job_skill", Integer.class)).isZero();
     }
 }

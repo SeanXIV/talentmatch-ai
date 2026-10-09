@@ -178,4 +178,48 @@ class FeedPropertiesTest {
         assertThatThrownBy(() -> new FeedProperties.Scheduler(true, null, Duration.ofMinutes(11)))
                 .isInstanceOf(IllegalArgumentException.class);
     }
+
+    // ------------------------------------------------------------------ step 7: processor
+
+    @Test
+    void processorDefaultsWithEveryConstructor() {
+        FeedProperties.Processor d = FeedProperties.Processor.defaults();
+        assertThat(d.sweep()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(d.batchSize()).isEqualTo(50);
+        assertThat(d.retryDelay()).isEqualTo(Duration.ofMinutes(1));
+        assertThat(FeedProperties.defaults().processor()).isEqualTo(d);
+        assertThat(new FeedProperties(Intervals.defaults(), Duration.ofSeconds(10)).processor()).isEqualTo(d);
+        assertThat(new FeedProperties(true, null, null, Duration.ofSeconds(10), null, null, null).processor())
+                .as("step-6 constructor").isEqualTo(d);
+        assertThat(new FeedProperties(true, null, null, Duration.ofSeconds(10), null, null, null, null).processor())
+                .as("full constructor, null processor").isEqualTo(d);
+        FeedProperties.Processor custom = new FeedProperties.Processor(Duration.ofSeconds(5), 10, Duration.ofSeconds(2));
+        assertThat(new FeedProperties(true, null, null, Duration.ofSeconds(10), null, null, null, custom).processor())
+                .isEqualTo(custom);
+        // null durations in the record take their defaults
+        FeedProperties.Processor nulls = new FeedProperties.Processor(null, 7, null);
+        assertThat(nulls.sweep()).isEqualTo(Duration.ofSeconds(30));
+        assertThat(nulls.retryDelay()).isEqualTo(Duration.ofMinutes(1));
+        assertThat(nulls.batchSize()).isEqualTo(7);
+    }
+
+    @Test
+    void processorRanges() {
+        // inclusive bounds
+        assertThat(new FeedProperties.Processor(Duration.ofSeconds(1), 1, Duration.ofSeconds(1)).batchSize()).isOne();
+        assertThat(new FeedProperties.Processor(Duration.ofMinutes(10), 500, Duration.ofHours(1)).batchSize())
+                .isEqualTo(500);
+        assertThatThrownBy(() -> new FeedProperties.Processor(Duration.ofMillis(999), 50, null))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("processor.sweep");
+        assertThatThrownBy(() -> new FeedProperties.Processor(Duration.ofMinutes(10).plusSeconds(1), 50, null))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("processor.sweep");
+        assertThatThrownBy(() -> new FeedProperties.Processor(null, 0, null))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("processor.batch-size");
+        assertThatThrownBy(() -> new FeedProperties.Processor(null, 501, null))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("processor.batch-size");
+        assertThatThrownBy(() -> new FeedProperties.Processor(null, 50, Duration.ofMillis(999)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("processor.retry-delay");
+        assertThatThrownBy(() -> new FeedProperties.Processor(null, 50, Duration.ofHours(1).plusSeconds(1)))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("processor.retry-delay");
+    }
 }

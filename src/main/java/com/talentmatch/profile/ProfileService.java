@@ -27,6 +27,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -48,6 +49,7 @@ public class ProfileService {
     private final SkillAliasRepository aliases;
     private final CandidateService candidates;
     private final Clock clock;
+    private final ApplicationEventPublisher events;
 
     /** Punctuation, spaces and trailing version numbers are ignored when comparing skill names. */
     private static final Pattern NOT_SKILL_CHAR = Pattern.compile("[^\\p{L}\\p{N}+#]");
@@ -57,13 +59,15 @@ public class ProfileService {
     private static final int NEAR_DUPLICATE_MIN_LENGTH = 4;
 
     public ProfileService(OwnerProfileRepository profiles, ResumeRepository resumes, SkillRepository skills,
-                          SkillAliasRepository aliases, CandidateService candidates, Clock clock) {
+                          SkillAliasRepository aliases, CandidateService candidates, Clock clock,
+                          ApplicationEventPublisher events) {
         this.profiles = profiles;
         this.resumes = resumes;
         this.skills = skills;
         this.aliases = aliases;
         this.candidates = candidates;
         this.clock = clock;
+        this.events = events;
     }
 
     @Transactional(readOnly = true)
@@ -109,6 +113,8 @@ public class ProfileService {
 
         profiles.save(candidate.id(), request.resumeId(), ProfileJson.write(doc));
         OwnerProfileRepository.StoredProfile stored = profiles.find().orElseThrow();
+        // Listeners run after commit (the feed re-scores its open jobs against the new version).
+        events.publishEvent(new OwnerProfileConfirmedEvent(stored.version(), candidate.id()));
         return new ProfileResponse(candidate.id(), stored.resumeId(), stored.version(), doc, candidate.skills(),
                 stored.confirmedAt(), stored.updatedAt(), List.copyOf(warnings));
     }

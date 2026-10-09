@@ -5,7 +5,7 @@ import java.util.Objects;
 
 /** The result of one {@link SourcePoller#poll} (the poller never throws). */
 public sealed interface PollOutcome permits PollOutcome.Ok, PollOutcome.NotModified, PollOutcome.Failed,
-        PollOutcome.LeaseLost {
+        PollOutcome.Deferred, PollOutcome.LeaseLost {
 
     /** The value stored in {@code feed_source.last_status}; null when nothing was recorded. */
     String status();
@@ -49,6 +49,20 @@ public sealed interface PollOutcome permits PollOutcome.Ok, PollOutcome.NotModif
      * @param message sanitized (no body, query or key); also stored in {@code last_error}
      */
     record Failed(SourceFailure failure, String status, String message) implements PollOutcome {
+    }
+
+    /**
+     * Saving lost a lock conflict (a deadlock or lock timeout against a concurrent writer of the same
+     * feed jobs): nothing written, and it isn't a source failure. The lease was released and the
+     * source is due again at {@code retryAt}; {@code consecutive_failures}, {@code last_status} and
+     * {@code last_error} are unchanged.
+     */
+    record Deferred(java.time.Instant retryAt) implements PollOutcome {
+
+        @Override
+        public String status() {
+            return null;
+        }
     }
 
     /** The lease was taken over (the poll overran it) or the source was deleted: nothing written. */

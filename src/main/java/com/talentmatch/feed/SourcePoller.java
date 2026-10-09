@@ -54,6 +54,9 @@ public class SourcePoller {
     /** Headroom kept before the lease ends: one more detail request must finish inside the lease. */
     private static final Duration LEASE_MARGIN = Duration.ofSeconds(30);
     private static final int MAX_ERROR_LENGTH = 300;
+    /** A save that lost a lock conflict is retried after this (plus up to {@link #LOCK_CONFLICT_JITTER}). */
+    private static final Duration LOCK_CONFLICT_RETRY = Duration.ofSeconds(5);
+    private static final Duration LOCK_CONFLICT_JITTER = Duration.ofSeconds(5);
 
     private final SourceAdapters adapters;
     private final PollWriter writer;
@@ -136,6 +139,9 @@ public class SourcePoller {
         } catch (PollWriter.LeaseLostException e) {
             return new PollOutcome.LeaseLost();
         } catch (RuntimeException e) {
+            if (LockRetry.isLockConflict(e)) {
+                return deferAfterLockConflict(source, e);
+            }
             // Rolled back: the next poll fetches and writes the same data again.
             log.warn("Feed poll source={} kind={}: saving the postings failed ({})", source.id(), source.kind(),
                     describe(e));
@@ -278,6 +284,28 @@ public class SourcePoller {
 
     // ------------------------------------------------------------------ failures
 
+    /**
+     * The save lost a lock conflict (deadlock or lock timeout) against a concurrent writer of the same
+     * feed jobs, e.g. a refresh marker. Not a source failure (§6.1 backoff is for provider and
+     * response problems): the lease is released and the source is due again in a few seconds, without
+     * counting a failure or changing its status.
+     */
+    private PollOutcome deferAfterLockConflict(FeedSource source, RuntimeException e) {
+        Instant retryAt = clock.instant().plus(LOCK_CONFLICT_RETRY)
+                .plusMillis(ThreadLocalRandom.current().nextLong(LOCK_CONFLICT_JITTER.toMillis() + 1));
+        log.info("Feed poll source={} kind={}: saving the postings lost a lock conflict ({}); retrying at {}",
+                source.id(), source.kind(), describe(e), retryAt);
+        try {
+            return sources.releaseForRetry(source.id(), source.leaseUntil(), retryAt)
+                    ? new PollOutcome.Deferred(retryAt) : new PollOutcome.LeaseLost();
+        } catch (RuntimeException again) {
+            // The lease expires on its own; the source is claimed again then.
+            log.warn("Feed poll source={} kind={}: could not release the lease ({})", source.id(), source.kind(),
+                    describe(again));
+            return new PollOutcome.Deferred(retryAt);
+        }
+    }
+
     private PollOutcome fail(FeedSource source, SourceFailure failure, String status, String message, Instant now,
                              Duration interval) {
         String error = message == null ? status : cut(message);
@@ -336,6 +364,9 @@ public class SourcePoller {
         } else if (outcome instanceof PollOutcome.Failed failed) {
             log.info("Feed poll source={} kind={} outcome=failed status={} error=\"{}\" latencyMs={}", source.id(),
                     source.kind(), failed.status(), failed.message(), latencyMs);
+        } else if (outcome instanceof PollOutcome.Deferred deferred) {
+            log.info("Feed poll source={} kind={} outcome=deferred: lock conflict while saving, nothing written, "
+                    + "due again at {} (latencyMs={})", source.id(), source.kind(), deferred.retryAt(), latencyMs);
         } else {
             log.warn("Feed poll source={} kind={} outcome=lease_lost: the lease was taken over or the source was "
                     + "deleted; nothing was written (latencyMs={})", source.id(), source.kind(), latencyMs);

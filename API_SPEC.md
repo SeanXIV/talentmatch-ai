@@ -271,6 +271,9 @@ Full replace; the version goes up by one on every save. **Response `200`** (same
 
 Text is trimmed and whitespace runs are collapsed; duplicates (ignoring case) are dropped.
 Field errors use full paths, e.g. `preferences.regions.countries[1]`: `"'XX' is not an ISO country code."`
+After the save has committed, every open feed job is queued for re-evaluation. If that queueing fails
+(e.g. it conflicts with a poll, or a job stays locked by another transaction for more than 2 s on each
+of 3 attempts), the save still succeeds and the next processor run catches up.
 **Errors:** `400 VALIDATION_FAILED`; `400 MALFORMED_REQUEST` for unknown fields or enum values.
 
 ---
@@ -291,6 +294,9 @@ The watchlist of company job boards the feed polls. Each ACTIVE source is polled
 | `INVALID_RESPONSE` / `TOO_LARGE` | unreadable listing, more than half of the postings unreadable, or a body over 20 MB; nothing was saved | as `ERROR` |
 | `NOT_FOUND` / `UNAUTHORIZED` | the board is gone or refused access; the source stays `ACTIVE` in case it comes back | after 6 h |
 
+A poll whose save loses a database lock conflict with a concurrent update of the same jobs is not a
+failure: nothing is saved, `lastStatus`, `lastError` and `consecutiveFailures` stay as they were, and
+the source is polled again 5–10 s later.
 `consecutiveFailures` resets on `OK`/`NOT_MODIFIED`; `lastError` is a short sanitized note (no
 response body, no URL query, no key). The first successful poll sets `baselineAt`: postings seen
 then count as already known (not new) unless they were published within the last 24 h. A posting
@@ -385,17 +391,73 @@ If every poll thread is busy, the source is made due and the scheduler polls it 
 
 ## Job feed (Phase 5)
 
+Each feed job found or changed by a poll is processed in the background within seconds: its
+skills are matched against the skill vocabulary (names and aliases; nothing is invented), it is
+checked against your preferences, and it is scored against your confirmed profile with the same
+scoring as `/jobs/{id}/matches`. A job with no recognised skills is not matchable and is never
+scored or notified. A job that is open, new (first seen within the last 24 h and not part of a
+source's first poll), passes your preferences and scores at least the notification threshold is
+queued for one notification, at most once ever. Confirming your profile, saving preferences or
+adding a skill or alias re-processes every open job (no repeat notifications).
+
+### `GET /feed/jobs`
+**Query params:** `page`, `size`, `since` (ISO-8601 instant, compared with `firstSeenAt`),
+`minScore` (0..1, your score), `includeFiltered` (default `false`), `includeClosed` (default
+`false`), `includeBaseline` (default `false`). Newest `firstSeenAt` first.
+**Response `200`** `PageResponse<FeedJobResponse>`. Without a profile nothing is scored, so
+`minScore` matches nothing. **Errors:** `400 INVALID_PARAMETER`
+
+**`FeedJobResponse`**
+```json
+{ "jobId": "…", "title": "Backend Engineer", "company": "Acme", "primaryUrl": "https://…",
+  "firstSeenAt": "…", "postedAt": "…", "closedAt": null, "baseline": false,
+  "workplace": "HYBRID", "locationText": "Cape Town", "countryCodes": ["ZA"], "seniority": "UNKNOWN",
+  "salary": { "min": 600000, "max": 800000, "currency": "ZAR", "period": "YEAR", "estimated": false },
+  "score": 0.8, "scorePercent": 80, "matchable": true,
+  "summary": "Matches 2 of 2 required skills; 0 of 1 nice-to-have.",
+  "matchedRequired": ["Java", "SQL"], "missingRequired": [],
+  "preferenceVerdict": "PASS", "filterReasons": [], "flags": ["REMOTE_ELIGIBILITY_UNKNOWN"],
+  "skills": [ { "name": "Java", "required": true, "source": "DICTIONARY" },
+              { "name": "Kubernetes", "required": false, "source": "DICTIONARY" } ],
+  "aiSuggestions": [], "enrichmentStatus": "PENDING",
+  "notification": { "status": "PENDING", "channel": "EMAIL", "sentAt": null },
+  "sources": [ { "kind": "LEVER", "via": "Lever", "url": "https://…", "externalId": "…",
+                 "firstSeenAt": "…", "closedAt": null } ] }
+```
+- `salary` is `null` when no salary is stated; `estimated` salaries are never used for filtering.
+- `score` is your cached score (`null` without a profile, before processing, or when the job has no
+  skills). `summary`, `matchedRequired` and `missingRequired` are computed from the job's current
+  skills and yours.
+- `preferenceVerdict` is `null` until the job was processed. `filterReasons`: `TITLE`,
+  `EXCLUDED_KEYWORD`, `REGION`, `REMOTE_NOT_WANTED`, `REMOTE_REGION`, `SENIORITY`, `SALARY`,
+  `WORK_PERMIT`. `flags`: `LOCATION_UNKNOWN`, `REMOTE_ELIGIBILITY_UNKNOWN`, `SALARY_OTHER_CURRENCY`,
+  `IMMEDIATE_START` (never filter).
+- `skills[].source`: `DICTIONARY`, `AI` or `BOTH`. `aiSuggestions` (`{name, requirement, evidence}`)
+  are skills the AI found that aren't in the vocabulary; they are never created automatically.
+- `notification` is `null` when none was queued.
+- `sources` lists every posting of the job (several providers can post the same job).
+
+### `GET /feed/jobs/{jobId}`
+**Response `200`** `FeedJobResponse` plus `description` (omitted while the posting has none yet).
+**Errors:** `400 INVALID_ID`; `404 JOB_NOT_FOUND` (also for a job that isn't from the feed:
+`"Job … is not from the job feed. Read it with GET /api/jobs/…."`)
+
 ### `GET /feed/status`
-**Response `200`** (this step reports the poller; more sections are added as the feed grows)
+**Response `200`** (more sections are added as the feed grows)
 ```json
 { "enabled": true, "schedulerEnabled": true,
+  "profile": { "present": true, "version": 3, "appliedVersion": 3 },
+  "preferences": { "present": true, "version": 2 },
   "sources": { "total": 4, "active": 3, "failing": 1, "lastSuccessAt": "…" },
   "processing": { "pending": 12 } }
 ```
-- `schedulerEnabled`: sources are polled automatically (the feed and its scheduler are both on).
+- `schedulerEnabled`: sources are polled and their jobs processed automatically (the feed and its
+  scheduler are both on).
+- `profile.appliedVersion`: the profile version the open feed jobs were last queued for re-scoring
+  against; it differs from `version` only until the processor catches up.
+- `preferences.present`: `false` means the feed is not filtered.
 - `sources.failing`: ACTIVE sources whose last poll failed.
-- `processing.pending`: feed jobs found or changed by a poll and waiting to be processed (skills,
-  filter, score).
+- `processing.pending`: feed jobs waiting to be processed (skills, filter, score).
 
 The actuator health component `feed` is `UP`, or `DEGRADED` when an ACTIVE source failed 3 times
 in a row or has had no successful poll for more than 3 × its interval (details: counts and source
@@ -807,7 +869,8 @@ exception class names or SQL.
 | 409 | `FEED_DISABLED` | the job feed is switched off (`FEED_ENABLED=false`) **(Phase 5)** |
 | 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job within the regenerate window (`Retry-After: n`) **(extension, Phase 3)** |
 | 429 | `FEED_POLL_RATE_LIMITED` | a poll on request within 60 s of the source's last poll (`Retry-After: n`) **(Phase 5)** |
-| 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`) |
+| 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`); `/jobs/{id}/matches` and `/matches/**` only |
+| 503 | `SERVICE_BUSY` | any other endpoint lost a lock conflict with a concurrent update; nothing was saved, retry (`Retry-After: 2`) **(Phase 5)** |
 | 503 | `DATABASE_UNAVAILABLE` | database unreachable (`Retry-After: 5`) |
 | 503 | `UPLOAD_BUSY` | every PDF reader is busy; retry the upload in a minute **(Phase 4)** |
 | 500 | `INTERNAL_ERROR` | unexpected; message includes the request id to quote |

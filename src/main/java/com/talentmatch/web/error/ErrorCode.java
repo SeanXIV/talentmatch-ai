@@ -41,6 +41,8 @@ public enum ErrorCode {
     // 503
     MATCHES_BUSY,
     UPLOAD_BUSY,
+    /** A lock conflict with a concurrent update outside the matches endpoints (Phase 5). */
+    SERVICE_BUSY,
     DATABASE_UNAVAILABLE,
     // 500 / fallbacks
     INTERNAL_ERROR,

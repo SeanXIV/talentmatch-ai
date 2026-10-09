@@ -21,6 +21,12 @@ public class NotFoundException extends ApiException {
         return new NotFoundException(ErrorCode.JOB_NOT_FOUND, "No job with id " + id + ".");
     }
 
+    /** A job that exists but was not found by the job feed (a MANUAL job), for {@code /api/feed/jobs/{id}}. */
+    public static NotFoundException notFeedJob(UUID id) {
+        return new NotFoundException(ErrorCode.JOB_NOT_FOUND, "Job " + id + " is not from the job feed. "
+                + "Read it with GET /api/jobs/" + id + ".");
+    }
+
     public static NotFoundException skill(UUID id) {
         return new NotFoundException(ErrorCode.SKILL_NOT_FOUND, "No skill with id " + id + ".");
     }

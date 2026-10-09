@@ -30,6 +30,14 @@ import org.springframework.transaction.support.TransactionTemplate;
  *       {@code process_after = now}, the hand-off to the processor.</li>
  *   <li>The source: status, ETag / body hash, baseline time, open count, next poll, lease released.</li>
  * </ol>
+ * After the commit, a poll that touched jobs wakes the {@link FeedProcessor} (a no-op while the
+ * scheduler is off).
+ *
+ * <p><b>Lock order.</b> Before writing, the open feed jobs of changed and closing postings are locked
+ * in {@code job_id} order, and the canonical pass (with the deferred baseline clearing) also runs in
+ * {@code job_id} order, the same order the refresh markers lock in. A lock conflict that still
+ * happens rolls the poll back; {@link SourcePoller} treats it as transient (no failure counted, due
+ * again in a few seconds).
  */
 @Component
 public class PollWriter {
@@ -49,14 +57,17 @@ public class PollWriter {
     private final FeedJobRepository jobs;
     private final FeedProperties properties;
     private final TransactionTemplate tx;
+    private final FeedProcessor processor;
 
     public PollWriter(FeedSourceRepository sources, JobPostingRepository postings, FeedJobRepository jobs,
-                      FeedProperties properties, PlatformTransactionManager transactionManager) {
+                      FeedProperties properties, PlatformTransactionManager transactionManager,
+                      FeedProcessor processor) {
         this.sources = sources;
         this.postings = postings;
         this.jobs = jobs;
         this.properties = properties;
         this.tx = new TransactionTemplate(transactionManager);
+        this.processor = processor;
     }
 
     /**
@@ -66,7 +77,16 @@ public class PollWriter {
      * @throws LeaseLostException when the lease is no longer ours (nothing written)
      */
     PollOutcome.Ok write(FeedSource source, PollPlan plan, Instant now, Instant nextPollAt) {
-        return tx.execute(status -> doWrite(source, plan, now, nextPollAt));
+        PollOutcome.Ok ok = tx.execute(status -> doWrite(source, plan, now, nextPollAt));
+        if (ok != null && touchedJobs(ok.stats())) {
+            processor.wake();                                   // after commit: the jobs are visible
+        }
+        return ok;
+    }
+
+    /** True when the poll handed jobs to the processor (new, changed, reopened or partly closed). */
+    private static boolean touchedJobs(PollOutcome.Stats s) {
+        return s.created() > 0 || s.updated() > 0 || s.reopened() > 0 || s.closed() > s.jobsClosed();
     }
 
     private PollOutcome.Ok doWrite(FeedSource source, PollPlan plan, Instant now, Instant nextPollAt) {
@@ -78,7 +98,23 @@ public class PollWriter {
             stored.put(p.externalId(), p);
         }
         boolean firstPoll = source.baselineAt() == null;
+
+        // The closing decision depends only on what was stored and what was fetched: decided up front
+        // so the jobs it closes can be locked together with the others below.
+        ClosingPolicy.Decision decision = null;
+        if (plan.complete()) {
+            List<String> openIds = stored.values().stream().filter(StoredPosting::open)
+                    .map(StoredPosting::externalId).toList();
+            decision = ClosingPolicy.decide(openIds, plan.fetchedIds(),
+                    source.suspiciousSince() != null, properties.closing().suspiciousDropRatio());
+        }
+        // Lock order: the open feed jobs this poll will write (changed or closing postings), in job_id
+        // order, before any of them is written; the refresh markers lock in the same order
+        // (FeedJobRepository.markOpenForProcessing), so the two can't deadlock on these rows.
+        jobs.lockOpenInOrder(jobsToWrite(plan, stored, decision));
+
         Set<UUID> touched = new LinkedHashSet<>();
+        Set<UUID> unbaseline = new LinkedHashSet<>();
         List<UUID> seen = new ArrayList<>();
         int created = 0;
         int updated = 0;
@@ -93,7 +129,7 @@ public class PollWriter {
                 }
                 boolean baseline = firstPoll
                         && ClosingPolicy.isBaselinePosting(posting.postedAt(), now, properties.freshWindow());
-                UUID jobId = attachOrCreate(posting, baseline, now);
+                UUID jobId = attachOrCreate(posting, baseline, now, unbaseline);
                 postings.insert(source.id(), jobId, posting, baseline, now);
                 touched.add(jobId);
                 created++;
@@ -120,11 +156,7 @@ public class PollWriter {
         int jobsClosed = 0;
         Instant suspiciousSince = null;
         String status = "OK";
-        if (plan.complete()) {
-            List<String> openIds = stored.values().stream().filter(StoredPosting::open)
-                    .map(StoredPosting::externalId).toList();
-            ClosingPolicy.Decision decision = ClosingPolicy.decide(openIds, plan.fetchedIds(),
-                    source.suspiciousSince() != null, properties.closing().suspiciousDropRatio());
+        if (decision != null) {
             if (decision.closingHeld()) {
                 suspiciousSince = now;
                 status = "SUSPICIOUS_EMPTY";
@@ -141,7 +173,11 @@ public class PollWriter {
             }
         }
 
-        for (UUID jobId : touched) {
+        // In job_id order, like the lock pass above (jobs attached to from another source are locked here).
+        for (UUID jobId : FeedJobRepository.sortedForDatabase(touched)) {
+            if (unbaseline.contains(jobId)) {
+                jobs.clearBaseline(jobId);
+            }
             CanonicalJob.of(postings.findOpenCandidates(jobId)).ifPresent(c -> jobs.applyCanonical(jobId, c, now));
         }
 
@@ -161,8 +197,38 @@ public class PollWriter {
                 jobsClosed, plan.skipped(), plan.detailCalls()));
     }
 
-    /** The open job with this posting's key, or a new one (§4.4). */
-    private UUID attachOrCreate(NormalizedPosting posting, boolean baseline, Instant now) {
+    /**
+     * The open feed jobs the poll writes before its ordered canonical pass: jobs of stored open
+     * postings whose content changed, and jobs of postings the complete listing closes. (Jobs found by
+     * dedup key and reopened jobs are only known while writing; closed jobs aren't marked anyway.)
+     */
+    private static Set<UUID> jobsToWrite(PollPlan plan, Map<String, StoredPosting> stored,
+                                         ClosingPolicy.Decision decision) {
+        Set<UUID> ids = new LinkedHashSet<>();
+        for (PollPlan.Entry entry : plan.entries()) {
+            StoredPosting existing = stored.get(entry.externalId());
+            NormalizedPosting posting = entry.posting();
+            if (existing != null && existing.open() && posting != null
+                    && !posting.contentHash().equals(existing.contentHash())) {
+                ids.add(existing.jobId());
+            }
+        }
+        if (decision != null && !decision.closingHeld()) {
+            for (String externalId : decision.toClose()) {
+                StoredPosting p = stored.get(externalId);
+                if (p != null) {
+                    ids.add(p.jobId());
+                }
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * The open job with this posting's key, or a new one (§4.4). A non-baseline posting joining an
+     * existing job adds it to {@code unbaseline}; the flag is cleared in the ordered canonical pass.
+     */
+    private UUID attachOrCreate(NormalizedPosting posting, boolean baseline, Instant now, Set<UUID> unbaseline) {
         String key = DedupKeys.of(posting.company(), posting.title(), posting.workplace());
         Optional<UUID> open = jobs.findOpenByDedupKey(key);
         if (open.isEmpty()) {
@@ -177,7 +243,7 @@ public class PollWriter {
             }
         }
         if (!baseline) {
-            jobs.clearBaseline(open.get());
+            unbaseline.add(open.get());
         }
         return open.get();
     }
