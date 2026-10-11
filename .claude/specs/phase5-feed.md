@@ -1172,7 +1172,25 @@ Steps 2–3 and 4–5 can run in parallel. Steps 8 and 9 depend only on 7.
 2. Lever: `mode=json` returns every posting with no pagination needed; the `country` and `workplaceType` fields; an unknown site returns 404; the EU host.
 3. Ashby: the endpoint path; field names (`publishedAt`, `isListed`, `workplaceType`, `compensation.summaryComponents`); unknown-board behaviour.
 4. Adzuna: the exact free-tier limits and terms (attribution, storing and caching ads); `za` coverage; the `max_days_old`/`sort_by=date` semantics.
-5. Email:
+5. Email (verified in step 8 by unit tests: `EmailNotifierSocketTest`, `EmailSettingsTest`, `NotifyConfigTest`):
+   - Angus Mail 2.0.x (Boot 3.5): `org.eclipse.angus.mail.smtp.SMTP{Send,Address,Sender}FailedException` (`getReturnCode()`) and `org.eclipse.angus.mail.util.MailConnectException` come with `spring-boot-starter-mail`; a refused connection surfaces as `MailConnectException`.
+   - `JavaMailSenderImpl` keeps an explicitly set Message-ID across `saveChanges()`; mail arrives with `<feed-{id}@from-domain>` (no `MimeMessage` subclass needed).
+   - GreenMail with a configured user answers a wrong password with 535 (`AuthenticationFailedException`), classified CONFIG.
+   - `InternetAddress(addr, true)` accepts a bare local part with no domain, so `EmailSettings.parse` requires `local@domain` explicitly (and rejects CR/LF).
+   - An empty `SMTP_PORT` / `SMTP_SECURITY` binds to null, so the defaults 587 / STARTTLS apply.
+
+   **Step 8 deviations from this spec** (also in API_SPEC.md / DATA_MODEL.md):
+   - Retries (§4.9 vs §9.1 #14): `max-attempts` = 5 sends in total; delays 1, 2, 4, 8 min; the 5th failure is FAILED (the 15m cap stays in the backoff function).
+   - Notifications disabled: PENDING rows are not claimed and expire after 24h.
+   - Hourly cap (§4.9 step 4): checked before claiming, so rows are never claimed and released; exact within one instance.
+   - Settings response (§5.4): `from` is masked like `to`; `NotifyProperties.toString` masks username, from and to.
+   - §5.6: 502 is not mapped in `ApiErrorAttributes.codeFor` (a container 502 isn't a mail failure); it stays `INTERNAL_ERROR`.
+   - "Failed in the last 24h/1h" counts use `updated_at` on the DB clock; health `NOTIFICATIONS_FAILED` ignores `last_error='expired'`.
+   - `/feed/status` notifications section adds `paused`, `pausedUntil`, `lastError`.
+   - A CONFIG error releases the row to PENDING with `next_attempt_at = now`; the in-memory pause blocks claims, so a successful test send (which clears the pause) or a restart sends at once.
+   - A run stops after a transient failure; the remaining rows wait for the next sweep or wake.
+   - §7 vs §4.9: `SMTP_USERNAME` without `SMTP_PASSWORD` (or the reverse) fails startup even when host/from/to are blank.
+   - Pause and cap are per instance (single-instance assumption, §6.3); startup recovery resets every SENDING row.
 6. LangChain4j 1.20.2: the hand-built `ResponseFormat` schema works for this shape on Ollama (same approach as `ProfileJsonSchema`).
 
 Until the owner answers §0, build with the recommended defaults. Only the modules marked against each decision would change.

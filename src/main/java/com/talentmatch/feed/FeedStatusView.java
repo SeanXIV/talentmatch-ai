@@ -1,5 +1,6 @@
 package com.talentmatch.feed;
 
+import com.talentmatch.notify.Channel;
 import java.time.Instant;
 
 /**
@@ -12,7 +13,21 @@ import java.time.Instant;
  *                         scheduler are enabled
  */
 public record FeedStatusView(boolean enabled, boolean schedulerEnabled, Profile profile, Preferences preferences,
-                             Sources sources, Processing processing) {
+                             Notifications notifications, Sources sources, Processing processing) {
+
+    /**
+     * Notification delivery (§5.2, step 8). {@code paused}, {@code pausedUntil} and {@code lastError} are
+     * additions to §5.2 (D20).
+     *
+     * @param configured    the channel can deliver (for email: host, from and to are set)
+     * @param pending       PENDING + SENDING rows
+     * @param failedLast24h FAILED rows changed in the last 24 hours (database clock), expired ones included
+     * @param paused        the dispatcher is paused after a configuration error
+     * @param lastError     the sanitized text of the last failed send (null after a success)
+     */
+    public record Notifications(boolean enabled, Channel channel, boolean configured, double minScore, long pending,
+                                long failedLast24h, boolean paused, Instant pausedUntil, String lastError) {
+    }
 
     /**
      * @param present        an owner profile was confirmed

@@ -2,6 +2,7 @@ package com.talentmatch.feed;
 
 import com.talentmatch.ai.config.MdcTaskDecorator;
 import com.talentmatch.feed.source.SourceProperties;
+import com.talentmatch.notify.NotificationDispatcher;
 import java.util.concurrent.ThreadPoolExecutor;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
@@ -79,12 +80,14 @@ public class FeedConfig {
         private final FeedScheduler scheduler;
         private final FeedProperties properties;
         private final ObjectProvider<FeedProcessor> processor;
+        private final ObjectProvider<NotificationDispatcher> dispatcher;
 
         FeedSchedulingConfig(FeedScheduler scheduler, FeedProperties properties,
-                             ObjectProvider<FeedProcessor> processor) {
+                             ObjectProvider<FeedProcessor> processor, ObjectProvider<NotificationDispatcher> dispatcher) {
             this.scheduler = scheduler;
             this.properties = properties;
             this.processor = processor;
+            this.dispatcher = dispatcher;
         }
 
         @Override
@@ -94,6 +97,13 @@ public class FeedConfig {
             FeedProcessor p = processor.getIfAvailable();
             if (p != null) {
                 registrar.addFixedDelayTask(new FixedDelayTask(p::wake, properties.processor().sweep(),
+                        s.initialDelay()));
+            }
+            // The notification dispatcher's sweep reuses processor.sweep (D9); it also picks up rows whose
+            // next_attempt_at has come, and rows waiting for the hourly cap or a pause to end.
+            NotificationDispatcher d = dispatcher.getIfAvailable();
+            if (d != null) {
+                registrar.addFixedDelayTask(new FixedDelayTask(d::wake, properties.processor().sweep(),
                         s.initialDelay()));
             }
         }

@@ -1,5 +1,6 @@
 package com.talentmatch.feed;
 
+import com.talentmatch.notify.NotificationDispatcher;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -13,10 +14,11 @@ import org.springframework.stereotype.Component;
  *       (the source is due again at once instead of after the lease expires).</li>
  *   <li>The profile, preferences and skill vocabulary are compared with what the open jobs were last
  *       processed for (§4.11); a difference marks them for processing.</li>
- *   <li>The processor is woken (a no-op while the scheduler is off).</li>
+ *   <li>Notifications left SENDING by a crash go back to PENDING (at least once: they are sent again,
+ *       with the same Message-ID).</li>
+ *   <li>The processor and the notification dispatcher are woken (no-ops while the scheduler is off).</li>
  * </ol>
- * Enrichment and notification recovery join with later steps. Each step runs on its own and logs
- * class names only.
+ * Enrichment recovery joins with step 10. Each step runs on its own and logs class names only.
  */
 @Component
 public class FeedRecovery {
@@ -26,11 +28,14 @@ public class FeedRecovery {
     private final FeedSourceRepository sources;
     private final FeedRefreshService refresh;
     private final FeedProcessor processor;
+    private final NotificationDispatcher dispatcher;
 
-    public FeedRecovery(FeedSourceRepository sources, FeedRefreshService refresh, FeedProcessor processor) {
+    public FeedRecovery(FeedSourceRepository sources, FeedRefreshService refresh, FeedProcessor processor,
+                        NotificationDispatcher dispatcher) {
         this.sources = sources;
         this.refresh = refresh;
         this.processor = processor;
+        this.dispatcher = dispatcher;
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -49,6 +54,15 @@ public class FeedRecovery {
             log.warn("Feed recovery: could not compare the applied versions ({}); the processor retries",
                     SourcePoller.describe(e));
         }
+        try {
+            int reset = dispatcher.recoverInterrupted();
+            if (reset > 0) {
+                log.info("Feed recovery: {} interrupted notification(s) will be sent again", reset);
+            }
+        } catch (RuntimeException e) {
+            log.warn("Feed recovery: could not reset interrupted notifications ({})", SourcePoller.describe(e));
+        }
         processor.wake();
+        dispatcher.wake();
     }
 }

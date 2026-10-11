@@ -10,6 +10,9 @@ import org.springframework.beans.factory.support.DefaultListableBeanFactory;
 class NotificationChannelsTest {
 
     private record StubNotifier(Channel channel, boolean configured) implements Notifier {
+        @Override
+        public void send(NotificationMessage message) {
+        }
     }
 
     private static NotificationChannels channels(Notifier... notifiers) {

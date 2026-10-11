@@ -448,6 +448,8 @@ adding a skill or alias re-processes every open job (no repeat notifications).
 { "enabled": true, "schedulerEnabled": true,
   "profile": { "present": true, "version": 3, "appliedVersion": 3 },
   "preferences": { "present": true, "version": 2 },
+  "notifications": { "enabled": true, "channel": "EMAIL", "configured": true, "minScore": 0.6,
+                     "pending": 1, "failedLast24h": 0, "paused": false, "pausedUntil": null, "lastError": null },
   "sources": { "total": 4, "active": 3, "failing": 1, "lastSuccessAt": "…" },
   "processing": { "pending": 12 } }
 ```
@@ -458,10 +460,84 @@ adding a skill or alias re-processes every open job (no repeat notifications).
 - `preferences.present`: `false` means the feed is not filtered.
 - `sources.failing`: ACTIVE sources whose last poll failed.
 - `processing.pending`: feed jobs waiting to be processed (skills, filter, score).
+- `notifications`: the saved settings (`enabled`, `channel`, `minScore`), whether the channel is
+  `configured`, `pending` (queued or being sent), `failedLast24h` (failed in the last 24 hours,
+  expired ones included), and the sender's state: `paused` / `pausedUntil` after a configuration
+  error (bad login, TLS, unknown host) and `lastError`, the sanitized text of the last failed send
+  (e.g. `"SMTP login failed (535). Check SMTP_USERNAME and SMTP_PASSWORD."`; cleared by a successful
+  send). `paused`, `pausedUntil` and `lastError` go beyond the Phase 5 spec §5.2.
 
 The actuator health component `feed` is `UP`, or `DEGRADED` when an ACTIVE source failed 3 times
 in a row or has had no successful poll for more than 3 × its interval (details: counts and source
-ids). It never turns overall health `DOWN`.
+ids), with reason `EMAIL_CONFIG` while email sending is paused after a configuration error, or
+`NOTIFICATIONS_FAILED` when a notification failed in the last hour (expired ones aren't counted).
+Details include `notifications: {configured, paused, pausedUntil, failedLastHour}`. It never opens an
+SMTP connection and never turns overall health `DOWN`.
+
+---
+
+## Notifications (Phase 5)
+
+Email over SMTP is the only channel. Email is **configured** when `SMTP_HOST`, `NOTIFY_EMAIL_FROM` and
+`NOTIFY_EMAIL_TO` are set (plus `SMTP_USERNAME` and `SMTP_PASSWORD` if the server needs a login);
+notifications are **disabled** until the owner turns them on. An email holds only the job's facts
+(title, company, workplace, location, score, matched/missing required skills, apply link), never CV
+data. At most one notification per job, ever; at most `maxPerHour` emails an hour. Delivery is at
+least once: a crash mid-send can send the same email again, with the same `Message-ID`.
+
+### `GET /notifications/settings`
+**Response `200`** (defaults when nothing was saved: disabled, EMAIL, 0.6, 20)
+```json
+{ "enabled": true, "channel": "EMAIL", "minScore": 0.6, "maxPerHour": 20,
+  "email": { "configured": true, "host": "smtp.gmail.com", "port": 587, "security": "STARTTLS",
+             "from": "o•••@gmail.com", "to": "o•••@example.com", "authenticated": true } }
+```
+Not configured: `"email": { "configured": false, "missing": ["SMTP_HOST", "NOTIFY_EMAIL_TO"] }` (the
+blank variables). The username and password are never returned; `from` and `to` are masked
+(`from` is masked too, which goes beyond the Phase 5 spec, because it is usually the owner's own
+address).
+
+### `PUT /notifications/settings`
+**Request** (full replacement)
+```json
+{ "enabled": true, "minScore": 0.6, "maxPerHour": 20, "channel": "EMAIL" }
+```
+**Response `200`** as `GET`. `channel` is optional (only `"EMAIL"` exists). A new `minScore` applies to
+new evaluations only; turning notifications off stops sending, and queued ones expire after 24 hours.
+**Errors:** `400 VALIDATION_FAILED` with field errors: `enabled` `"enabled is required."`;
+`minScore` `"minScore must be a number between 0 and 1."`; `maxPerHour`
+`"maxPerHour must be a whole number between 1 and 200."`; `enabled: true` while email isn't configured:
+`enabled` `"Email isn't configured: set SMTP_HOST, NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO (plus
+SMTP_USERNAME and SMTP_PASSWORD if your server needs a login), then restart."`.
+`400 MALFORMED_REQUEST` for an unknown field or another `channel` value (`"SMS"`).
+
+### `POST /notifications/test`
+No body. Sends the fixed email `[TalentMatch] Test notification` (the settings summary, no job or CV
+data) synchronously, bounded by the SMTP timeouts (10 s each). Works while notifications are disabled;
+creates no notification and doesn't count toward the hourly cap. A success also ends a pause after a
+configuration error.
+**Response `200`**
+```json
+{ "channel": "EMAIL", "delivered": true, "to": "o•••@example.com",
+  "messageId": "<test-3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6@example.com>" }
+```
+**Errors:** `409 NOTIFICATION_NOT_CONFIGURED` (same text as the `PUT` message above);
+`429 NOTIFICATION_TEST_RATE_LIMITED` with `Retry-After: n` (one attempt per 30 s, failed ones
+included); `502 NOTIFICATION_DELIVERY_FAILED`, e.g. `"The mail server rejected the login (535). Check
+SMTP_USERNAME and SMTP_PASSWORD."`, `"Couldn't connect to smtp.example.com:587 within 10 seconds."`,
+`"The mail server refused the recipient address (550). Check NOTIFY_EMAIL_TO."`, `"The mail server
+doesn't offer STARTTLS on port 587. Use port 465 with SMTP_SECURITY=SSL."`.
+
+### `GET /notifications`
+**Query:** `page`, `size` (see Paging). **Response `200`** `PageResponse` of
+```json
+{ "id": "…", "jobId": "…", "title": "Backend Engineer", "company": "Acme", "channel": "EMAIL",
+  "status": "SENT", "score": 0.8, "attempts": 1, "lastError": null,
+  "createdAt": "…", "sentAt": "…" }
+```
+newest `createdAt` first. `status`: `PENDING`, `SENDING`, `SENT` or `FAILED`. `lastError` is sanitized
+text only: `"SMTP 421 (transient)"`, `"connect timeout"`, `"SMTP 550 (rejected)"`, `"expired"`.
+**Errors:** `400 INVALID_PARAMETER`.
 
 ---
 
@@ -868,7 +944,10 @@ exception class names or SQL.
 | 409 | `FEED_POLL_IN_PROGRESS` | the feed source is being polled right now **(Phase 5)** |
 | 409 | `FEED_DISABLED` | the job feed is switched off (`FEED_ENABLED=false`) **(Phase 5)** |
 | 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job within the regenerate window (`Retry-After: n`) **(extension, Phase 3)** |
+| 409 | `NOTIFICATION_NOT_CONFIGURED` | `POST /notifications/test` while email isn't configured **(Phase 5)** |
 | 429 | `FEED_POLL_RATE_LIMITED` | a poll on request within 60 s of the source's last poll (`Retry-After: n`) **(Phase 5)** |
+| 429 | `NOTIFICATION_TEST_RATE_LIMITED` | a test email within 30 s of the last attempt, failed attempts included (`Retry-After: n`) **(Phase 5)** |
+| 502 | `NOTIFICATION_DELIVERY_FAILED` | the test email couldn't be delivered; the message names the cause, host:port and the SMTP code, never the server's reply text or a credential. The only 502 in the API; a container-level 502 on `/error` still reports `INTERNAL_ERROR` **(Phase 5)** |
 | 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`); `/jobs/{id}/matches` and `/matches/**` only |
 | 503 | `SERVICE_BUSY` | any other endpoint lost a lock conflict with a concurrent update; nothing was saved, retry (`Retry-After: 2`) **(Phase 5)** |
 | 503 | `DATABASE_UNAVAILABLE` | database unreachable (`Retry-After: 5`) |

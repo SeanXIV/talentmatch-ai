@@ -214,7 +214,55 @@ transactions do, waiting for rows another transaction holds, but each lock wait 
 per lock and retry a lock conflict or timeout up to 3 times in total; the comparison at the start of
 a processor run waits at most 1 s, is not retried, and when it gives up the run still processes the
 due jobs (the next run compares again).
-`notification_settings` with no row means notifications are disabled (min score 0.6).
+`notification_settings` with no row means notifications are disabled (channel EMAIL, min score 0.6,
+at most 20 an hour). It is written only by `PUT /api/notifications/settings` (one upsert).
+
+### `feed_notification` lifecycle (V5, written by the notification dispatcher)
+```
+            insert (processor, ON CONFLICT (job_id) DO NOTHING)
+                 │
+                 v
+   ┌──────── PENDING ◄───────────── release (config error) / startup recovery
+   │  claim     │  ▲ retry (transient: attempts+1, next_attempt_at = backoff)
+   │ (SKIP      v  │
+   │  LOCKED) SENDING ──ok──────────► SENT (sent_at, attempts+1, last_error NULL)
+   │            │
+   │            └─ permanent / transient on the last attempt ─► FAILED (attempts, last_error)
+   └─ created_at older than max-age (24 h) ───────────────────► FAILED (last_error 'expired', no email)
+```
+- **Claim**: the oldest due row (`status = 'PENDING' AND next_attempt_at <= now`, by `created_at`)
+  becomes `SENDING` in one autocommit statement with `FOR UPDATE SKIP LOCKED`. Nothing is claimed while
+  notifications are disabled, the channel isn't configured, the channel is paused after a configuration
+  error, or the hourly cap is reached; such rows simply wait (and expire).
+- **Send** runs outside any transaction, holding no connection. Each result is one short statement
+  guarded by `status = 'SENDING'` (so writing it twice is harmless), in a transaction with a 2 s
+  `lock_timeout`; a result that can't be written is kept in memory and written on the next run (never
+  re-sent):
+  - sent → `SENT`, `sent_at`, `attempts + 1`, `last_error = NULL`;
+  - transient (SMTP 4xx, connection or timeout) → `PENDING`, `attempts + 1`, `next_attempt_at = now +`
+    1, 2, 4, 8 min (±10 %, capped at `retry-max` 15 min); the 5th failed send (`max-attempts`) → `FAILED`;
+  - permanent (SMTP 5xx other than the login/TLS codes, invalid address) → `FAILED` at once;
+  - configuration error (login rejected, 530/534/535/538, no STARTTLS, TLS handshake, unknown host) →
+    `PENDING` without counting an attempt (`next_attempt_at` unchanged in effect, `last_error` set),
+    and the dispatcher pauses for `config-error-pause` (15 min, in memory) or until a test email succeeds.
+- **Expiry**: a `PENDING` row whose `created_at` is older than `max-age` becomes `FAILED` with
+  `last_error = 'expired'`, without an email (also while disabled, unconfigured or paused).
+- **Hourly cap**: counted as `SENT` rows with `sent_at` in the last hour (application clock);
+  checked before each claim.
+- **At least once**: a crash between the mail server's `250` and the `SENT` write leaves the row
+  `SENDING`; startup recovery resets every `SENDING` row to `PENDING` and it is sent again with the same
+  `Message-ID` (`<feed-{id}@from-domain>`), which some clients merge.
+- A run stops after a transient failure (or a message that can't be prepared); the remaining due rows
+  wait for the next sweep or wake, so a struggling mail server isn't retried row after row.
+- **Single instance**: the pause and the hourly cap are held per instance, and startup recovery resets
+  every `SENDING` row, including one another instance is sending. With two instances the cap can be
+  exceeded by one per extra instance and a restart can cause a duplicate send (§6.3 assumes one).
+- `last_error` is sanitized text only (≤ 300 chars): `"SMTP 421 (transient)"`, `"connect timeout"`,
+  `"SMTP 550 (rejected)"`, `"expired"`; never server reply text, addresses or credentials.
+- `/feed/status` `failedLast24h` and the `feed` health check (`NOTIFICATIONS_FAILED`, last hour,
+  expired rows excluded) count `FAILED` rows by `updated_at`, which the trigger sets on the database clock.
+- Deleting a source cascades to its orphaned feed jobs and their notification rows; the dispatcher's
+  status writes then simply match no row.
 
 ### `skill`
 A normalized skill lookup table (e.g. "Java", "SQL", "React") shared between

@@ -29,6 +29,10 @@ spring:
     max-file-size: 6MB            # above talentmatch.profile.max-resume-bytes so our own 413 message wins
     max-request-size: 7MB
   lifecycle.timeout-per-shutdown-phase: 30s
+  # No auto-configured JavaMailSender: the email notifier builds its own sender from talentmatch.notify.email.*,
+  # so a stray SPRING_MAIL_* env var can't create a second sender (or a mail health check).
+  # Note for tests: a test that sets spring.autoconfigure.exclude itself replaces this list.
+  autoconfigure.exclude: org.springframework.boot.autoconfigure.mail.MailSenderAutoConfiguration
 
 server:
   address: ${SERVER_ADDRESS:127.0.0.1}  # loopback only: no auth yet, and /api/profile is personal data (PRODUCTION_READINESS §6)
@@ -48,6 +52,7 @@ management:
     show-details: always
     probes.enabled: true
     status.order: down,out-of-service,up,degraded,unknown   # 'ai' DEGRADED never fails overall health
+  health.mail.enabled: false          # never open SMTP connections from health probes
 
 talentmatch:
   scoring:
@@ -112,5 +117,29 @@ talentmatch:
     greenhouse: { base-url: https://boards-api.greenhouse.io, max-detail-calls-per-poll: 20 }
     lever: { base-url: https://api.lever.co, eu-base-url: https://api.eu.lever.co }
     ashby: { base-url: https://api.ashbyhq.com }
+
+  # Email notifications (Phase 5, com.talentmatch.notify.NotifyProperties). Email is off until SMTP_HOST,
+  # NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO are set, and nothing is sent until the owner turns notifications
+  # on (PUT /api/notifications/settings). Background sending runs only while the feed scheduler runs.
+  notify:
+    zone: Africa/Johannesburg
+    app-base-url: ${NOTIFY_APP_BASE_URL:http://127.0.0.1:8080}   # only used for the "Details:" link
+    max-attempts: 5                   # sends per notification: retries after 1, 2, 4, 8 min, then FAILED
+    retry-initial: 1m
+    retry-max: 15m
+    config-error-pause: 15m           # a login/TLS/host error pauses sending this long (or until a test succeeds)
+    max-age: 24h                      # unsent after this long -> FAILED "expired"
+    test-interval: 30s                # POST /api/notifications/test at most this often
+    email:
+      host: ${SMTP_HOST:}             # blank = email off (dev default)
+      port: ${SMTP_PORT:587}
+      security: ${SMTP_SECURITY:STARTTLS}   # STARTTLS (587) | SSL (465) | NONE (loopback hosts only)
+      username: ${SMTP_USERNAME:}
+      password: ${SMTP_PASSWORD:}     # env var only; never write a value in any yml file
+      from: ${NOTIFY_EMAIL_FROM:}
+      to: ${NOTIFY_EMAIL_TO:}
+      connection-timeout: 10s
+      read-timeout: 10s
+      write-timeout: 10s
 
 logging.pattern.level: "%5p [%X{requestId:-}]"
