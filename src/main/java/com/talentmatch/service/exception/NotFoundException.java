@@ -21,6 +21,12 @@ public class NotFoundException extends ApiException {
         return new NotFoundException(ErrorCode.JOB_NOT_FOUND, "No job with id " + id + ".");
     }
 
+    /** A job that exists but was not found by the job feed (a MANUAL job), for {@code /api/feed/jobs/{id}}. */
+    public static NotFoundException notFeedJob(UUID id) {
+        return new NotFoundException(ErrorCode.JOB_NOT_FOUND, "Job " + id + " is not from the job feed. "
+                + "Read it with GET /api/jobs/" + id + ".");
+    }
+
     public static NotFoundException skill(UUID id) {
         return new NotFoundException(ErrorCode.SKILL_NOT_FOUND, "No skill with id " + id + ".");
     }
@@ -32,6 +38,21 @@ public class NotFoundException extends ApiException {
     public static NotFoundException profile() {
         return new NotFoundException(ErrorCode.PROFILE_NOT_FOUND, "You have not saved a profile yet. Upload your CV "
                 + "with POST /api/profile/resume, review the draft, then save it with PUT /api/profile.");
+    }
+
+    public static NotFoundException preferences() {
+        return new NotFoundException(ErrorCode.PREFERENCES_NOT_FOUND,
+                "No job preferences saved yet; the feed is not filtered. Save them with PUT /api/preferences.");
+    }
+
+    public static NotFoundException skillAlias(UUID skillId, UUID aliasId) {
+        return new NotFoundException(ErrorCode.SKILL_ALIAS_NOT_FOUND,
+                "Skill " + skillId + " has no alias with id " + aliasId + ".");
+    }
+
+    public static NotFoundException feedSource(UUID id) {
+        return new NotFoundException(ErrorCode.FEED_SOURCE_NOT_FOUND, "No feed source with id " + id
+                + ". List your sources with GET /api/feed/sources.");
     }
 
     public static NotFoundException recomputeRun(UUID id, int historySize) {

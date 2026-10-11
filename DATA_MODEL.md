@@ -10,6 +10,9 @@ The schema is created by the Flyway migrations in `src/main/resources/db/migrati
   (Phase 3; see "AI explanations" below).
 - `V4__owner_profile.sql`: uploaded CVs (`resume`) and the owner's confirmed master profile
   (`owner_profile`) (Phase 4; see "Master profile" below).
+- `V5__job_feed.sql`: job origin (`MANUAL` | `FEED`), skill aliases, and the job feed tables
+  (`feed_source`, `feed_job`, `job_posting`, `job_preferences`, `notification_settings`,
+  `feed_notification`, `feed_state`, `feed_api_usage`) (Phase 5; see "Job origin" below).
 
 ## Entity-Relationship Diagram
 
@@ -40,6 +43,7 @@ erDiagram
         string title
         string company
         text description
+        string origin
         timestamp created_at
         timestamp updated_at
     }
@@ -127,7 +131,90 @@ and is unique.
 
 ### `job`
 Core job record. `description` provides context for AI explanations in the
-same way `candidate.summary` does. The pair `(title, company)` is unique.
+same way `candidate.summary` does.
+
+**Job origin (V5).** `origin` is `MANUAL` (created through the API or loaded by the ETL; the
+default) or `FEED` (created and kept up to date by the Phase 5 job feed). The pair
+`(title, company)` is unique **among MANUAL jobs only** (partial unique index
+`uq_job_title_company_manual`): real postings repeat a title and company (one role in several
+cities, a re-post), so feed jobs are deduplicated by `feed_job.dedup_key` instead. Upserts by the
+natural key must say `ON CONFLICT (title, company) WHERE origin = 'MANUAL'`. `UNIQUE (id, origin)`
+lets `feed_job` reference `(job_id, 'FEED')`, so only FEED jobs can have feed rows. FEED jobs are
+read-only in `/api/jobs` (`PUT`/`DELETE` → 409 `DATA_CONFLICT`). The remaining V5 feed tables
+are documented with the rest of Phase 5; the poller's use of them is below.
+
+### `feed_source`, `job_posting`, `feed_job` (V5, written by the poller)
+```
+feed_source 1──* job_posting *──1 feed_job 1──1 job (origin FEED)
+```
+- **`feed_source`** is one watched board. The poller claims due ACTIVE rows by setting
+  `lease_until` (`UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)`), fetches without any
+  transaction open, then writes everything for that source in one transaction. Every statement that
+  finishes a poll is guarded with `lease_until = <its lease>`, so a poll whose lease expired (and was
+  taken over) writes nothing. A poll also records `last_status`, `last_error` (sanitized),
+  `consecutive_failures`, `next_poll_at` (backoff on failure), `etag`/`content_hash` (conditional
+  requests: a `304` or an identical body is `NOT_MODIFIED`), `open_postings`, and `baseline_at`
+  (first successful poll). `suspicious_since` holds back closing when a complete listing suddenly
+  lacks most open postings, until a second such poll. Leases left by a stopped app are dropped at
+  startup.
+- **`job_posting`** is one provider posting, unique per `(source_id, external_id)`; `content_hash`
+  (sha256 of the cleaned content) detects changes. A posting missing from a complete (ATS) listing
+  gets `closed_at`; one that reappears is reopened. `baseline` marks postings of a source's first
+  poll that weren't published within the fresh window (24 h). A Greenhouse posting can be stored
+  with `description` NULL until its detail is fetched (at most 20 detail requests per poll).
+- **`feed_job`** is the canonical, deduplicated job. A new posting attaches to the **open** feed
+  job with the same `dedup_key` (`normalized company | normalized title | remote|onsite`), otherwise
+  a new `job` (origin FEED) and `feed_job` are created; the partial unique index on open keys makes
+  concurrent creates safe. The canonical title, company, description, URL, salary, countries and
+  workplace come from the open postings (ATS before aggregator, then the most complete
+  description). A job closes when its last open posting closes. `baseline` is true only while all
+  its postings are baseline. A changed description resets `enrichment_status` to `PENDING`. Every
+  job a poll touches gets `process_after = now`, the hand-off to the processor (skills, filter,
+  score).
+
+### `feed_job` processing, `feed_notification`, `feed_state` (V5, written by the processor)
+The processor takes jobs whose `process_after` is due, one transaction per job, locking the
+`feed_job` and `job` rows with `FOR NO KEY UPDATE SKIP LOCKED` (a poll writing the job, or another
+processor run, is skipped, not waited for). For each job it:
+1. matches the skill vocabulary (skill names and `skill_alias`) in the title and description and
+   stores the result in `dictionary_skills` (`[{skillId, name, required}]`);
+2. merges it with `ai_skills` (when enriched) and makes `job_skill` hold exactly those skills.
+   Only differing rows are written, so an unchanged job keeps `job.updated_at` and its cached
+   matches stay fresh; a real change bumps it (V2 triggers) and marks other candidates' matches stale.
+   Known limitation: the V2 triggers use `now()` (transaction start), so a `/matches` request that
+   held the job's advisory lock and committed after this transaction started can leave other
+   candidates' rows looking fresh though scored with the old skills; `?regenerate=true` repairs
+   them (a follow-up migration will switch the triggers to `clock_timestamp()`);
+3. evaluates the owner's preferences: `preference_verdict` (`PASS`/`FILTERED`), `filter_reasons`
+   and `filter_flags` (enum names), `evaluated_preferences_version`;
+4. when an owner profile exists and the job has skills, upserts the owner's `job_match` row with the
+   existing scoring, under the same per-job advisory lock as `/api/jobs/{id}/matches`, held from
+   before step 2 changes `job_skill` until the commit (`scored_profile_version`, `scored_at`); other
+   candidates are still scored lazily;
+5. inserts a `feed_notification` row (`PENDING`, `ON CONFLICT (job_id) DO NOTHING`) when the job is
+   notifiable: open, not baseline, first seen within the fresh window (24 h), `PASS`, scored at least
+   `notification_settings.min_score`, notifications enabled, the channel configured, and no row yet.
+   A job is notified at most once, ever;
+6. sets `process_after = NULL`. A failure leaves the job pending with `process_after` a minute
+   ahead.
+
+**`feed_state`** (single row) records what the open jobs were last queued for: the owner profile
+version, the preferences version and the skill-vocabulary fingerprint. Confirming a profile, saving
+preferences (both after the save commits, in a transaction of their own), or a vocabulary change (a
+skill or alias added or renamed, seen at the next processor run) sets `process_after = now` on every
+open feed job (a job already due keeps its earlier `process_after`, but is still written, so a job a
+running processor evaluates with what it read before the change is pending again afterwards) and
+updates the row. The processor reads the preferences, owner profile version, vocabulary and
+notification settings per job, after locking it, so `evaluated_preferences_version` is the version
+that job's verdict was computed with. The row is updated only together with a successful marking. If
+the marking fails, the save is unaffected, and the comparison at the start of every processor run
+(and at startup) catches up. Markers lock the open `feed_job` rows in `job_id` order, as poll
+transactions do, waiting for rows another transaction holds, but each lock wait is bounded
+(`lock_timeout`). The profile and preferences markers and the startup comparison wait at most 2 s
+per lock and retry a lock conflict or timeout up to 3 times in total; the comparison at the start of
+a processor run waits at most 1 s, is not retried, and when it gives up the run still processes the
+due jobs (the next run compares again).
+`notification_settings` with no row means notifications are disabled (min score 0.6).
 
 ### `skill`
 A normalized skill lookup table (e.g. "Java", "SQL", "React") shared between

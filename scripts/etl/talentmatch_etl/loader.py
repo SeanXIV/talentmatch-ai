@@ -76,10 +76,14 @@ RETURNING (xmax = 0) AS inserted
 
 SQL_CANDIDATE_IDS = "SELECT email, id FROM candidate WHERE email = ANY(%s::text[])"
 
+# ETL jobs are MANUAL (the column default). Since V5 the natural key is the
+# partial unique index uq_job_title_company_manual, and PostgreSQL only infers
+# a partial index when ON CONFLICT repeats its predicate. FEED jobs (job feed)
+# may share a title and company and are never touched by the ETL.
 SQL_UPSERT_JOB = """
 INSERT INTO job (title, company, description)
 SELECT * FROM unnest(%s::text[], %s::text[], %s::text[])
-ON CONFLICT (title, company) DO UPDATE
+ON CONFLICT (title, company) WHERE origin = 'MANUAL' DO UPDATE
     SET description = EXCLUDED.description
     WHERE job.description IS DISTINCT FROM EXCLUDED.description
 RETURNING (xmax = 0) AS inserted
@@ -89,6 +93,7 @@ SQL_JOB_IDS = """
 SELECT j.title, j.company, j.id
 FROM job j
 JOIN unnest(%s::text[], %s::text[]) AS u(t, c) ON j.title = u.t AND j.company = u.c
+WHERE j.origin = 'MANUAL'
 """
 
 SQL_UPSERT_CANDIDATE_SKILL = """
@@ -233,7 +238,7 @@ def upsert_candidates(cur: "psycopg.Cursor", df: pd.DataFrame,
 
 def upsert_jobs(cur: "psycopg.Cursor", df: pd.DataFrame,
                 stats: TableStats | None = None) -> dict[tuple[str, str], UUID]:
-    """Upsert jobs by (title, company); return {(title, company): id}."""
+    """Upsert MANUAL jobs by (title, company); return {(title, company): id}."""
     rows = _dedupe(_rows(df), key=lambda r: (r["title"], r["company"]), what="jobs")
     if not rows:
         return {}

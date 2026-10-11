@@ -43,6 +43,17 @@ public class OwnerProfileRepository {
                 new MapSqlParameterSource(), rs -> null);
     }
 
+    /** The owner's candidate and current profile version, without the profile document. */
+    public record OwnerRef(UUID candidateId, int version) {
+    }
+
+    /** The owner's candidate id and profile version, if a profile was saved (cheap: no JSON). */
+    public Optional<OwnerRef> findRef() {
+        return jdbc.query("SELECT candidate_id, version FROM owner_profile WHERE id", new MapSqlParameterSource(),
+                (rs, n) -> new OwnerRef(rs.getObject("candidate_id", UUID.class), rs.getInt("version")))
+                .stream().findFirst();
+    }
+
     /** The owner's candidate id, if a profile was saved. */
     public Optional<UUID> findCandidateId() {
         return jdbc.queryForList("SELECT candidate_id FROM owner_profile WHERE id",

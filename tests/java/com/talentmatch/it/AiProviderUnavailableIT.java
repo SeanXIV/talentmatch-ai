@@ -32,7 +32,14 @@ import org.springframework.context.annotation.Import;
         "talentmatch.ai.ollama.base-url=http://localhost:1",
         "talentmatch.ai.request-budget=2s",
         "talentmatch.ai.call-timeout=3s",
-        "talentmatch.ai.top-n=3"})
+        "talentmatch.ai.top-n=3",
+        // Phase 5: no feed scheduling, no real provider network (same as AbstractApiIT)
+        "talentmatch.feed.scheduler.enabled=false",
+        "talentmatch.feed.greenhouse.base-url=http://localhost:1",
+        "talentmatch.feed.lever.base-url=http://localhost:1",
+        "talentmatch.feed.lever.eu-base-url=http://localhost:1",
+        "talentmatch.feed.ashby.base-url=http://localhost:1",
+        "talentmatch.feed.adzuna.base-url=http://localhost:1"})
 @Import(TestcontainersConfiguration.class)
 @ExtendWith(OutputCaptureExtension.class)
 class AiProviderUnavailableIT extends AbstractApiIT {
@@ -41,10 +48,10 @@ class AiProviderUnavailableIT extends AbstractApiIT {
     ChatModel chatModel;
 
     @Test
-    void startsWithV4AndServesTemplatesWhileOllamaIsUnreachable() {
+    void startsWithV5AndServesTemplatesWhileOllamaIsUnreachable() {
         assertThat(chatModel).isInstanceOf(OllamaChatModel.class);
         assertThat(jdbc.queryForList("SELECT version FROM flyway_schema_history WHERE success AND version IS NOT NULL "
-                + "ORDER BY installed_rank", String.class)).containsExactly("1", "2", "3", "4");
+                + "ORDER BY installed_rank", String.class)).containsExactly("1", "2", "3", "4", "5");
 
         skills("Java", "SQL", "Docker");
         UUID job = job("Backend Engineer", "Acme", "Java", "SQL", "~Docker");

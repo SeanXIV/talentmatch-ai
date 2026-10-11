@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_schema.sh - Verify the TalentMatch AI schema (V1 + V2 + V3) in the running
+# test_schema.sh - Verify the TalentMatch AI schema (V1 to V5) in the running
 # talentmatch-postgres container. Behavioral checks run in a transaction that
 # is rolled back, so no test data is left behind.
 #
@@ -36,14 +36,25 @@ BEGIN
                    WHERE version = '3' AND success) THEN
         RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V3';
     END IF;
-    RAISE NOTICE 'PASS: PostgreSQL 16, Flyway V1 + V2 + V3 success';
+    IF NOT EXISTS (SELECT 1 FROM flyway_schema_history
+                   WHERE version = '4' AND success) THEN
+        RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V4';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM flyway_schema_history
+                   WHERE version = '5' AND success) THEN
+        RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V5';
+    END IF;
+    RAISE NOTICE 'PASS: PostgreSQL 16, Flyway V1 to V5 success';
 END $$;
 
 -- ---------- Tables ----------
 DO $$
 DECLARE t text;
 BEGIN
-    FOREACH t IN ARRAY ARRAY['candidate','job','skill','candidate_skill','job_skill','job_match'] LOOP
+    FOREACH t IN ARRAY ARRAY['candidate','job','skill','candidate_skill','job_skill','job_match',
+                             'resume','owner_profile','owner_profile_version',
+                             'skill_alias','feed_source','feed_job','job_posting','job_preferences',
+                             'notification_settings','feed_notification','feed_state','feed_api_usage'] LOOP
         IF to_regclass('public.' || t) IS NULL THEN
             RAISE EXCEPTION 'FAIL: missing table %', t;
         END IF;
@@ -61,7 +72,15 @@ BEGIN
     FOR r IN SELECT * FROM (VALUES
         ('candidate',       'uq_candidate_email',            'u'),
         ('candidate',       'ck_candidate_email_normalized', 'c'),
-        ('job',             'uq_job_title_company',          'u'),
+        ('job',             'uq_job_id_origin',              'u'),
+        ('job',             'ck_job_origin',                 'c'),
+        ('feed_job',        'fk_feed_job_job',               'f'),
+        ('feed_job',        'ck_feed_job_enrichment_failure','c'),
+        ('feed_job',        'ck_feed_job_enriched',          'c'),
+        ('feed_job',        'ck_feed_job_salary',            'c'),
+        ('feed_source',     'ck_feed_source_shape',          'c'),
+        ('job_posting',     'uq_job_posting_source_external','u'),
+        ('feed_notification','ck_feed_notification_sent',    'c'),
         ('job_match',       'uq_job_match_candidate_job',    'u'),
         ('candidate_skill', 'candidate_skill_pkey',          'p'),
         ('job_skill',       'job_skill_pkey',                'p')
@@ -85,6 +104,16 @@ BEGIN
          WHERE c.conname = 'job_skill_pkey') <> ARRAY['job_id','skill_id'] THEN
         RAISE EXCEPTION 'FAIL: job_skill PK is not (job_id, skill_id)';
     END IF;
+    -- V5 dropped the V1 job key; it lives on as a partial unique index (see Indexes)
+    IF EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'uq_job_title_company') THEN
+        RAISE EXCEPTION 'FAIL: V1 constraint uq_job_title_company still exists (V5 drops it)';
+    END IF;
+    IF (SELECT array_agg(a.attname::text ORDER BY a.attname)
+          FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY (c.conkey)
+         WHERE c.conname = 'uq_job_id_origin') <> ARRAY['id','origin'] THEN
+        RAISE EXCEPTION 'FAIL: uq_job_id_origin is not (id, origin)';
+    END IF;
     RAISE NOTICE 'PASS: constraints and composite PKs present';
 END $$;
 
@@ -93,13 +122,31 @@ DO $$
 DECLARE i text;
 BEGIN
     FOREACH i IN ARRAY ARRAY['uq_skill_name_lower','ix_job_match_job_score',
-                             'ix_candidate_skill_skill','ix_job_skill_skill'] LOOP
+                             'ix_candidate_skill_skill','ix_job_skill_skill',
+                             'uq_job_title_company_manual','ix_job_origin_feed',
+                             'uq_skill_alias_lower','ix_skill_alias_skill','ix_feed_source_due',
+                             'uq_feed_job_open_dedup','ix_feed_job_first_seen','ix_feed_job_process',
+                             'ix_feed_job_enrichment','ix_job_posting_job','ix_job_posting_source_open',
+                             'ix_feed_notification_due','ix_feed_notification_created'] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_indexes
                        WHERE schemaname = 'public' AND indexname = i) THEN
             RAISE EXCEPTION 'FAIL: missing index %', i;
         END IF;
     END LOOP;
-    RAISE NOTICE 'PASS: indexes present';
+    -- the MANUAL-only job key: unique, on (title, company), partial on origin = 'MANUAL'
+    IF NOT EXISTS (SELECT 1 FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid
+                    WHERE c.relname = 'uq_job_title_company_manual' AND x.indisunique
+                      AND x.indrelid = 'public.job'::regclass
+                      AND pg_get_indexdef(x.indexrelid) LIKE '%(title, company)%'
+                      AND pg_get_expr(x.indpred, x.indrelid) LIKE '%origin%MANUAL%') THEN
+        RAISE EXCEPTION 'FAIL: uq_job_title_company_manual is not UNIQUE (title, company) WHERE origin = MANUAL';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_index x JOIN pg_class c ON c.oid = x.indexrelid
+                    WHERE c.relname = 'uq_feed_job_open_dedup' AND x.indisunique
+                      AND pg_get_expr(x.indpred, x.indrelid) LIKE '%closed_at IS NULL%') THEN
+        RAISE EXCEPTION 'FAIL: uq_feed_job_open_dedup is not UNIQUE ... WHERE closed_at IS NULL';
+    END IF;
+    RAISE NOTICE 'PASS: indexes present (incl. V5 partial unique indexes)';
 END $$;
 
 -- ---------- Triggers ----------
@@ -110,7 +157,13 @@ BEGIN
         ('candidate', 'trg_candidate_updated_at'),
         ('job',       'trg_job_updated_at'),
         ('skill',     'trg_skill_updated_at'),
-        ('job_match', 'trg_job_match_updated_at')
+        ('job_match', 'trg_job_match_updated_at'),
+        ('feed_source',           'trg_feed_source_updated_at'),
+        ('feed_job',              'trg_feed_job_updated_at'),
+        ('job_preferences',       'trg_job_preferences_updated_at'),
+        ('notification_settings', 'trg_notification_settings_updated_at'),
+        ('feed_notification',     'trg_feed_notification_updated_at'),
+        ('feed_state',            'trg_feed_state_updated_at')
     ) AS v(tbl, trg) LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_trigger
                        WHERE tgname = r.trg AND NOT tgisinternal
@@ -236,13 +289,13 @@ BEGIN
         RAISE NOTICE 'PASS: non-normalized email rejected';
     END;
 
-    -- Duplicate (title, company) job rejected
+    -- Duplicate (title, company) MANUAL job rejected (origin defaults to MANUAL; V5 partial index)
     INSERT INTO job (title, company) VALUES ('QA Engineer', 'QA Corp') RETURNING id INTO j_id;
     BEGIN
         INSERT INTO job (title, company) VALUES ('QA Engineer', 'QA Corp');
         RAISE EXCEPTION 'FAIL: duplicate (title, company) accepted';
     EXCEPTION WHEN unique_violation THEN
-        RAISE NOTICE 'PASS: duplicate (title, company) rejected';
+        RAISE NOTICE 'PASS: duplicate MANUAL (title, company) rejected';
     END;
 
     -- Case-insensitive skill uniqueness
@@ -338,6 +391,214 @@ BEGIN
            explanation_model = NULL, explanation_generated_at = NULL
      WHERE candidate_id = c_id AND job_id = j_id;
     RAISE NOTICE 'PASS: clearing a whole explanation accepted';
+END $$;
+
+ROLLBACK;
+
+-- ---------- V5 behavioral checks (rolled back) ----------
+BEGIN;
+
+DO $$
+DECLARE
+    m_id uuid; f1 uuid; f2 uuid; f3 uuid; s_id uuid; src uuid;
+    h constant text := repeat('a', 64);
+    n int; o text;
+BEGIN
+    -- origin defaults to MANUAL and only MANUAL / FEED are allowed
+    INSERT INTO job (title, company) VALUES ('QA V5 Engineer', 'QA V5 Corp') RETURNING id, origin INTO m_id, o;
+    IF o <> 'MANUAL' THEN
+        RAISE EXCEPTION 'FAIL: job.origin defaults to % (expected MANUAL)', o;
+    END IF;
+    BEGIN
+        INSERT INTO job (title, company, origin) VALUES ('QA V5 Other', 'QA V5 Corp', 'OTHER');
+        RAISE EXCEPTION 'FAIL: job.origin OTHER accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    RAISE NOTICE 'PASS: job.origin defaults to MANUAL; unknown origin rejected';
+
+    -- (title, company) is unique among MANUAL jobs only
+    INSERT INTO job (title, company, origin) VALUES ('QA V5 Engineer', 'QA V5 Corp', 'FEED') RETURNING id INTO f1;
+    INSERT INTO job (title, company, origin) VALUES ('QA V5 Engineer', 'QA V5 Corp', 'FEED') RETURNING id INTO f2;
+    RAISE NOTICE 'PASS: FEED jobs may repeat a (title, company), also next to a MANUAL job';
+
+    -- the ETL upsert form (partial-index predicate repeated) updates the MANUAL job only
+    INSERT INTO job (title, company, description) VALUES ('QA V5 Engineer', 'QA V5 Corp', 'etl')
+    ON CONFLICT (title, company) WHERE origin = 'MANUAL' DO UPDATE
+        SET description = EXCLUDED.description
+        WHERE job.description IS DISTINCT FROM EXCLUDED.description;
+    SELECT count(*) INTO n FROM job WHERE title = 'QA V5 Engineer' AND description = 'etl';
+    IF n <> 1 OR (SELECT description FROM job WHERE id = m_id) IS DISTINCT FROM 'etl' THEN
+        RAISE EXCEPTION 'FAIL: partial-index ON CONFLICT did not update exactly the MANUAL job (% rows)', n;
+    END IF;
+    BEGIN
+        INSERT INTO job (title, company) VALUES ('QA V5 Engineer', 'QA V5 Corp')
+        ON CONFLICT (title, company) DO NOTHING;
+        RAISE EXCEPTION 'FAIL: ON CONFLICT (title, company) without the predicate was accepted';
+    EXCEPTION WHEN invalid_column_reference THEN
+        NULL;
+    END;
+    RAISE NOTICE 'PASS: ON CONFLICT (title, company) WHERE origin = ''MANUAL'' works; the bare form does not';
+
+    -- feed_job may only reference a FEED job
+    BEGIN
+        INSERT INTO feed_job (job_id, dedup_key, primary_url) VALUES (m_id, 'qa|v5', 'https://qa.test/j');
+        RAISE EXCEPTION 'FAIL: feed_job referencing a MANUAL job accepted';
+    EXCEPTION WHEN foreign_key_violation THEN
+        NULL;
+    END;
+    INSERT INTO feed_job (job_id, dedup_key, primary_url) VALUES (f1, 'qa|v5', 'https://qa.test/j');
+    BEGIN
+        UPDATE job SET origin = 'MANUAL' WHERE id = f1;
+        RAISE EXCEPTION 'FAIL: origin of a job with a feed_job row changed';
+    EXCEPTION WHEN foreign_key_violation OR unique_violation THEN
+        NULL;
+    END;
+    RAISE NOTICE 'PASS: feed_job only references FEED jobs (fk_feed_job_job)';
+
+    -- an open dedup key is unique; after closing, a re-post may reuse it
+    BEGIN
+        INSERT INTO feed_job (job_id, dedup_key, primary_url) VALUES (f2, 'qa|v5', 'https://qa.test/j');
+        RAISE EXCEPTION 'FAIL: second open feed_job with the same dedup_key accepted';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    UPDATE feed_job SET closed_at = now() WHERE job_id = f1;
+    INSERT INTO feed_job (job_id, dedup_key, primary_url) VALUES (f2, 'qa|v5', 'https://qa.test/j');
+    RAISE NOTICE 'PASS: open dedup_key unique; a closed key can be reused';
+
+    -- feed_job CHECKs
+    BEGIN
+        UPDATE feed_job SET enrichment_status = 'FAILED' WHERE job_id = f2;
+        RAISE EXCEPTION 'FAIL: FAILED enrichment without a failure reason accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    BEGIN
+        UPDATE feed_job SET enrichment_status = 'SUCCEEDED' WHERE job_id = f2;
+        RAISE EXCEPTION 'FAIL: SUCCEEDED enrichment without ai_skills/model/time accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    BEGIN
+        UPDATE feed_job SET salary_min = 200, salary_max = 100 WHERE job_id = f2;
+        RAISE EXCEPTION 'FAIL: salary_min > salary_max accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    BEGIN
+        UPDATE feed_job SET primary_url = 'javascript:alert(1)' WHERE job_id = f2;
+        RAISE EXCEPTION 'FAIL: non-http primary_url accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    RAISE NOTICE 'PASS: feed_job enrichment / salary / URL checks';
+
+    -- feed_source shape
+    INSERT INTO feed_source (source_key, kind, board_token) VALUES ('greenhouse:qav5', 'GREENHOUSE', 'qav5')
+    RETURNING id INTO src;
+    INSERT INTO feed_source (source_key, kind, managed_by, options)
+    VALUES ('adzuna:qa:v5', 'ADZUNA', 'PREFERENCES', '{"country":"za"}');
+    BEGIN
+        INSERT INTO feed_source (source_key, kind) VALUES ('greenhouse:qa-none', 'GREENHOUSE');
+        RAISE EXCEPTION 'FAIL: ATS source without a board token accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    BEGIN
+        INSERT INTO feed_source (source_key, kind, board_token, managed_by)
+        VALUES ('lever:qa-pref', 'LEVER', 'qa-pref', 'PREFERENCES');
+        RAISE EXCEPTION 'FAIL: preference-managed ATS source accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    BEGIN
+        INSERT INTO feed_source (source_key, kind, options) VALUES ('adzuna:qa:none', 'ADZUNA', '{}');
+        RAISE EXCEPTION 'FAIL: Adzuna source without a country accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    BEGIN
+        INSERT INTO feed_source (source_key, kind, board_token) VALUES ('greenhouse:qa-bad', 'GREENHOUSE', 'a/b');
+        RAISE EXCEPTION 'FAIL: board token with a slash accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    RAISE NOTICE 'PASS: feed_source shape checks (ck_feed_source_shape, board_token pattern)';
+
+    -- job_posting: unique per (source, external id); deleting the job cascades
+    INSERT INTO job_posting (source_id, external_id, job_id, url, title, company, content_hash)
+    VALUES (src, 'qa-1', f2, 'https://qa.test/p', 'T', 'C', h);
+    BEGIN
+        INSERT INTO job_posting (source_id, external_id, job_id, url, title, company, content_hash)
+        VALUES (src, 'qa-1', f2, 'https://qa.test/p', 'T', 'C', h);
+        RAISE EXCEPTION 'FAIL: duplicate (source_id, external_id) accepted';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    RAISE NOTICE 'PASS: job_posting unique per (source_id, external_id)';
+
+    -- feed_notification: at most one per job; SENT <=> sent_at
+    INSERT INTO feed_notification (job_id, channel, score) VALUES (f2, 'EMAIL', 0.8);
+    BEGIN
+        INSERT INTO feed_notification (job_id, channel, score) VALUES (f2, 'EMAIL', 0.9);
+        RAISE EXCEPTION 'FAIL: second notification for the same job accepted';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    BEGIN
+        UPDATE feed_notification SET status = 'SENT' WHERE job_id = f2;
+        RAISE EXCEPTION 'FAIL: SENT notification without sent_at accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    BEGIN
+        INSERT INTO feed_notification (job_id, channel, score) VALUES (f1, 'SMS', 0.8);
+        RAISE EXCEPTION 'FAIL: notification channel SMS accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    RAISE NOTICE 'PASS: feed_notification unique per job; status / channel checks';
+
+    DELETE FROM job WHERE id = f2;
+    SELECT (SELECT count(*) FROM feed_job WHERE job_id = f2)
+         + (SELECT count(*) FROM job_posting WHERE job_id = f2)
+         + (SELECT count(*) FROM feed_notification WHERE job_id = f2) INTO n;
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'FAIL: FEED job delete did not cascade (% rows left)', n;
+    END IF;
+    RAISE NOTICE 'PASS: FEED job delete cascades to feed_job, job_posting and feed_notification';
+
+    -- singletons
+    INSERT INTO notification_settings DEFAULT VALUES;
+    BEGIN
+        INSERT INTO notification_settings DEFAULT VALUES;
+        RAISE EXCEPTION 'FAIL: second notification_settings row accepted';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    BEGIN
+        INSERT INTO job_preferences (id, preferences, version) VALUES (false, '{}', 1);
+        RAISE EXCEPTION 'FAIL: job_preferences row with id = false accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+    RAISE NOTICE 'PASS: singleton tables hold at most one row';
+
+    -- skill aliases: case-insensitive unique, cascade with the skill
+    INSERT INTO skill (name) VALUES ('QaV5PostgreSQL') RETURNING id INTO s_id;
+    INSERT INTO skill_alias (skill_id, alias) VALUES (s_id, 'QaV5Postgres');
+    BEGIN
+        INSERT INTO skill_alias (skill_id, alias) VALUES (s_id, 'qav5postgres');
+        RAISE EXCEPTION 'FAIL: case-insensitive duplicate alias accepted';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    DELETE FROM skill WHERE id = s_id;
+    IF EXISTS (SELECT 1 FROM skill_alias WHERE skill_id = s_id) THEN
+        RAISE EXCEPTION 'FAIL: skill delete did not cascade to skill_alias';
+    END IF;
+    RAISE NOTICE 'PASS: skill_alias unique case-insensitively; cascades with the skill';
 END $$;
 
 ROLLBACK;

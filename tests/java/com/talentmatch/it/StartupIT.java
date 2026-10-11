@@ -18,11 +18,11 @@ class StartupIT extends AbstractApiIT {
     Environment environment;
 
     @Test
-    void flywayAppliedV1ToV4AndHibernateValidates() {
+    void flywayAppliedV1ToV5AndHibernateValidates() {
         List<String> versions = jdbc.queryForList(
                 "SELECT version FROM flyway_schema_history WHERE success AND version IS NOT NULL ORDER BY installed_rank",
                 String.class);
-        assertThat(versions).containsExactly("1", "2", "3", "4");
+        assertThat(versions).containsExactly("1", "2", "3", "4", "5");
         // The context started with ddl-auto=validate, so the entity mappings match V1.
         assertThat(environment.getProperty("spring.jpa.hibernate.ddl-auto")).isEqualTo("validate");
         assertThat(jdbc.queryForObject("SELECT count(*) FROM pg_trigger WHERE tgname LIKE 'trg_%_skill_touch_%'",

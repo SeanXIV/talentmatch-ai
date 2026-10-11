@@ -43,7 +43,15 @@ import org.testcontainers.containers.PostgreSQLContainer;
  *   <li>connection acquisition: subsequent requests cannot get a connection at all.</li>
  * </ul>
  */
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "talentmatch.ai.enabled=false")
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
+        "talentmatch.ai.enabled=false",
+        // Phase 5: no feed scheduling, no real provider network (same as AbstractApiIT)
+        "talentmatch.feed.scheduler.enabled=false",
+        "talentmatch.feed.greenhouse.base-url=http://localhost:1",
+        "talentmatch.feed.lever.base-url=http://localhost:1",
+        "talentmatch.feed.lever.eu-base-url=http://localhost:1",
+        "talentmatch.feed.ashby.base-url=http://localhost:1",
+        "talentmatch.feed.adzuna.base-url=http://localhost:1"})
 @Import(DatabaseDownIT.OwnContainer.class)
 @DirtiesContext
 @ExtendWith(OutputCaptureExtension.class)

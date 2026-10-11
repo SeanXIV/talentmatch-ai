@@ -134,13 +134,16 @@ Sorted by `title`, `company`, `id`.
 {
   "content": [
     { "id": "uuid", "title": "Backend Engineer", "company": "Acme", "description": "...",
-      "skillCount": 4, "matchable": true }
+      "skillCount": 4, "matchable": true, "origin": "MANUAL" }
   ],
   "page": 0, "size": 20, "totalPages": 3, "totalElements": 50
 }
 ```
 `skillCount` and `matchable` are **(extension)**. `matchable` is `false` for jobs with no
 skills (possible for ETL-loaded jobs).
+`origin` **(extension, Phase 5)** is `MANUAL` (created here or by the ETL) or `FEED` (found by
+the job feed). FEED jobs are listed and can be matched like any other job, but they are
+read-only here: `PUT` and `DELETE` answer `409 DATA_CONFLICT`.
 
 ### `GET /jobs/{id}`
 **Response `200`**
@@ -149,7 +152,8 @@ skills (possible for ETL-loaded jobs).
   "id": "uuid", "title": "Backend Engineer", "company": "Acme", "description": "...",
   "matchable": true,
   "skills": [ { "skillId": "uuid", "name": "Java", "category": "Language", "required": true } ],
-  "createdAt": "2026-10-01T10:00:00Z", "updatedAt": "2026-10-01T10:00:00Z"
+  "createdAt": "2026-10-01T10:00:00Z", "updatedAt": "2026-10-01T10:00:00Z",
+  "origin": "MANUAL"
 }
 ```
 **Errors:** `400 INVALID_ID`, `404 JOB_NOT_FOUND`
@@ -164,7 +168,7 @@ skills (possible for ETL-loaded jobs).
 | Field | Rule |
 |---|---|
 | `title` | required, max 300 |
-| `company` | required, max 200; `(title, company)` unique after trimming |
+| `company` | required, max 200; `(title, company)` unique after trimming among MANUAL jobs (a FEED job with the same pair doesn't conflict) |
 | `description` | optional, max 20000 |
 | `skills` | **at least 1**, max 100 (`"Add at least one skill so candidates can be ranked for this job."`) |
 | `skills[i].name` | required, must exist, no duplicates |
@@ -174,10 +178,14 @@ skills (possible for ETL-loaded jobs).
 
 ### `PUT /jobs/{id}` **(extension)**
 Full replace, links diffed like candidates. **Response `200`**.
-**Errors:** `400`, `404 JOB_NOT_FOUND`, `409 JOB_ALREADY_EXISTS`
+**Errors:** `400`, `404 JOB_NOT_FOUND`, `409 JOB_ALREADY_EXISTS`, `409 DATA_CONFLICT` for a FEED
+job (checked before the body is validated): `"This job comes from the job feed (source
+greenhouse:acme) and is kept up to date automatically. It can't be edited or deleted here."`
+(the source part is omitted when the job has no posting).
 
 ### `DELETE /jobs/{id}` **(extension)**
-**Response `204`** (also deletes the job's skills and match rows). **Errors:** `400`, `404`
+**Response `204`** (also deletes the job's skills and match rows). **Errors:** `400`, `404`,
+`409 DATA_CONFLICT` for a FEED job (same message as `PUT`).
 
 ---
 
@@ -197,9 +205,263 @@ Sorted by `lower(name)`, then `id`. Items: `{ "id", "name", "category" }`.
 `name` required, max 100 (whitespace normalized); `category` optional, max 100.
 **Response `201`** with `Location: /api/skills/{id}`.
 **Errors:** `400 VALIDATION_FAILED`, `409 SKILL_ALREADY_EXISTS`
-(`"A skill named 'kubernetes' already exists as 'Kubernetes' (id …)."`)
+(`"A skill named 'kubernetes' already exists as 'Kubernetes' (id …)."`). Since Phase 5, also
+`409 SKILL_ALREADY_EXISTS` when the name is already an alias of a skill
+(`"'Postgres' is already another name (alias) for 'PostgreSQL' (skill id …). Use that skill, or delete the alias first."`).
 
 No `PUT`/`DELETE` for skills in Phase 2.
+
+**Aliases in requests (Phase 5).** Wherever a request names skills (candidates, jobs, the
+profile), a name that is not a skill name but is an alias resolves to the alias's skill
+("Postgres" → PostgreSQL). An exact skill name always wins. Two names for the same skill in one
+list are a duplicate (`400`, at the second entry).
+
+### `GET /skills/{id}/aliases` (Phase 5)
+**Response `200`** `[ { "id", "alias", "createdAt" } ]`, sorted by alias.
+**Errors:** `400 INVALID_ID`, `404 SKILL_NOT_FOUND`
+
+### `POST /skills/{id}/aliases` (Phase 5)
+```json
+{ "alias": "Postgres" }
+```
+`alias` required, max 100 (whitespace normalized). **Response `201`** with
+`Location: /api/skills/{id}/aliases/{aliasId}`.
+**Errors:** `400 VALIDATION_FAILED`, `404 SKILL_NOT_FOUND`, `409 SKILL_ALIAS_ALREADY_EXISTS` (the
+alias exists already, on any skill, or it is the name of a skill).
+
+### `DELETE /skills/{id}/aliases/{aliasId}` (Phase 5)
+**Response `204`**. **Errors:** `400 INVALID_ID`, `404 SKILL_NOT_FOUND`, `404 SKILL_ALIAS_NOT_FOUND`
+
+---
+
+## Preferences (Phase 5)
+
+Hand-entered filters for the job feed. Nothing derives them from the CV or from AI.
+
+### `GET /preferences`
+**Response `200`** `{ "version": 3, "preferences": { … }, "updatedAt": "…" }`.
+**Errors:** `404 PREFERENCES_NOT_FOUND` (`"No job preferences saved yet; the feed is not filtered. …"`)
+
+### `PUT /preferences`
+Full replace; the version goes up by one on every save. **Response `200`** (same shape as `GET`).
+```json
+{ "preferences": {
+    "targetTitles": ["Backend Engineer"],
+    "excludedTitleKeywords": ["Intern", "Sales"],
+    "regions": { "countries": ["ZA"], "includeRemote": true, "remoteScope": "ELIGIBLE_FROM_COUNTRIES",
+                 "remoteLocationKeywords": ["worldwide", "anywhere", "global", "emea", "africa", "south africa"] },
+    "seniority": ["MID", "SENIOR"],
+    "salaryFloor": { "amount": 600000, "currency": "ZAR", "period": "YEAR" },
+    "workAuthorization": ["ZA"],
+    "noticePeriodDays": 30 } }
+```
+| Field | Rule (every field optional) |
+|---|---|
+| `targetTitles` | 0–20 items, each 2–100 characters; empty = any title |
+| `excludedTitleKeywords` | 0–30 items, each 2–50 characters |
+| `regions` | omitted → the defaults shown above |
+| `regions.countries` | ISO 3166 alpha-2 (case-insensitive), at most 50; omitted → `["ZA"]`; empty = any country |
+| `regions.includeRemote` | default `true` |
+| `regions.remoteScope` | `ANYWHERE` or `ELIGIBLE_FROM_COUNTRIES` (default) |
+| `regions.remoteLocationKeywords` | 0–30 items, each 2–50 characters; omitted → the defaults above |
+| `seniority` | `INTERN`, `JUNIOR`, `MID`, `SENIOR`, `LEAD`, `PRINCIPAL`, `MANAGER`; empty = any |
+| `salaryFloor` | optional; `amount` > 0, `currency` ISO 4217, `period` `YEAR` or `MONTH` |
+| `workAuthorization` | ISO 3166 alpha-2, at most 50; empty = not checked |
+| `noticePeriodDays` | 0–365 |
+
+Text is trimmed and whitespace runs are collapsed; duplicates (ignoring case) are dropped.
+Field errors use full paths, e.g. `preferences.regions.countries[1]`: `"'XX' is not an ISO country code."`
+After the save has committed, every open feed job is queued for re-evaluation. If that queueing fails
+(e.g. it conflicts with a poll, or a job stays locked by another transaction for more than 2 s on each
+of 3 attempts), the save still succeeds and the next processor run catches up.
+**Errors:** `400 VALIDATION_FAILED`; `400 MALFORMED_REQUEST` for unknown fields or enum values.
+
+---
+
+## Job feed sources (Phase 5)
+
+The watchlist of company job boards the feed polls. Each ACTIVE source is polled every
+`effectivePollIntervalSeconds` (±10% jitter) by a background scheduler, or on request with
+`POST /feed/sources/{id}/poll`. The outcome of the last poll is in `lastStatus`:
+
+| `lastStatus` | Meaning | Next poll |
+|---|---|---|
+| `OK` | the listing was read and stored | after the interval |
+| `NOT_MODIFIED` | `304`, or the same body as last time; nothing to store | after the interval |
+| `SUSPICIOUS_EMPTY` | the listing suddenly lacks most open postings (or all of at least 3); nothing was closed. A second such poll in a row closes them | after the interval |
+| `RATE_LIMITED` | the provider said `429` | after its `Retry-After` (at least the interval, at most 1 h), else as `ERROR` |
+| `ERROR` | 5xx, network error or timeout (or saving failed) | interval × 2^failures, at most 1 h |
+| `INVALID_RESPONSE` / `TOO_LARGE` | unreadable listing, more than half of the postings unreadable, or a body over 20 MB; nothing was saved | as `ERROR` |
+| `NOT_FOUND` / `UNAUTHORIZED` | the board is gone or refused access; the source stays `ACTIVE` in case it comes back | after 6 h |
+
+A poll whose save loses a database lock conflict with a concurrent update of the same jobs is not a
+failure: nothing is saved, `lastStatus`, `lastError` and `consecutiveFailures` stay as they were, and
+the source is polled again 5–10 s later.
+`consecutiveFailures` resets on `OK`/`NOT_MODIFIED`; `lastError` is a short sanitized note (no
+response body, no URL query, no key). The first successful poll sets `baselineAt`: postings seen
+then count as already known (not new) unless they were published within the last 24 h. A posting
+that leaves a board's listing is closed; one that comes back is reopened.
+
+**`FeedSourceResponse`**
+```json
+{ "id": "…", "kind": "LEVER", "managedBy": "OWNER", "state": "ACTIVE", "companyName": "Acme",
+  "boardToken": "acme", "options": { "leverInstance": "eu" }, "pollIntervalSeconds": null,
+  "effectivePollIntervalSeconds": 300, "nextPollAt": "…", "lastPolledAt": null, "lastSuccessAt": null,
+  "lastStatus": null, "lastError": null, "consecutiveFailures": 0, "openPostings": 0,
+  "baselineAt": null, "createdAt": "…", "warnings": [] }
+```
+`effectivePollIntervalSeconds` is the interval actually used: `pollIntervalSeconds`, or the default
+for the kind (company boards: 300), and never below the minimum (company boards: 120).
+`warnings` is filled only by `POST`. No ETag, body hash or API key is ever returned.
+
+### `GET /feed/sources`
+**Query params:** `page`, `size`, `kind` (`GREENHOUSE` | `LEVER` | `ASHBY` | `ADZUNA`), `state`
+(`ACTIVE` | `PAUSED`). Newest first. **Response `200`** `PageResponse<FeedSourceResponse>`.
+**Errors:** `400 INVALID_PARAMETER`
+
+### `GET /feed/sources/{id}`
+**Response `200`**. **Errors:** `400 INVALID_ID`, `404 FEED_SOURCE_NOT_FOUND`
+
+### `POST /feed/sources`
+```json
+{ "kind": "LEVER", "boardToken": "acme", "companyName": "Acme",
+  "options": { "leverInstance": "eu" }, "pollIntervalSeconds": 600, "verify": true }
+```
+| Field | Rule |
+|---|---|
+| `kind` | required: `GREENHOUSE`, `LEVER` or `ASHBY`. `ADZUNA` is not available yet (`400` on `kind`) |
+| `boardToken` | required; `[A-Za-z0-9._-]{1,100}`, the board name from the URL (`boards.greenhouse.io/<token>`, `jobs.lever.co/<site>`, `jobs.ashbyhq.com/<name>`) |
+| `companyName` | optional, max 200; Greenhouse fills it from the board when omitted |
+| `options.leverInstance` | Lever only: `"eu"` (jobs.eu.lever.co) or `"global"` (default) |
+| `pollIntervalSeconds` | optional, 120..86400 for company boards |
+| `verify` | default `true`: check the board with the provider first (waits at most 10 s) |
+
+Greenhouse and Ashby tokens are case-insensitive (`Acme` and `acme` are the same source). **Lever
+site names are case-sensitive** and kept as given.
+
+**Response `201`** with `Location: /api/feed/sources/{id}`. `warnings` explains anything to watch:
+- `"The board exists but has no open postings right now."`
+- `"Couldn't reach Lever to check the board; it will be checked on the first poll."` (network
+  error, timeout or 5xx; the source is saved anyway). Rate limits and odd answers get a similar note.
+- `verify: false` saves without a check and says so.
+
+**Errors:**
+- `400 VALIDATION_FAILED`: invalid fields, or the provider has no such board (field `boardToken`:
+  `"Greenhouse has no job board 'acme'. Check the token in the board URL (boards.greenhouse.io/<token>)."`).
+- `400 MALFORMED_REQUEST`: unknown fields or an unknown `kind`.
+- `409 FEED_SOURCE_ALREADY_EXISTS`: `"Lever site 'acme' is already on your watchlist (source id …)."`
+
+### `PUT /feed/sources/{id}`
+```json
+{ "companyName": "Acme", "state": "PAUSED", "pollIntervalSeconds": null }
+```
+Full replace of the editable fields: `state` is required; a missing `companyName` or
+`pollIntervalSeconds` clears it (the interval goes back to the default). `kind`, `boardToken` and
+`options` can't be changed (`400 MALFORMED_REQUEST`, unknown field). A paused source set back to
+`ACTIVE` is due at once. **Response `200`**.
+**Errors:** `400 VALIDATION_FAILED`, `400 INVALID_ID`, `404 FEED_SOURCE_NOT_FOUND`,
+`409 DATA_CONFLICT` (the source is managed by your job preferences; change those instead).
+
+### `DELETE /feed/sources/{id}`
+**Response `204`**. The source's postings are deleted, and so are feed jobs left with no posting
+(with their skills, matches and notifications). A job that still has a posting from another source
+is kept.
+**Errors:** `400 INVALID_ID`, `404 FEED_SOURCE_NOT_FOUND`, `409 DATA_CONFLICT` (managed by your job
+preferences).
+
+### `POST /feed/sources/{id}/poll`
+Polls the source now, whatever its schedule (a `PAUSED` source too). The poll runs in the
+background; check `lastStatus` with `GET /feed/sources/{id}` a moment later.
+
+**Response `202`**
+```json
+{ "sourceId": "…", "queued": true }
+```
+If every poll thread is busy, the source is made due and the scheduler polls it on its next tick
+(still `202`).
+
+**Errors:**
+- `400 INVALID_ID`, `404 FEED_SOURCE_NOT_FOUND`
+- `409 FEED_DISABLED`: the feed is switched off (`FEED_ENABLED=false`).
+- `409 FEED_POLL_IN_PROGRESS`: the source is being polled right now.
+- `429 FEED_POLL_RATE_LIMITED` with `Retry-After: n`: the source was polled less than 60 s ago
+  (`"This source was polled less than a minute ago. You can poll it again in 42 seconds; …"`).
+
+---
+
+## Job feed (Phase 5)
+
+Each feed job found or changed by a poll is processed in the background within seconds: its
+skills are matched against the skill vocabulary (names and aliases; nothing is invented), it is
+checked against your preferences, and it is scored against your confirmed profile with the same
+scoring as `/jobs/{id}/matches`. A job with no recognised skills is not matchable and is never
+scored or notified. A job that is open, new (first seen within the last 24 h and not part of a
+source's first poll), passes your preferences and scores at least the notification threshold is
+queued for one notification, at most once ever. Confirming your profile, saving preferences or
+adding a skill or alias re-processes every open job (no repeat notifications).
+
+### `GET /feed/jobs`
+**Query params:** `page`, `size`, `since` (ISO-8601 instant, compared with `firstSeenAt`),
+`minScore` (0..1, your score), `includeFiltered` (default `false`), `includeClosed` (default
+`false`), `includeBaseline` (default `false`). Newest `firstSeenAt` first.
+**Response `200`** `PageResponse<FeedJobResponse>`. Without a profile nothing is scored, so
+`minScore` matches nothing. **Errors:** `400 INVALID_PARAMETER`
+
+**`FeedJobResponse`**
+```json
+{ "jobId": "…", "title": "Backend Engineer", "company": "Acme", "primaryUrl": "https://…",
+  "firstSeenAt": "…", "postedAt": "…", "closedAt": null, "baseline": false,
+  "workplace": "HYBRID", "locationText": "Cape Town", "countryCodes": ["ZA"], "seniority": "UNKNOWN",
+  "salary": { "min": 600000, "max": 800000, "currency": "ZAR", "period": "YEAR", "estimated": false },
+  "score": 0.8, "scorePercent": 80, "matchable": true,
+  "summary": "Matches 2 of 2 required skills; 0 of 1 nice-to-have.",
+  "matchedRequired": ["Java", "SQL"], "missingRequired": [],
+  "preferenceVerdict": "PASS", "filterReasons": [], "flags": ["REMOTE_ELIGIBILITY_UNKNOWN"],
+  "skills": [ { "name": "Java", "required": true, "source": "DICTIONARY" },
+              { "name": "Kubernetes", "required": false, "source": "DICTIONARY" } ],
+  "aiSuggestions": [], "enrichmentStatus": "PENDING",
+  "notification": { "status": "PENDING", "channel": "EMAIL", "sentAt": null },
+  "sources": [ { "kind": "LEVER", "via": "Lever", "url": "https://…", "externalId": "…",
+                 "firstSeenAt": "…", "closedAt": null } ] }
+```
+- `salary` is `null` when no salary is stated; `estimated` salaries are never used for filtering.
+- `score` is your cached score (`null` without a profile, before processing, or when the job has no
+  skills). `summary`, `matchedRequired` and `missingRequired` are computed from the job's current
+  skills and yours.
+- `preferenceVerdict` is `null` until the job was processed. `filterReasons`: `TITLE`,
+  `EXCLUDED_KEYWORD`, `REGION`, `REMOTE_NOT_WANTED`, `REMOTE_REGION`, `SENIORITY`, `SALARY`,
+  `WORK_PERMIT`. `flags`: `LOCATION_UNKNOWN`, `REMOTE_ELIGIBILITY_UNKNOWN`, `SALARY_OTHER_CURRENCY`,
+  `IMMEDIATE_START` (never filter).
+- `skills[].source`: `DICTIONARY`, `AI` or `BOTH`. `aiSuggestions` (`{name, requirement, evidence}`)
+  are skills the AI found that aren't in the vocabulary; they are never created automatically.
+- `notification` is `null` when none was queued.
+- `sources` lists every posting of the job (several providers can post the same job).
+
+### `GET /feed/jobs/{jobId}`
+**Response `200`** `FeedJobResponse` plus `description` (omitted while the posting has none yet).
+**Errors:** `400 INVALID_ID`; `404 JOB_NOT_FOUND` (also for a job that isn't from the feed:
+`"Job … is not from the job feed. Read it with GET /api/jobs/…."`)
+
+### `GET /feed/status`
+**Response `200`** (more sections are added as the feed grows)
+```json
+{ "enabled": true, "schedulerEnabled": true,
+  "profile": { "present": true, "version": 3, "appliedVersion": 3 },
+  "preferences": { "present": true, "version": 2 },
+  "sources": { "total": 4, "active": 3, "failing": 1, "lastSuccessAt": "…" },
+  "processing": { "pending": 12 } }
+```
+- `schedulerEnabled`: sources are polled and their jobs processed automatically (the feed and its
+  scheduler are both on).
+- `profile.appliedVersion`: the profile version the open feed jobs were last queued for re-scoring
+  against; it differs from `version` only until the processor catches up.
+- `preferences.present`: `false` means the feed is not filtered.
+- `sources.failing`: ACTIVE sources whose last poll failed.
+- `processing.pending`: feed jobs waiting to be processed (skills, filter, score).
+
+The actuator health component `feed` is `UP`, or `DEGRADED` when an ACTIVE source failed 3 times
+in a row or has had no successful poll for more than 3 × its interval (details: counts and source
+ids). It never turns overall health `DOWN`.
 
 ---
 
@@ -594,17 +856,21 @@ exception class names or SQL.
 | 400 | `INVALID_ID` | path id is not a UUID (`"'abc' is not a valid id. Ids look like 3f2c0e9a-…"`) |
 | 400 | `MALFORMED_REQUEST` | body is not valid JSON, has an unknown field, or a field has the wrong type |
 | 400 | `RESUME_UNREADABLE` | uploaded PDF can't be read (damaged, protected, scanned, too many pages, too slow) **(Phase 4)** |
-| 404 | `CANDIDATE_NOT_FOUND` / `JOB_NOT_FOUND` / `SKILL_NOT_FOUND` / `RECOMPUTE_RUN_NOT_FOUND` / `RESUME_NOT_FOUND` / `PROFILE_NOT_FOUND` | resource missing |
+| 404 | `CANDIDATE_NOT_FOUND` / `JOB_NOT_FOUND` / `SKILL_NOT_FOUND` / `RECOMPUTE_RUN_NOT_FOUND` / `RESUME_NOT_FOUND` / `PROFILE_NOT_FOUND` / `PREFERENCES_NOT_FOUND` / `SKILL_ALIAS_NOT_FOUND` / `FEED_SOURCE_NOT_FOUND` | resource missing |
 | 404 | `ENDPOINT_NOT_FOUND` | no such endpoint (`"No endpoint GET /api/foo."`) |
 | 405 | `METHOD_NOT_ALLOWED` | wrong HTTP method (`Allow` header lists the supported ones) |
 | 413 | `PAYLOAD_TOO_LARGE` | uploaded CV over the size limit **(Phase 4)** |
 | 415 | `UNSUPPORTED_MEDIA_TYPE` | body is not `application/json` (upload endpoints: not `multipart/form-data`, or the file is not a PDF); the message says what to send |
-| 409 | `EMAIL_ALREADY_EXISTS` / `JOB_ALREADY_EXISTS` / `SKILL_ALREADY_EXISTS` | natural-key conflict |
+| 409 | `EMAIL_ALREADY_EXISTS` / `JOB_ALREADY_EXISTS` / `SKILL_ALREADY_EXISTS` / `SKILL_ALIAS_ALREADY_EXISTS` / `FEED_SOURCE_ALREADY_EXISTS` | natural-key conflict |
 | 409 | `DATA_CONFLICT` | other conflicting concurrent change |
 | 409 | `RECOMPUTE_ALREADY_RUNNING` | a batch recompute is active |
 | 409 | `RESUME_EXTRACTION_IN_PROGRESS` | the CV is queued or being read **(Phase 4)** |
+| 409 | `FEED_POLL_IN_PROGRESS` | the feed source is being polled right now **(Phase 5)** |
+| 409 | `FEED_DISABLED` | the job feed is switched off (`FEED_ENABLED=false`) **(Phase 5)** |
 | 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job within the regenerate window (`Retry-After: n`) **(extension, Phase 3)** |
-| 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`) |
+| 429 | `FEED_POLL_RATE_LIMITED` | a poll on request within 60 s of the source's last poll (`Retry-After: n`) **(Phase 5)** |
+| 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`); `/jobs/{id}/matches` and `/matches/**` only |
+| 503 | `SERVICE_BUSY` | any other endpoint lost a lock conflict with a concurrent update; nothing was saved, retry (`Retry-After: 2`) **(Phase 5)** |
 | 503 | `DATABASE_UNAVAILABLE` | database unreachable (`Retry-After: 5`) |
 | 503 | `UPLOAD_BUSY` | every PDF reader is busy; retry the upload in a minute **(Phase 4)** |
 | 500 | `INTERNAL_ERROR` | unexpected; message includes the request id to quote |

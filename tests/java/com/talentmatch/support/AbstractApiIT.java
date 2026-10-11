@@ -30,9 +30,21 @@ import org.testcontainers.containers.PostgreSQLContainer;
  * <p>Phase 3: the Phase 2 suite runs with the AI layer off ({@code talentmatch.ai.enabled=false}),
  * so its behaviour is unchanged apart from the template {@code explanation} (AI_DISABLED). AI tests
  * extend {@link AbstractAiApiIT}, which uses a second context with a fake ChatModel.
+ *
+ * <p>Phase 5: the feed scheduler is off, every provider base URL points at a closed port and email
+ * is not configured; feed tests extend {@code AbstractFeedIT}.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "talentmatch.ai.enabled=false")
+        properties = {
+                "talentmatch.ai.enabled=false",
+                // Phase 5: no feed scheduling and no real network; email stays unconfigured
+                // (talentmatch.notify.email.host is left blank on purpose).
+                "talentmatch.feed.scheduler.enabled=false",
+                "talentmatch.feed.greenhouse.base-url=http://localhost:1",
+                "talentmatch.feed.lever.base-url=http://localhost:1",
+                "talentmatch.feed.lever.eu-base-url=http://localhost:1",
+                "talentmatch.feed.ashby.base-url=http://localhost:1",
+                "talentmatch.feed.adzuna.base-url=http://localhost:1"})
 @Import(TestcontainersConfiguration.class)
 public abstract class AbstractApiIT {
 
@@ -58,7 +70,10 @@ public abstract class AbstractApiIT {
     @BeforeEach
     void resetDatabase() {
         api = new Api(port, mapper);
-        jdbc.execute("TRUNCATE owner_profile, owner_profile_version, resume, job_match, candidate_skill, job_skill, candidate, job, skill");
+        // No CASCADE: every table must be listed (a missing one fails loudly instead of being silently kept).
+        jdbc.execute("TRUNCATE feed_notification, job_posting, feed_job, feed_source, feed_api_usage, feed_state, "
+                + "job_preferences, notification_settings, skill_alias, owner_profile, owner_profile_version, resume, "
+                + "job_match, candidate_skill, job_skill, candidate, job, skill");
     }
 
     // ------------------------------------------------------------------ fixtures via the API

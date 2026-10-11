@@ -19,13 +19,18 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
     @EntityGraph(attributePaths = {"skills", "skills.skill"})
     Optional<Job> findWithSkillsById(UUID id);
 
-    Optional<Job> findByTitleAndCompany(String title, String company);
+    /**
+     * The MANUAL job with this natural key (V5: unique among MANUAL jobs only, partial index
+     * uq_job_title_company_manual). FEED jobs may share a title and company and are ignored.
+     */
+    @Query("select j from Job j where j.title = :title and j.company = :company and j.origin = 'MANUAL'")
+    Optional<Job> findManualByTitleAndCompany(@Param("title") String title, @Param("company") String company);
 
     @Query(value = """
             select new com.talentmatch.repository.projection.JobListRow(
-                j.id, j.title, j.company, j.description, count(js.id.skillId))
+                j.id, j.title, j.company, j.description, j.origin, count(js.id.skillId))
             from Job j left join j.skills js
-            group by j.id, j.title, j.company, j.description
+            group by j.id, j.title, j.company, j.description, j.origin
             order by j.title asc, j.company asc, j.id asc""",
             countQuery = "select count(j) from Job j")
     Page<JobListRow> findListPage(Pageable pageable);
@@ -33,11 +38,11 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
     /** Jobs listing the skill as required or nice-to-have; skillCount still counts all skills. */
     @Query(value = """
             select new com.talentmatch.repository.projection.JobListRow(
-                j.id, j.title, j.company, j.description, count(js.id.skillId))
+                j.id, j.title, j.company, j.description, j.origin, count(js.id.skillId))
             from Job j left join j.skills js
             where exists (select 1 from JobSkill f join f.skill fs
                           where f.job = j and lower(fs.name) = lower(:skill))
-            group by j.id, j.title, j.company, j.description
+            group by j.id, j.title, j.company, j.description, j.origin
             order by j.title asc, j.company asc, j.id asc""",
             countQuery = """
             select count(j) from Job j
@@ -49,8 +54,26 @@ public interface JobRepository extends JpaRepository<Job, UUID> {
     @Query("select j.updatedAt from Job j where j.id = :id")
     Optional<Instant> findUpdatedAt(@Param("id") UUID id);
 
-    /** Bulk delete; the database cascades job_skill and job_match rows. */
+    /** The job's origin (MANUAL or FEED), if it exists. */
+    @Query("select j.origin from Job j where j.id = :id")
+    Optional<String> findOriginById(@Param("id") UUID id);
+
+    /**
+     * The source key of the job's earliest-seen posting (e.g. "greenhouse:acme"), for FEED jobs.
+     * Source keys hold no secrets (Adzuna queries are hashed).
+     */
+    @Query(value = """
+            SELECT s.source_key FROM job_posting p JOIN feed_source s ON s.id = p.source_id
+            WHERE p.job_id = :id
+            ORDER BY p.first_seen_at, p.id
+            LIMIT 1""", nativeQuery = true)
+    Optional<String> findFeedSourceKey(@Param("id") UUID id);
+
+    /**
+     * Bulk delete of a MANUAL job; the database cascades job_skill and job_match rows.
+     * FEED jobs are never deleted here (0 rows): the job feed owns them.
+     */
     @Modifying
-    @Query("delete from Job j where j.id = :id")
-    int deleteByIdReturningCount(@Param("id") UUID id);
+    @Query("delete from Job j where j.id = :id and j.origin = 'MANUAL'")
+    int deleteManualByIdReturningCount(@Param("id") UUID id);
 }

@@ -83,21 +83,21 @@ Principles for everything below:
   is a later, separate decision (see "Later").
 
 ## Phase 4 — Your master profile (resume upload)
-- [ ] `POST /api/profile/resume`: upload a **PDF** (DOCX later, see "Later"); keep the
+- [x] `POST /api/profile/resume`: upload a **PDF** (DOCX later, see "Later"); keep the
       original file; list (`GET /api/profile/resumes`) and delete uploads
-- [ ] Extract the text with **Apache PDFBox** (bounded memory and time; scanned PDFs are
+- [x] Extract the text with **Apache PDFBox** (bounded memory and time; scanned PDFs are
       rejected, no OCR) and have the AI turn it into a structured profile in the background:
       contact, summary, experience (roles, dates, technologies, achievements), projects,
       skills (with years only where the CV states them), certifications, education, languages
-- [ ] Never invent: a hand-built response schema lets the model answer `null`; names not
+- [x] Never invent: a hand-built response schema lets the model answer `null`; names not
       found in the CV become warnings for the owner; years not stated next to the skill are
       dropped
-- [ ] Owner reviews and edits the extracted profile before it is saved (nothing is
+- [x] Owner reviews and edits the extracted profile before it is saved (nothing is
       trusted until confirmed); skills map onto the `skill` table, new ones only after
       confirmation
-- [ ] Store it as the owner's candidate plus profile tables (V4 migration), so the
+- [x] Store it as the owner's candidate plus profile tables (V4 migration), so the
       existing scoring works against real jobs
-- [ ] Tests: extraction with a fake `ChatModel`, malformed and scanned-PDF files, edits
+- [x] Tests: extraction with a fake `ChatModel`, malformed and scanned-PDF files, edits
 
 **Demonstrable output:** your full CV as a structured, editable profile in the database.
 
