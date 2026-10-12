@@ -14,6 +14,8 @@ import org.springframework.stereotype.Component;
  *       (the source is due again at once instead of after the lease expires).</li>
  *   <li>The profile, preferences and skill vocabulary are compared with what the open jobs were last
  *       processed for (§4.11); a difference marks them for processing.</li>
+ *   <li>The derived Adzuna searches are reconciled with the preferences and profile (they may have
+ *       changed, or the keys been set, while the app was down).</li>
  *   <li>Notifications left SENDING by a crash go back to PENDING (at least once: they are sent again,
  *       with the same Message-ID).</li>
  *   <li>The processor and the notification dispatcher are woken (no-ops while the scheduler is off).</li>
@@ -27,13 +29,15 @@ public class FeedRecovery {
 
     private final FeedSourceRepository sources;
     private final FeedRefreshService refresh;
+    private final AggregatorQueries aggregatorQueries;
     private final FeedProcessor processor;
     private final NotificationDispatcher dispatcher;
 
-    public FeedRecovery(FeedSourceRepository sources, FeedRefreshService refresh, FeedProcessor processor,
-                        NotificationDispatcher dispatcher) {
+    public FeedRecovery(FeedSourceRepository sources, FeedRefreshService refresh, AggregatorQueries aggregatorQueries,
+                        FeedProcessor processor, NotificationDispatcher dispatcher) {
         this.sources = sources;
         this.refresh = refresh;
+        this.aggregatorQueries = aggregatorQueries;
         this.processor = processor;
         this.dispatcher = dispatcher;
     }
@@ -54,6 +58,7 @@ public class FeedRecovery {
             log.warn("Feed recovery: could not compare the applied versions ({}); the processor retries",
                     SourcePoller.describe(e));
         }
+        aggregatorQueries.reconcileSafely();
         try {
             int reset = dispatcher.recoverInterrupted();
             if (reset > 0) {

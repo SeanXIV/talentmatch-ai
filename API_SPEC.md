@@ -280,7 +280,8 @@ of 3 attempts), the save still succeeds and the next processor run catches up.
 
 ## Job feed sources (Phase 5)
 
-The watchlist of company job boards the feed polls. Each ACTIVE source is polled every
+The watchlist the feed polls: company job boards (Greenhouse, Lever, Ashby) and Adzuna searches
+(`ADZUNA`, South Africa). Each ACTIVE source is polled every
 `effectivePollIntervalSeconds` (±10% jitter) by a background scheduler, or on request with
 `POST /feed/sources/{id}/poll`. The outcome of the last poll is in `lastStatus`:
 
@@ -292,7 +293,8 @@ The watchlist of company job boards the feed polls. Each ACTIVE source is polled
 | `RATE_LIMITED` | the provider said `429` | after its `Retry-After` (at least the interval, at most 1 h), else as `ERROR` |
 | `ERROR` | 5xx, network error or timeout (or saving failed) | interval × 2^failures, at most 1 h |
 | `INVALID_RESPONSE` / `TOO_LARGE` | unreadable listing, more than half of the postings unreadable, or a body over 20 MB; nothing was saved | as `ERROR` |
-| `NOT_FOUND` / `UNAUTHORIZED` | the board is gone or refused access; the source stays `ACTIVE` in case it comes back | after 6 h |
+| `NOT_FOUND` / `UNAUTHORIZED` | the board is gone or refused access; the source stays `ACTIVE` in case it comes back. For Adzuna, also `"Adzuna isn't configured: set ADZUNA_APP_ID and ADZUNA_APP_KEY."` (not counted as a failure) | after 6 h |
+| `BUDGET_EXHAUSTED` | Adzuna only: today's request budget (`talentmatch.feed.adzuna.daily-request-budget`, default 200 per UTC day, shared by every Adzuna search, probes included) is used up. No request is made and no failure is counted | after midnight UTC (+0–5 min) |
 
 A poll whose save loses a database lock conflict with a concurrent update of the same jobs is not a
 failure: nothing is saved, `lastStatus`, `lastError` and `consecutiveFailures` stay as they were, and
@@ -300,7 +302,10 @@ the source is polled again 5–10 s later.
 `consecutiveFailures` resets on `OK`/`NOT_MODIFIED`; `lastError` is a short sanitized note (no
 response body, no URL query, no key). The first successful poll sets `baselineAt`: postings seen
 then count as already known (not new) unless they were published within the last 24 h. A posting
-that leaves a board's listing is closed; one that comes back is reopened.
+that leaves a board's listing is closed; one that comes back is reopened. An Adzuna search is never
+a complete listing: its postings close only after 14 days unseen (`adzuna.unseen-close-after`).
+When page 1 of an Adzuna search is full and everything on it is newer than the last successful
+poll, page 2 is fetched too (within the budget).
 
 **`FeedSourceResponse`**
 ```json
@@ -311,7 +316,18 @@ that leaves a board's listing is closed; one that comes back is reopened.
   "baselineAt": null, "createdAt": "…", "warnings": [] }
 ```
 `effectivePollIntervalSeconds` is the interval actually used: `pollIntervalSeconds`, or the default
-for the kind (company boards: 300), and never below the minimum (company boards: 120).
+for the kind (company boards: 300; Adzuna: 900), and never below the minimum (company boards: 120;
+Adzuna: 600). Adzuna searches share the daily budget, so each one waits at least
+`24 h × active Adzuna searches / budget` (4 searches with a budget of 200: 1728 s).
+
+An Adzuna source has `boardToken: null` and `options: {"country": "za", "what": "java developer",
+"where": "Cape Town"}` (`where` only when set). Sources with `managedBy: "PREFERENCES"` are the
+**derived searches**: one per target title in your preferences (at most 3; with no target titles,
+your confirmed profile's most recent job title), plus `"remote"` when remote jobs are wanted. They
+are kept in step automatically when preferences are saved or the profile is confirmed (and at
+startup), only while the Adzuna keys are set; they can't be edited or deleted here. Adzuna jobs
+show `"via": "Adzuna"` in `sources[]`, link to Adzuna's own page (attribution), and email
+notifications add "Jobs by Adzuna".
 `warnings` is filled only by `POST`. No ETag, body hash or API key is ever returned.
 
 ### `GET /feed/sources`
@@ -329,12 +345,13 @@ for the kind (company boards: 300), and never below the minimum (company boards:
 ```
 | Field | Rule |
 |---|---|
-| `kind` | required: `GREENHOUSE`, `LEVER` or `ASHBY`. `ADZUNA` is not available yet (`400` on `kind`) |
-| `boardToken` | required; `[A-Za-z0-9._-]{1,100}`, the board name from the URL (`boards.greenhouse.io/<token>`, `jobs.lever.co/<site>`, `jobs.ashbyhq.com/<name>`) |
+| `kind` | required: `GREENHOUSE`, `LEVER`, `ASHBY` or `ADZUNA`. `ADZUNA` needs `ADZUNA_APP_ID` and `ADZUNA_APP_KEY` (`400` on `kind` without them) |
+| `boardToken` | company boards: required; `[A-Za-z0-9._-]{1,100}`, the board name from the URL (`boards.greenhouse.io/<token>`, `jobs.lever.co/<site>`, `jobs.ashbyhq.com/<name>`). `ADZUNA`: must be absent |
+| `options.what` / `options.where` | `ADZUNA` only: search terms (required) and location (optional), each at most 100 characters; whitespace is collapsed. The country is `talentmatch.feed.adzuna.country` (`za`) |
 | `companyName` | optional, max 200; Greenhouse fills it from the board when omitted |
 | `options.leverInstance` | Lever only: `"eu"` (jobs.eu.lever.co) or `"global"` (default) |
-| `pollIntervalSeconds` | optional, 120..86400 for company boards |
-| `verify` | default `true`: check the board with the provider first (waits at most 10 s) |
+| `pollIntervalSeconds` | optional, 120..86400 for company boards, 600..86400 for `ADZUNA` |
+| `verify` | default `true`: check the board with the provider first (waits at most 10 s). For `ADZUNA`, runs the search once for one result (counts against the daily budget) |
 
 Greenhouse and Ashby tokens are case-insensitive (`Acme` and `acme` are the same source). **Lever
 site names are case-sensitive** and kept as given.
@@ -344,10 +361,13 @@ site names are case-sensitive** and kept as given.
 - `"Couldn't reach Lever to check the board; it will be checked on the first poll."` (network
   error, timeout or 5xx; the source is saved anyway). Rate limits and odd answers get a similar note.
 - `verify: false` saves without a check and says so.
+- Adzuna: `"The Adzuna search finds no jobs right now; it keeps checking for new ones."`, or
+  `"Today's Adzuna request budget is used up, so the search wasn't checked; …"`.
 
 **Errors:**
 - `400 VALIDATION_FAILED`: invalid fields, or the provider has no such board (field `boardToken`:
-  `"Greenhouse has no job board 'acme'. Check the token in the board URL (boards.greenhouse.io/<token>)."`).
+  `"Greenhouse has no job board 'acme'. Check the token in the board URL (boards.greenhouse.io/<token>)."`),
+  or Adzuna rejected the keys (field `kind`: `"Adzuna rejected ADZUNA_APP_ID / ADZUNA_APP_KEY. …"`).
 - `400 MALFORMED_REQUEST`: unknown fields or an unknown `kind`.
 - `409 FEED_SOURCE_ALREADY_EXISTS`: `"Lever site 'acme' is already on your watchlist (source id …)."`
 
@@ -451,6 +471,7 @@ adding a skill or alias re-processes every open job (no repeat notifications).
   "notifications": { "enabled": true, "channel": "EMAIL", "configured": true, "minScore": 0.6,
                      "pending": 1, "failedLast24h": 0, "paused": false, "pausedUntil": null, "lastError": null },
   "sources": { "total": 4, "active": 3, "failing": 1, "lastSuccessAt": "…" },
+  "aggregator": { "configured": true, "requestsToday": 37, "dailyBudget": 200 },
   "processing": { "pending": 12 } }
 ```
 - `schedulerEnabled`: sources are polled and their jobs processed automatically (the feed and its
@@ -460,6 +481,8 @@ adding a skill or alias re-processes every open job (no repeat notifications).
 - `preferences.present`: `false` means the feed is not filtered.
 - `sources.failing`: ACTIVE sources whose last poll failed.
 - `processing.pending`: feed jobs waiting to be processed (skills, filter, score).
+- `aggregator`: whether the Adzuna keys are set, and the requests counted against today's (UTC)
+  budget, probes included.
 - `notifications`: the saved settings (`enabled`, `channel`, `minScore`), whether the channel is
   `configured`, `pending` (queued or being sent), `failedLast24h` (failed in the last 24 hours,
   expired ones included), and the sender's state: `paused` / `pausedUntil` after a configuration

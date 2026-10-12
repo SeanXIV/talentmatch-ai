@@ -5,15 +5,16 @@ import java.time.Instant;
 
 /**
  * The feed's state for {@code GET /api/feed/status} (§5.2). Step 6 filled the poller's part; step 7
- * adds the profile and preferences the processor works against. The notification, aggregator,
- * enrichment and detection parts join with later steps.
+ * adds the profile and preferences the processor works against; step 8 the notifications; step 9
+ * the aggregator. The enrichment and detection parts join with later steps.
  *
  * @param enabled          {@code talentmatch.feed.enabled}
  * @param schedulerEnabled the scheduler polls (and the processor runs) on its own: the feed and its
  *                         scheduler are enabled
  */
 public record FeedStatusView(boolean enabled, boolean schedulerEnabled, Profile profile, Preferences preferences,
-                             Notifications notifications, Sources sources, Processing processing) {
+                             Notifications notifications, Sources sources, Aggregator aggregator,
+                             Processing processing) {
 
     /**
      * Notification delivery (§5.2, step 8). {@code paused}, {@code pausedUntil} and {@code lastError} are
@@ -51,6 +52,16 @@ public record FeedStatusView(boolean enabled, boolean schedulerEnabled, Profile 
      * @param lastSuccessAt the latest successful poll of any source
      */
     public record Sources(long total, long active, long failing, Instant lastSuccessAt) {
+    }
+
+    /**
+     * Adzuna (§5.2).
+     *
+     * @param configured    {@code ADZUNA_APP_ID} and {@code ADZUNA_APP_KEY} are set
+     * @param requestsToday requests counted against today's (UTC) budget, probes included
+     * @param dailyBudget   {@code talentmatch.feed.adzuna.daily-request-budget}
+     */
+    public record Aggregator(boolean configured, int requestsToday, int dailyBudget) {
     }
 
     /** @param pending feed jobs waiting for the processor ({@code process_after} set) */

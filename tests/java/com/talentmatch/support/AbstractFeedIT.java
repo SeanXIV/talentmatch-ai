@@ -13,7 +13,9 @@ import com.talentmatch.feed.PollOutcome;
 import com.talentmatch.feed.PollWriter;
 import com.talentmatch.feed.SourceAdapters;
 import com.talentmatch.feed.SourcePoller;
+import com.talentmatch.feed.FeedApiUsage;
 import com.talentmatch.feed.FeedConfig;
+import com.talentmatch.feed.PollIntervals;
 import com.talentmatch.feed.source.SourceProperties;
 import com.talentmatch.support.Api.Res;
 import com.talentmatch.support.RouteStubServer.Reply;
@@ -53,6 +55,7 @@ public abstract class AbstractFeedIT extends AbstractApiIT {
         registry.add("talentmatch.feed.lever.base-url", STUB::baseUrl);
         registry.add("talentmatch.feed.lever.eu-base-url", STUB::baseUrl);
         registry.add("talentmatch.feed.ashby.base-url", STUB::baseUrl);
+        registry.add("talentmatch.feed.adzuna.base-url", STUB::baseUrl);
         registry.add("talentmatch.feed.http.min-host-spacing", () -> "0s");
         registry.add("talentmatch.feed.http.connect-timeout", () -> "2s");
         registry.add("talentmatch.feed.http.read-timeout", () -> "5s");
@@ -76,6 +79,10 @@ public abstract class AbstractFeedIT extends AbstractApiIT {
     protected SourceProperties sourceProperties;
     @Autowired
     protected FeedRecovery recovery;
+    @Autowired
+    protected PollIntervals pollIntervals;
+    @Autowired
+    protected FeedApiUsage apiUsage;
     @Autowired
     protected Clock clock;
     @Autowired

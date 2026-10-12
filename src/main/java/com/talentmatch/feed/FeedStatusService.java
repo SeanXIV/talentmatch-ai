@@ -1,5 +1,7 @@
 package com.talentmatch.feed;
 
+import com.talentmatch.feed.source.SourceKind;
+import com.talentmatch.feed.source.SourceProperties;
 import com.talentmatch.notify.NotificationChannels;
 import com.talentmatch.notify.NotificationDispatcher;
 import com.talentmatch.notify.NotificationRepository;
@@ -13,7 +15,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 /**
  * {@code GET /api/feed/status} (§5.2): switches, profile and preferences versions, notifications,
- * sources and the processing backlog.
+ * sources, the Adzuna budget and the processing backlog.
  */
 @Service
 public class FeedStatusService {
@@ -30,12 +32,14 @@ public class FeedStatusService {
     private final NotificationChannels channels;
     private final NotificationDispatcher dispatcher;
     private final FeedProperties properties;
+    private final FeedApiUsage usage;
+    private final SourceProperties.Adzuna adzuna;
 
     public FeedStatusService(FeedSourceRepository sources, FeedJobRepository jobs, FeedStateRepository state,
                              OwnerProfileRepository profiles, PreferencesRepository preferences,
                              NotificationSettingsRepository notificationSettings, NotificationRepository notifications,
                              NotificationChannels channels, NotificationDispatcher dispatcher,
-                             FeedProperties properties) {
+                             FeedProperties properties, FeedApiUsage usage, SourceProperties sourceProperties) {
         this.sources = sources;
         this.jobs = jobs;
         this.state = state;
@@ -46,6 +50,8 @@ public class FeedStatusService {
         this.channels = channels;
         this.dispatcher = dispatcher;
         this.properties = properties;
+        this.usage = usage;
+        this.adzuna = sourceProperties.adzuna();
     }
 
     @Transactional(readOnly = true)
@@ -66,6 +72,8 @@ public class FeedStatusService {
                         notifications.countFailedSince(FAILED_WINDOW, true), channel.paused(), channel.pausedUntil(),
                         channel.lastError()),
                 new FeedStatusView.Sources(counts.total(), counts.active(), counts.failing(), counts.lastSuccessAt()),
+                new FeedStatusView.Aggregator(adzuna.configured(), usage.requestsToday(SourceKind.ADZUNA),
+                        adzuna.dailyRequestBudget()),
                 new FeedStatusView.Processing(jobs.countPendingProcessing()));
     }
 }

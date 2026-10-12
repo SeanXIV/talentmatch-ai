@@ -222,4 +222,17 @@ class FeedPropertiesTest {
         assertThatThrownBy(() -> new FeedProperties.Processor(null, 50, Duration.ofHours(1).plusSeconds(1)))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("processor.retry-delay");
     }
+
+    @Test
+    void aggregatorIntervalSharesTheDailyBudget() {
+        FeedProperties.Intervals i = FeedProperties.Intervals.defaults();
+        assertThat(FeedProperties.Intervals.budgetSeconds(0, 200)).isZero();
+        assertThat(FeedProperties.Intervals.budgetSeconds(3, 200)).isEqualTo(1296);       // 21.6 min
+        assertThat(FeedProperties.Intervals.budgetSeconds(1, 7)).isEqualTo(12_343);        // rounded up
+        assertThat(FeedProperties.Intervals.budgetSeconds(500, 1)).isEqualTo(86_400);      // capped at 24h
+        assertThat(i.effectiveSeconds(SourceKind.ADZUNA, null, 1, 200)).isEqualTo(900);   // default wins
+        assertThat(i.effectiveSeconds(SourceKind.ADZUNA, null, 4, 200)).isEqualTo(1728);
+        assertThat(i.effectiveSeconds(SourceKind.ADZUNA, 3600, 4, 200)).isEqualTo(3600);
+        assertThat(i.effectiveSeconds(SourceKind.LEVER, null, 50, 1)).isEqualTo(300);     // ATS never shares
+    }
 }

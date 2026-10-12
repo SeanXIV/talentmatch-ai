@@ -50,16 +50,18 @@ public class FeedHealthIndicator implements HealthIndicator {
     private final NotificationRepository notifications;
     private final NotificationChannels channels;
     private final FeedProperties properties;
+    private final PollIntervals intervals;
     private final Clock clock;
 
     public FeedHealthIndicator(FeedSourceRepository sources, NotificationDispatcher dispatcher,
                                NotificationRepository notifications, NotificationChannels channels,
-                               FeedProperties properties, Clock clock) {
+                               FeedProperties properties, PollIntervals intervals, Clock clock) {
         this.sources = sources;
         this.dispatcher = dispatcher;
         this.notifications = notifications;
         this.channels = channels;
         this.properties = properties;
+        this.intervals = intervals;
         this.clock = clock;
     }
 
@@ -77,12 +79,13 @@ public class FeedHealthIndicator implements HealthIndicator {
             return Health.unknown().withDetail("enabled", true).withDetail("error", "sources unavailable").build();
         }
         Instant now = clock.instant();
+        int aggregators = (int) active.stream().filter(s -> !s.kind().ats()).count();
         List<UUID> failing = new ArrayList<>();
         List<UUID> stale = new ArrayList<>();
         for (FeedSource source : active) {
             if (source.consecutiveFailures() >= FAILURE_THRESHOLD) {
                 failing.add(source.id());
-            } else if (isStale(source, now)) {
+            } else if (isStale(source, aggregators, now)) {
                 stale.add(source.id());
             }
         }
@@ -135,12 +138,11 @@ public class FeedHealthIndicator implements HealthIndicator {
     }
 
     /** Polled, but no success for more than 3 × the effective interval (since the last success or creation). */
-    private boolean isStale(FeedSource source, Instant now) {
+    private boolean isStale(FeedSource source, int activeAggregators, Instant now) {
         if (source.lastPolledAt() == null) {
             return false;                                   // never polled yet: nothing to judge
         }
-        Duration interval = Duration.ofSeconds(
-                properties.intervals().effectiveSeconds(source.kind(), source.pollIntervalSeconds()));
+        Duration interval = Duration.ofSeconds(intervals.seconds(source, activeAggregators));
         Instant since = source.lastSuccessAt() != null ? source.lastSuccessAt() : source.createdAt();
         return since != null && since.plus(interval.multipliedBy(STALE_INTERVALS)).isBefore(now);
     }

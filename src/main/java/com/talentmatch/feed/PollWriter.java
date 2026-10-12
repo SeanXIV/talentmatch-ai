@@ -1,6 +1,8 @@
 package com.talentmatch.feed;
 
 import com.talentmatch.feed.JobPostingRepository.StoredPosting;
+import com.talentmatch.feed.source.SourceProperties;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -24,8 +26,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>Changed posting (content hash differs): content replaced.</li>
  *   <li>Closed posting seen again: reopened; its job reopens unless another open job holds its key,
  *       in which case the posting moves to that job.</li>
- *   <li>Complete listing: {@link ClosingPolicy} closes missing postings (suspicious-drop guard); a job
- *       left without open postings closes.</li>
+ *   <li>Complete listing: {@link ClosingPolicy} closes missing postings (suspicious-drop guard). A
+ *       search result (Adzuna) is never complete: its postings close once unseen for
+ *       {@code adzuna.unseen-close-after}, checked on every successful poll of the source (deviation
+ *       from §4.2.4's daily sweep: same effect, no extra scheduler). A job left without open
+ *       postings closes.</li>
  *   <li>Every touched open job gets its canonical fields ({@link CanonicalJob}) and
  *       {@code process_after = now}, the hand-off to the processor.</li>
  *   <li>The source: status, ETag / body hash, baseline time, open count, next poll, lease released.</li>
@@ -56,16 +61,18 @@ public class PollWriter {
     private final JobPostingRepository postings;
     private final FeedJobRepository jobs;
     private final FeedProperties properties;
+    private final Duration unseenCloseAfter;
     private final TransactionTemplate tx;
     private final FeedProcessor processor;
 
     public PollWriter(FeedSourceRepository sources, JobPostingRepository postings, FeedJobRepository jobs,
-                      FeedProperties properties, PlatformTransactionManager transactionManager,
-                      FeedProcessor processor) {
+                      FeedProperties properties, SourceProperties sourceProperties,
+                      PlatformTransactionManager transactionManager, FeedProcessor processor) {
         this.sources = sources;
         this.postings = postings;
         this.jobs = jobs;
         this.properties = properties;
+        this.unseenCloseAfter = sourceProperties.adzuna().unseenCloseAfter();
         this.tx = new TransactionTemplate(transactionManager);
         this.processor = processor;
     }
@@ -107,6 +114,13 @@ public class PollWriter {
                     .map(StoredPosting::externalId).toList();
             decision = ClosingPolicy.decide(openIds, plan.fetchedIds(),
                     source.suspiciousSince() != null, properties.closing().suspiciousDropRatio());
+        } else {
+            Set<String> unseen = new LinkedHashSet<>(postings.findOpenUnseenSince(source.id(),
+                    now.minus(unseenCloseAfter)));
+            unseen.removeAll(plan.fetchedIds());
+            if (!unseen.isEmpty()) {
+                decision = new ClosingPolicy.Decision(unseen, false, false);
+            }
         }
         // Lock order: the open feed jobs this poll will write (changed or closing postings), in job_id
         // order, before any of them is written; the refresh markers lock in the same order

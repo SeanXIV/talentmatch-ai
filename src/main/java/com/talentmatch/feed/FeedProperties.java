@@ -203,11 +203,35 @@ public record FeedProperties(
 
         /**
          * The interval actually used: the configured one (or the kind's default), never below the
-         * kind's minimum. Step 9 widens Adzuna sources further to fit the daily request budget.
+         * kind's minimum. Aggregator sources are widened further by {@link #budgetSeconds}.
          */
         public int effectiveSeconds(SourceKind kind, Integer configuredSeconds) {
             int configured = configuredSeconds == null ? defaultSeconds(kind) : configuredSeconds;
             return Math.max(configured, minSeconds(kind));
+        }
+
+        /**
+         * {@link #effectiveSeconds(SourceKind, Integer)}, and for aggregator sources at least
+         * {@link #budgetSeconds}: the active aggregator sources together stay within the daily budget (§4.3).
+         *
+         * @param activeAggregatorSources ACTIVE sources sharing the budget (this one included when active)
+         */
+        public int effectiveSeconds(SourceKind kind, Integer configuredSeconds, int activeAggregatorSources,
+                                    int dailyBudget) {
+            int seconds = effectiveSeconds(kind, configuredSeconds);
+            return kind.ats() ? seconds : Math.max(seconds, budgetSeconds(activeAggregatorSources, dailyBudget));
+        }
+
+        /**
+         * {@code ceil(24h × sources / budget)}, at most 24h: the shortest interval at which {@code sources}
+         * searches use no more than {@code budget} requests a day. 0 without sources.
+         */
+        public static int budgetSeconds(int sources, int dailyBudget) {
+            if (sources <= 0) {
+                return 0;
+            }
+            long seconds = (86_400L * sources + Math.max(1, dailyBudget) - 1) / Math.max(1, dailyBudget);
+            return (int) Math.min(seconds, MAX_INTERVAL_SECONDS);
         }
 
         private static void requireInterval(String name, Duration value) {

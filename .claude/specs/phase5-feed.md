@@ -1191,6 +1191,15 @@ Steps 2–3 and 4–5 can run in parallel. Steps 8 and 9 depend only on 7.
    - A run stops after a transient failure; the remaining rows wait for the next sweep or wake.
    - §7 vs §4.9: `SMTP_USERNAME` without `SMTP_PASSWORD` (or the reverse) fails startup even when host/from/to are blank.
    - Pause and cap are per instance (single-instance assumption, §6.3); startup recovery resets every SENDING row.
+   **Step 9 findings and deviations** (also in API_SPEC.md):
+   - No Adzuna keys were available, so `tests/resources/feed/adzuna.json` follows the documented response, not a live capture. Checked live: wrong keys answer `401 {"exception":"AUTH_FAIL"}` → UNAUTHORIZED. Re-check the fixture, the free-tier limits and the terms (attribution, caching) once keys exist (decision c).
+   - Adzuna settings bind in `SourceProperties.adzuna` (the adapter needs host, keys and paging); the budget, derived-query count and close-after live there too, so there is one `talentmatch.feed.adzuna.*` record.
+   - Closing after `unseen-close-after` runs on every successful poll of the search (in `PollWriter`), not as a daily sweep; a paused search keeps its postings open until it is resumed.
+   - Results without `company.display_name` are left out (not counted as skipped): they can't be deduplicated.
+   - No keys: a poll records `UNAUTHORIZED` "Adzuna isn't configured…" without counting a failure (next try after `not-found-backoff`); derived searches are neither created nor deleted.
+   - Keys Adzuna rejects on `POST /feed/sources` with `verify` → 400 on `kind` (not a warning): every poll would fail.
+   - A failing page 2 is ignored (page 1 is written). Page 2 counts against the budget.
+   - A derived search whose key matches an owner-added search is not created.
 6. LangChain4j 1.20.2: the hand-built `ResponseFormat` schema works for this shape on Ollama (same approach as `ProfileJsonSchema`).
 
 Until the owner answers §0, build with the recommended defaults. Only the modules marked against each decision would change.

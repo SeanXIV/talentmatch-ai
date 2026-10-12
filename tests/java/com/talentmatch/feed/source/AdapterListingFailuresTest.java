@@ -26,12 +26,14 @@ class AdapterListingFailuresTest {
                 case "greenhouse" -> new GreenhouseAdapter(client, props).parseListing(body, target, "h/p");
                 case "lever" -> new LeverAdapter(client, props).parseListing(body, target, "h/p");
                 case "ashby" -> new AshbyAdapter(client, props).parseListing(body, target, "h/p");
+                case "adzuna" -> new AdzunaAdapter(client, props).parseListing(body,
+                        new SourceTarget(null, null, java.util.Map.of("country", "za")), "h/p");
                 default -> throw new IllegalArgumentException(name);
             };
         }
 
         ArrayNode postings(JsonNode root) {
-            return (ArrayNode) (root.isArray() ? root : root.get("jobs"));
+            return (ArrayNode) (root.isArray() ? root : root.has("results") ? root.get("results") : root.get("jobs"));
         }
 
         @Override
@@ -44,7 +46,9 @@ class AdapterListingFailuresTest {
         return Stream.of(
                 Arguments.of(new Case("greenhouse", "greenhouse-list.json", "absolute_url", 4)),
                 Arguments.of(new Case("lever", "lever.json", "hostedUrl", 4)),
-                Arguments.of(new Case("ashby", "ashby.json", "jobUrl", 3)));
+                Arguments.of(new Case("ashby", "ashby.json", "jobUrl", 3)),
+                // 4 results, one without a company name (left out, not skipped)
+                Arguments.of(new Case("adzuna", "adzuna.json", "redirect_url", 3)));
     }
 
     @ParameterizedTest(name = "{0}")

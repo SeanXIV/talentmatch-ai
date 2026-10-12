@@ -13,7 +13,7 @@ public enum SourceKind {
     GREENHOUSE(true, true),
     LEVER(true, true),
     ASHBY(true, true),
-    /** Aggregator (step 9): a search result is never a complete listing. */
+    /** Aggregator: a search result is never a complete listing. */
     ADZUNA(false, false);
 
     private final boolean completeListing;

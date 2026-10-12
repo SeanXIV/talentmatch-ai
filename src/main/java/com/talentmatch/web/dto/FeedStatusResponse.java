@@ -7,11 +7,12 @@ import java.time.Instant;
 /**
  * {@code GET /api/feed/status} (§5.2). Step 6 returned the poller's part; step 7 added
  * {@code profile} and {@code preferences}; step 8 adds {@code notifications} (with {@code paused},
- * {@code pausedUntil} and {@code lastError} beyond §5.2, D20). The aggregator, enrichment and detection
- * parts are added (additively) by later steps.
+ * {@code pausedUntil} and {@code lastError} beyond §5.2, D20); step 9 adds {@code aggregator}. The
+ * enrichment and detection parts are added (additively) by later steps.
  */
 public record FeedStatusResponse(boolean enabled, boolean schedulerEnabled, Profile profile, Preferences preferences,
-                                 Notifications notifications, Sources sources, Processing processing) {
+                                 Notifications notifications, Sources sources, Aggregator aggregator,
+                                 Processing processing) {
 
     public record Profile(boolean present, Integer version, Integer appliedVersion) {
     }
@@ -24,6 +25,9 @@ public record FeedStatusResponse(boolean enabled, boolean schedulerEnabled, Prof
     }
 
     public record Sources(long total, long active, long failing, Instant lastSuccessAt) {
+    }
+
+    public record Aggregator(boolean configured, int requestsToday, int dailyBudget) {
     }
 
     public record Processing(long pending) {
@@ -39,6 +43,8 @@ public record FeedStatusResponse(boolean enabled, boolean schedulerEnabled, Prof
                 new Notifications(n.enabled(), n.channel(), n.configured(), n.minScore(), n.pending(),
                         n.failedLast24h(), n.paused(), n.pausedUntil(), n.lastError()),
                 new Sources(s.total(), s.active(), s.failing(), s.lastSuccessAt()),
+                new Aggregator(view.aggregator().configured(), view.aggregator().requestsToday(),
+                        view.aggregator().dailyBudget()),
                 new Processing(view.processing().pending()));
     }
 }

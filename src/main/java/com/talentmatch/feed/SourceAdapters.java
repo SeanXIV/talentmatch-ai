@@ -9,7 +9,7 @@ import java.util.Map;
 import java.util.Optional;
 import org.springframework.stereotype.Component;
 
-/** The adapter for each source kind (one bean per provider; Adzuna arrives in step 9). */
+/** The adapter for each source kind (one bean per provider). */
 @Component
 public class SourceAdapters {
 

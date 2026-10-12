@@ -117,6 +117,18 @@ talentmatch:
     greenhouse: { base-url: https://boards-api.greenhouse.io, max-detail-calls-per-poll: 20 }
     lever: { base-url: https://api.lever.co, eu-base-url: https://api.eu.lever.co }
     ashby: { base-url: https://api.ashbyhq.com }
+    # Aggregator (decision c). Off until both keys are set (free keys: developer.adzuna.com). The keys
+    # travel in the request URL, so no log line ever holds a full Adzuna URL.
+    adzuna:
+      base-url: https://api.adzuna.com
+      app-id: ${ADZUNA_APP_ID:}
+      app-key: ${ADZUNA_APP_KEY:}     # secret: env var only
+      country: za
+      results-per-page: 50
+      max-days-old: 2
+      daily-request-budget: 200       # all Adzuna requests per UTC day (polls, page 2, probes); spread over the searches
+      derived-queries: 3              # searches from the target titles (plus "remote" when remote jobs are wanted)
+      unseen-close-after: 14d         # an Adzuna posting unseen this long is closed
 
   # Email notifications (Phase 5, com.talentmatch.notify.NotifyProperties). Email is off until SMTP_HOST,
   # NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO are set, and nothing is sent until the owner turns notifications

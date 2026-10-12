@@ -1,0 +1,68 @@
+{
+  "__CLASS__": "Adzuna::API::Response::JobSearchResults",
+  "count": 137,
+  "mean": 612345.67,
+  "results": [
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "id": "4877291034",
+      "adref": "eyJhbGciOiJIUzI1NiJ9.eyJpIjoiNDg3NzI5MTAzNCJ9.qa",
+      "title": "Senior <strong>Java</strong> Developer",
+      "description": "We are looking for a Senior <strong>Java</strong> Developer to join our payments team in Cape Town. You will build Spring Boot services on PostgreSQL and Kafka …",
+      "created": "2026-10-11T08:12:33Z",
+      "redirect_url": "https://www.adzuna.co.za/land/ad/4877291034?se=qa&utm_medium=api&utm_source=qa&v=qa",
+      "company": { "__CLASS__": "Adzuna::API::Response::Company", "display_name": "Acme Payments (Pty) Ltd" },
+      "location": {
+        "__CLASS__": "Adzuna::API::Response::Location",
+        "display_name": "Cape Town, Western Cape",
+        "area": ["South Africa", "Western Cape", "Cape Town"]
+      },
+      "category": { "__CLASS__": "Adzuna::API::Response::Category", "tag": "it-jobs", "label": "IT Jobs" },
+      "salary_min": 720000,
+      "salary_max": 900000,
+      "salary_is_predicted": "0",
+      "contract_time": "full_time",
+      "contract_type": "permanent",
+      "latitude": -33.92,
+      "longitude": 18.42
+    },
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "id": "4877288812",
+      "title": "Backend Engineer (Remote)",
+      "description": "Remote-first fintech hiring a backend engineer. Python, AWS &amp; Docker.",
+      "created": "2026-10-10T17:45:00Z",
+      "redirect_url": "https://www.adzuna.co.za/land/ad/4877288812?se=qa",
+      "company": { "display_name": "Orbit Labs" },
+      "location": { "display_name": "South Africa", "area": ["South Africa"] },
+      "category": { "tag": "it-jobs", "label": "IT Jobs" },
+      "salary_min": 550000.0,
+      "salary_max": 550000.0,
+      "salary_is_predicted": "1",
+      "contract_time": "full_time"
+    },
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "id": "4877270001",
+      "title": "Data Engineer",
+      "description": "Hybrid role in Sandton.",
+      "created": "2026-10-10T09:00:00Z",
+      "redirect_url": "https://www.adzuna.co.za/land/ad/4877270001?se=qa",
+      "company": {},
+      "location": { "display_name": "Sandton, Gauteng" },
+      "category": { "tag": "it-jobs", "label": "IT Jobs" }
+    },
+    {
+      "__CLASS__": "Adzuna::API::Response::Job",
+      "id": "4877260077",
+      "title": "QA Analyst",
+      "description": "Contract QA analyst, hybrid in Johannesburg.",
+      "created": "2026-10-09T12:30:00Z",
+      "redirect_url": "https://www.adzuna.co.za/land/ad/4877260077?se=qa",
+      "company": { "display_name": "Northwind" },
+      "location": { "display_name": "Johannesburg, Gauteng", "area": ["South Africa", "Gauteng", "Johannesburg"] },
+      "category": { "tag": "it-jobs", "label": "IT Jobs" },
+      "contract_type": "contract"
+    }
+  ]
+}
