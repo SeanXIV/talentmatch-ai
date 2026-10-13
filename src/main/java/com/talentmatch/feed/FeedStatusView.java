@@ -6,7 +6,7 @@ import java.time.Instant;
 /**
  * The feed's state for {@code GET /api/feed/status} (§5.2). Step 6 filled the poller's part; step 7
  * adds the profile and preferences the processor works against; step 8 the notifications; step 9
- * the aggregator; step 10 the AI enrichment. The detection part joins with step 11.
+ * the aggregator; step 10 the AI enrichment; step 11 the detection latency.
  *
  * @param enabled          {@code talentmatch.feed.enabled}
  * @param schedulerEnabled the scheduler polls (and the processor runs) on its own: the feed and its
@@ -14,7 +14,7 @@ import java.time.Instant;
  */
 public record FeedStatusView(boolean enabled, boolean schedulerEnabled, Profile profile, Preferences preferences,
                              Notifications notifications, Sources sources, Aggregator aggregator,
-                             Processing processing, Enrichment enrichment) {
+                             Processing processing, Enrichment enrichment, Detection detection) {
 
     /**
      * Notification delivery (§5.2, step 8). {@code paused}, {@code pausedUntil} and {@code lastError} are
@@ -69,9 +69,22 @@ public record FeedStatusView(boolean enabled, boolean schedulerEnabled, Profile 
      *
      * @param failed    open jobs whose enrichment FAILED (they keep their dictionary skills)
      * @param modelBusy a CV extraction holds the local model right now
-     * @param aiEnabled a model exists and {@code talentmatch.feed.skills.enrichment.enabled} is true
+     * @param aiEnabled       a model exists and {@code talentmatch.feed.skills.enrichment.enabled} is true
+     * @param pausedUntil     the stage is paused after a provider fault until then (null when not)
+     * @param capReachedUntil the hourly cap stopped the last run until then (null when not)
      */
-    public record Enrichment(long pending, long running, long failed, boolean modelBusy, boolean aiEnabled) {
+    public record Enrichment(long pending, long running, long failed, boolean modelBusy, boolean aiEnabled,
+                             Instant pausedUntil, Instant capReachedUntil) {
+    }
+
+    /**
+     * How fast new jobs reach the owner (§5.2): over the emails sent in the last {@code windowDays} days,
+     * {@code sent_at − coalesce(posted_at, first_seen_at)}.
+     *
+     * @param p50LatencySeconds the median in whole seconds; null when nothing was sent
+     * @param samples           the emails it was computed from
+     */
+    public record Detection(Long p50LatencySeconds, long samples, int windowDays) {
     }
 
     /** @param pending feed jobs waiting for the processor ({@code process_after} set) */

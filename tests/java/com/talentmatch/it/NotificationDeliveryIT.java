@@ -8,6 +8,10 @@ import static org.mockito.Mockito.verify;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.talentmatch.notify.NotificationDispatcher.DispatchReport;
+import com.talentmatch.notify.NotifyMetrics;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import com.talentmatch.support.AbstractNotifyIT;
 import com.talentmatch.support.Api.Res;
 import jakarta.mail.internet.MimeMessage;
@@ -43,6 +47,18 @@ class NotificationDeliveryIT extends AbstractNotifyIT {
 
     @Autowired
     private ApplicationContext context;
+    @Autowired
+    private MeterRegistry meters;
+
+    private double sentCount() {
+        Counter c = meters.find(NotifyMetrics.NOTIFICATIONS).tags("channel", "email", "outcome", "sent").counter();
+        return c == null ? 0 : c.count();
+    }
+
+    private long latencySamples() {
+        Timer t = meters.find(NotifyMetrics.DETECTION_LATENCY).timer();
+        return t == null ? 0 : t.count();
+    }
 
     /** No line of our own logging may contain a credential, an address, the subject or job text. */
     private static void assertNoLeaks(CapturedOutput output, String... more) {
@@ -105,9 +121,14 @@ class NotificationDeliveryIT extends AbstractNotifyIT {
         assertThat(pending.get("status")).isEqualTo("PENDING");
         UUID id = (UUID) pending.get("id");
 
+        double sentBefore = sentCount();
+        long latencyBefore = latencySamples();
         Instant before = Instant.now();
         DispatchReport r = dispatcher.dispatchDue();
         assertThat(r.sent()).isOne();
+        // step 11 meters (cumulative across tests in the shared context: deltas)
+        assertThat(sentCount() - sentBefore).isEqualTo(1);
+        assertThat(latencySamples() - latencyBefore).isEqualTo(1);
         assertThat(txDuringSend.get()).as("SMTP never runs inside a DB transaction").isFalse();
 
         Map<String, Object> row = notification(id);

@@ -5,14 +5,14 @@ import com.talentmatch.notify.Channel;
 import java.time.Instant;
 
 /**
- * {@code GET /api/feed/status} (§5.2). Step 6 returned the poller's part; step 7 added
- * {@code profile} and {@code preferences}; step 8 adds {@code notifications} (with {@code paused},
- * {@code pausedUntil} and {@code lastError} beyond §5.2, D20); step 9 adds {@code aggregator}, step 10
- * {@code enrichment}. The detection part is added (additively) by step 11.
+ * {@code GET /api/feed/status} (§5.2). Beyond §5.2: {@code notifications} adds {@code paused},
+ * {@code pausedUntil} and {@code lastError} (step 8, D20); {@code enrichment} adds {@code pausedUntil}
+ * and {@code capReachedUntil}, and {@code detection} adds {@code samples} and {@code windowDays}
+ * (step 11).
  */
 public record FeedStatusResponse(boolean enabled, boolean schedulerEnabled, Profile profile, Preferences preferences,
                                  Notifications notifications, Sources sources, Aggregator aggregator,
-                                 Processing processing, Enrichment enrichment) {
+                                 Processing processing, Enrichment enrichment, Detection detection) {
 
     public record Profile(boolean present, Integer version, Integer appliedVersion) {
     }
@@ -33,13 +33,19 @@ public record FeedStatusResponse(boolean enabled, boolean schedulerEnabled, Prof
     public record Processing(long pending) {
     }
 
-    public record Enrichment(long pending, long running, long failed, boolean modelBusy, boolean aiEnabled) {
+    public record Enrichment(long pending, long running, long failed, boolean modelBusy, boolean aiEnabled,
+                             Instant pausedUntil, Instant capReachedUntil) {
+    }
+
+    public record Detection(Long p50LatencySeconds, long samples, int windowDays) {
     }
 
     public static FeedStatusResponse of(FeedStatusView view) {
         FeedStatusView.Sources s = view.sources();
         FeedStatusView.Profile p = view.profile();
         FeedStatusView.Notifications n = view.notifications();
+        FeedStatusView.Enrichment e = view.enrichment();
+        FeedStatusView.Detection d = view.detection();
         return new FeedStatusResponse(view.enabled(), view.schedulerEnabled(),
                 new Profile(p.present(), p.version(), p.appliedVersion()),
                 new Preferences(view.preferences().present(), view.preferences().version()),
@@ -49,7 +55,8 @@ public record FeedStatusResponse(boolean enabled, boolean schedulerEnabled, Prof
                 new Aggregator(view.aggregator().configured(), view.aggregator().requestsToday(),
                         view.aggregator().dailyBudget()),
                 new Processing(view.processing().pending()),
-                new Enrichment(view.enrichment().pending(), view.enrichment().running(), view.enrichment().failed(),
-                        view.enrichment().modelBusy(), view.enrichment().aiEnabled()));
+                new Enrichment(e.pending(), e.running(), e.failed(), e.modelBusy(), e.aiEnabled(), e.pausedUntil(),
+                        e.capReachedUntil()),
+                new Detection(d.p50LatencySeconds(), d.samples(), d.windowDays()));
     }
 }

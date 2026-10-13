@@ -6,6 +6,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
@@ -13,6 +14,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.task.TaskExecutor;
@@ -63,7 +65,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *
  * <p><b>Pause</b> state is in memory (single instance): cleared by the first successful send, by
  * {@link #resume()} or by a restart. Logs hold ids, outcomes, SMTP codes and latencies only: never a
- * subject, body, address, username or password.
+ * subject, body, address, username or password. Every outcome and the detection latency of each sent
+ * email are recorded by {@link NotifyMetrics}.
  */
 @Component
 public class NotificationDispatcher {
@@ -87,6 +90,7 @@ public class NotificationDispatcher {
     private final TaskExecutor executor;
     private final java.time.Clock clock;
     private final boolean backgroundEnabled;
+    private final NotifyMetrics metrics;
 
     private final ReentrantLock runLock = new ReentrantLock();
     /** Results whose status write failed; guarded by {@link #runLock}. */
@@ -97,13 +101,26 @@ public class NotificationDispatcher {
     private volatile String lastError;
     private volatile Instant lastErrorAt;
 
+    /** Records metrics into the global registry. */
+    public NotificationDispatcher(NotificationRepository notifications, NotificationSettingsRepository settings,
+                                  NotificationChannels channels, NotificationContentSource contentSource,
+                                  NotifyProperties properties, PlatformTransactionManager transactionManager,
+                                  TaskExecutor executor, java.time.Clock clock, boolean feedEnabled,
+                                  boolean schedulerEnabled) {
+        this(notifications, settings, channels, contentSource, properties, transactionManager, executor, clock,
+                feedEnabled, schedulerEnabled, NotifyMetrics.global());
+    }
+
+    @Autowired
     public NotificationDispatcher(NotificationRepository notifications, NotificationSettingsRepository settings,
                                   NotificationChannels channels, NotificationContentSource contentSource,
                                   NotifyProperties properties, PlatformTransactionManager transactionManager,
                                   @Qualifier(NotifyConfig.DISPATCH_EXECUTOR) TaskExecutor executor,
                                   java.time.Clock clock,
                                   @Value("${talentmatch.feed.enabled:true}") boolean feedEnabled,
-                                  @Value("${talentmatch.feed.scheduler.enabled:true}") boolean schedulerEnabled) {
+                                  @Value("${talentmatch.feed.scheduler.enabled:true}") boolean schedulerEnabled,
+                                  NotifyMetrics metrics) {
+        this.metrics = Objects.requireNonNull(metrics, "metrics");
         this.notifications = notifications;
         this.settings = settings;
         this.channels = channels;
@@ -249,6 +266,7 @@ public class NotificationDispatcher {
         int expired = notifications.expirePending(now, properties.maxAge());
         if (expired > 0) {
             log.info("Email notifications expired unsent: {}", expired);
+            metrics.notification(Channel.EMAIL, "expired", expired);
         }
         int sent = 0;
         int retried = 0;
@@ -301,21 +319,25 @@ public class NotificationDispatcher {
         UUID id = row.id();
         int attempts = row.attempts();
         NotificationMessage message;
+        NotificationContent loaded;
         try {
             Optional<NotificationContent> content = contentSource.load(row.jobId());
             if (content.isEmpty()) {
                 finish(id, Finish.fail(attempts, NO_CONTENT));
                 log.info("Email notification id={} job={} outcome=permanent smtpCode=none latencyMs=0 ({})", id,
                         row.jobId(), NO_CONTENT);
+                metrics.notification(row.channel(), "no_content", 1);
                 return Result.FAILED;
             }
-            message = NotificationFormatter.feed(id, content.get(), row.score(), s.minScore(), properties.zoneId(),
+            loaded = content.get();
+            message = NotificationFormatter.feed(id, loaded, row.score(), s.minScore(), properties.zoneId(),
                     properties.appBaseUrl(), clock.instant());
         } catch (RuntimeException e) {
             // A database blip or a bug: counted, so it is bounded by max-attempts.
             int a = attempts + 1;
             log.warn("Email notification id={} job={}: preparing the message failed ({})", id, row.jobId(),
                     NotifyErrors.describe(e));
+            metrics.notification(row.channel(), "internal_error", 1);
             if (a >= properties.maxAttempts()) {
                 finish(id, Finish.fail(a, INTERNAL_ERROR));
                 return Result.FAILED;
@@ -343,6 +365,8 @@ public class NotificationDispatcher {
             lastErrorAt = null;
             log.info("Email notification id={} job={} outcome=sent smtpCode=none latencyMs={}", id, row.jobId(),
                     latencyMs);
+            metrics.notification(row.channel(), "sent", 1);
+            metrics.detectionLatency(done, loaded.postedAt(), loaded.firstSeenAt());
             return Result.SENT;
         }
 
@@ -352,6 +376,7 @@ public class NotificationDispatcher {
         String code = failure.smtpCode() == null ? "none" : String.valueOf(failure.smtpCode());
         log.info("Email notification id={} job={} outcome={} smtpCode={} latencyMs={}", id, row.jobId(),
                 failure.outcome(), code, latencyMs);
+        metrics.notification(row.channel(), failure.outcome(), 1);
         switch (failure.kind()) {
             case CONFIG -> {
                 Instant until = done.plus(properties.configErrorPause());

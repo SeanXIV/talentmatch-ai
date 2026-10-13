@@ -102,26 +102,49 @@ Principles for everything below:
 **Demonstrable output:** your full CV as a structured, editable profile in the database.
 
 ## Phase 5 — Fresh job feed (be first to apply)
-- [ ] Source adapters for **company applicant-tracking boards** with public JSON APIs
-      (Greenhouse, Lever, Ashby, …) for a watchlist of companies: postings appear there
-      first. Plus one **aggregator API** for breadth, picked for the owner's region. No
-      scraping of sites whose terms forbid it.
-- [ ] Poll on a schedule (every few minutes per source, within each API's limits, using
+- [x] Source adapters for **company applicant-tracking boards** with public JSON APIs
+      (Greenhouse, Lever, Ashby) for a watchlist of companies: postings appear there
+      first. Plus one **aggregator API** for breadth, picked for the owner's region (Adzuna,
+      South Africa). No scraping of sites whose terms forbid it.
+- [x] Poll on a schedule (every few minutes per source, within each API's limits, using
       conditional requests where supported); dedup across sources; record
       `first_seen_at`, `posted_at`, closed postings
-- [ ] Extract skills from each posting's description (real postings have no skill
-      list): AI-suggested skills validated against the `skill` table (see
+- [x] Extract skills from each posting's description (real postings have no skill
+      list): dictionary matching first (names and aliases, never invented), then
+      AI-suggested skills validated against the `skill` table in the background (see
       PRODUCTION_READINESS "Jobs with no skills")
-- [ ] Score every new posting against the master profile as it arrives
-- [ ] **Notify** the owner within minutes when a new posting scores above a threshold
-      (channel to be chosen: e.g. email, Telegram, ntfy push)
-- [ ] Decide where polling runs (in the Spring app vs. the Python ETL) at phase start
-- [ ] **Job preferences** (V5): target job titles, regions (South Africa + remote), seniority,
+- [x] Score every new posting against the master profile as it arrives
+- [x] **Notify** the owner within minutes when a new posting scores above a threshold:
+      email (SMTP)
+- [x] Decide where polling runs (decided: in the Spring app)
+- [x] **Job preferences** (V5): target job titles, regions (South Africa + remote), seniority,
       salary floor, work permits, notice period. Entered by hand by the owner and never
       AI-extracted from the CV; stored separately from the CV profile and used to filter the
       feed. The watchlist is refreshed when the confirmed profile `version` changes (Phase 4)
+- [x] Skill aliases (`skill_alias`), feed status, health component and metrics
+- [ ] Tests: unit and Testcontainers integration tests for polling, dedup, processing,
+      enrichment, notifications, recovery and the status endpoint (GreenMail for SMTP, stub HTTP
+      servers for the providers; no real network or model in CI)
 
 **Demonstrable output:** a phone notification minutes after a matching job goes live.
+
+**Decisions (2026-10-07)** (details in the Phase 5 spec):
+- a. Polling runs in the Spring app (`@Scheduled` poller, adapters in Java).
+- b. Email over SMTP is the only notification channel in Phase 5, behind a `Notifier` interface.
+- c. Aggregator: Adzuna, country `za`.
+- d. The owner adds companies by hand (board checked when added); no seed file, no discovery
+  from the aggregator; an optional lookup helper.
+- e. Notification score threshold 0.60 by default (the owner can change it).
+- f. Skill extraction: dictionary first, AI enrichment in the background.
+- g. After a re-score, notify only while the job is fresh, and at most once per job, ever.
+- h. Feed jobs are read-only in `/api/jobs` (`PUT`/`DELETE` → 409).
+- i. A new profile `version` re-scores every open feed job and rebuilds the derived Adzuna
+  searches; the company list is never changed automatically.
+- j. Preference filters drop a job only on evidence; missing data passes with a flag.
+- k. No quiet hours or digest in Phase 5.
+- l. HTML to text with jsoup.
+- m. AI enrichment may use a hosted provider, with an hourly cap (postings are public; the CV
+  is never in the prompt).
 
 ## Phase 6 — Jobs for me
 - [ ] `GET /api/candidates/{id}/matches`: rank jobs for a candidate (the reverse of
@@ -174,6 +197,8 @@ Principles for everything below:
   it, and only after the drafting quality has proven itself under review.
 - **Public, multi-user version:** auth, per-user data isolation, quotas
   (PRODUCTION_READINESS section 6).
+- **Push notifications (ntfy or Telegram)** as a second `Notifier`, if email proves too slow to
+  notice. Only if useful; nothing in Phase 5 depends on it.
 
 ## Minimum Viable Version
 

@@ -470,7 +470,7 @@ adding a skill or alias re-processes every open job (no repeat notifications).
 `"Job … is not from the job feed. Read it with GET /api/jobs/…."`)
 
 ### `GET /feed/status`
-**Response `200`** (more sections are added as the feed grows)
+**Response `200`**
 ```json
 { "enabled": true, "schedulerEnabled": true,
   "profile": { "present": true, "version": 3, "appliedVersion": 3 },
@@ -480,7 +480,9 @@ adding a skill or alias re-processes every open job (no repeat notifications).
   "sources": { "total": 4, "active": 3, "failing": 1, "lastSuccessAt": "…" },
   "aggregator": { "configured": true, "requestsToday": 37, "dailyBudget": 200 },
   "processing": { "pending": 12 },
-  "enrichment": { "pending": 3, "running": 1, "failed": 0, "modelBusy": false, "aiEnabled": true } }
+  "enrichment": { "pending": 3, "running": 1, "failed": 0, "modelBusy": false, "aiEnabled": true,
+                  "pausedUntil": null, "capReachedUntil": null },
+  "detection": { "p50LatencySeconds": 312, "samples": 9, "windowDays": 7 } }
 ```
 - `schedulerEnabled`: sources are polled and their jobs processed automatically (the feed and its
   scheduler are both on).
@@ -491,7 +493,14 @@ adding a skill or alias re-processes every open job (no repeat notifications).
 - `processing.pending`: feed jobs waiting to be processed (skills, filter, score).
 - `enrichment`: open jobs waiting for, in, or failed by the AI stage; `modelBusy` while a CV
   extraction holds the local model; `aiEnabled` false when AI is off (or
-  `talentmatch.feed.skills.enrichment.enabled=false`).
+  `talentmatch.feed.skills.enrichment.enabled=false`); `pausedUntil` while the stage waits after the
+  model timed out or failed; `capReachedUntil` while the hourly cap (30 calls) holds it. Both are
+  `null` when not in effect.
+- `detection`: how fast new jobs reach you. `p50LatencySeconds` is the median of
+  `sent_at − postedAt` (or `firstSeenAt` when the provider gives no date) over the notification emails
+  sent in the last `windowDays` (7) days, negative spans counted as 0; `samples` is how many emails
+  that was. `p50LatencySeconds` is `null` with no samples. `samples` and `windowDays` go beyond the
+  Phase 5 spec §5.2.
 - `aggregator`: whether the Adzuna keys are set, and the requests counted against today's (UTC)
   budget, probes included.
 - `notifications`: the saved settings (`enabled`, `channel`, `minScore`), whether the channel is
@@ -507,6 +516,13 @@ ids), with reason `EMAIL_CONFIG` while email sending is paused after a configura
 `NOTIFICATIONS_FAILED` when a notification failed in the last hour (expired ones aren't counted).
 Details include `notifications: {configured, paused, pausedUntil, failedLastHour}`. It never opens an
 SMTP connection and never turns overall health `DOWN`.
+
+Metrics (Micrometer, not exposed over HTTP yet): `talentmatch.feed.polls` (timer; tags `kind`,
+`outcome` = the lower-cased `lastStatus`, or `deferred` / `lease_lost`), `talentmatch.feed.postings.new`
+(counter; tag `kind`; a source's first poll is not counted), `talentmatch.feed.enrichments` (timer; tag
+`outcome`), `talentmatch.feed.notifications` (counter; tags `channel`, `outcome` = `sent`, `transient`,
+`permanent`, `config`, `expired`, `no_content`, `internal_error`; the test email is not counted) and
+`talentmatch.feed.detection.latency` (timer, one sample per email sent).
 
 ---
 

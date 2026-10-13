@@ -20,6 +20,7 @@ import com.talentmatch.feed.skills.JobSkillExtractionModel;
 import com.talentmatch.feed.skills.SkillDictionary;
 import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.support.FakeExtractionModel;
+import com.talentmatch.support.MutableClock;
 import dev.langchain4j.model.output.FinishReason;
 import dev.langchain4j.model.output.TokenUsage;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -73,6 +74,14 @@ class JobSkillEnrichmentRulesTest {
         return new JobSkillEnrichmentService(repo, provider(model), provider(gate), dictionary,
                 new SkillsProperties(8000, e), feed, provider(processor), new ThreadPoolTaskExecutor(),
                 Clock.fixed(NOW, ZoneOffset.UTC), provider((MeterRegistry) meters));
+    }
+
+    private JobSkillEnrichmentService withClock(Clock clock, int maxPerHour) {
+        SkillsProperties.Enrichment e = new SkillsProperties.Enrichment(true, Duration.ofMinutes(5), 600, 0, 3,
+                BACKOFF, Duration.ofSeconds(60), maxPerHour, Duration.ofSeconds(60));
+        return new JobSkillEnrichmentService(repo, provider(new JobSkillExtractionModel(fake, "fake/m", null, true)),
+                provider(gate), dictionary, new SkillsProperties(8000, e), FeedProperties.defaults(),
+                provider(processor), new ThreadPoolTaskExecutor(), clock, provider((MeterRegistry) meters));
     }
 
     private JobSkillEnrichmentService local(Integer contextTokens) {
@@ -474,5 +483,61 @@ class JobSkillEnrichmentRulesTest {
                 verifyNoInteractions(executor);
             }
         }
+    }
+
+    // ------------------------------------------------------------------ step 11: status getters
+
+    @Test
+    void pausedUntilIsReportedAfterAProviderFaultAndClearsOnceItPasses() {
+        MutableClock clock = MutableClock.fixedAt(NOW);
+        when(repo.claim(anyInt(), any())).thenReturn(Optional.of(task(1)), Optional.empty());
+        fake.fail(new IllegalStateException("connection refused"));
+        JobSkillEnrichmentService s = withClock(clock, 30);
+        assertThat(s.pausedUntil()).isNull();
+        assertThat(s.capReachedUntil()).isNull();
+
+        s.enrichDue();
+        assertThat(s.pausedUntil()).isEqualTo(NOW.plus(BACKOFF));
+        assertThat(s.capReachedUntil()).isNull();
+
+        clock.advance(BACKOFF.minusSeconds(1));
+        assertThat(s.pausedUntil()).isEqualTo(NOW.plus(BACKOFF));
+        clock.advance(Duration.ofSeconds(1));
+        assertThat(s.pausedUntil()).as("not after the pause ends").isNull();
+    }
+
+    @Test
+    void pausedUntilIsSetByATimeoutToo() {
+        when(repo.claim(anyInt(), any())).thenReturn(Optional.of(task(1)), Optional.empty());
+        fake.fail(new RuntimeException(new SocketTimeoutException("read timed out")));
+        JobSkillEnrichmentService s = local(null);
+        s.enrichDue();
+        assertThat(s.pausedUntil()).isEqualTo(NOW.plus(BACKOFF));
+    }
+
+    @Test
+    void capReachedUntilIsSetWhenARunHitsTheHourlyCapAndClearsAfterTheHour() {
+        MutableClock clock = MutableClock.fixedAt(NOW);
+        when(repo.claim(anyInt(), any())).thenReturn(Optional.of(task(1)), Optional.of(task(1)), Optional.empty());
+        JobSkillEnrichmentService s = withClock(clock, 1);
+
+        JobSkillEnrichmentService.Report r = s.enrichDue();
+        assertThat(r.succeeded()).isEqualTo(1);
+        assertThat(r.deferredUntil()).isEqualTo(NOW.plus(Duration.ofHours(1)));
+        assertThat(s.capReachedUntil()).isEqualTo(NOW.plus(Duration.ofHours(1)));
+        assertThat(s.pausedUntil()).isNull();
+
+        clock.advance(Duration.ofMinutes(59));
+        assertThat(s.capReachedUntil()).isEqualTo(NOW.plus(Duration.ofHours(1)));
+        clock.advance(Duration.ofMinutes(1));
+        assertThat(s.capReachedUntil()).as("the hour has passed").isNull();
+    }
+
+    @Test
+    void capReachedUntilStaysNullBelowTheCap() {
+        when(repo.claim(anyInt(), any())).thenReturn(Optional.of(task(1)), Optional.empty());
+        JobSkillEnrichmentService s = withClock(Clock.fixed(NOW, ZoneOffset.UTC), 2);
+        assertThat(s.enrichDue().succeeded()).isEqualTo(1);
+        assertThat(s.capReachedUntil()).isNull();
     }
 }

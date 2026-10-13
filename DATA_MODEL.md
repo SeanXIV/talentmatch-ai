@@ -28,6 +28,11 @@ erDiagram
     RESUME |o--o{ OWNER_PROFILE : "confirmed from"
     OWNER_PROFILE_VERSION ||--o| OWNER_PROFILE : "current version"
     RESUME |o--o{ OWNER_PROFILE_VERSION : "confirmed from"
+    SKILL ||--o{ SKILL_ALIAS : "also called"
+    FEED_SOURCE ||--o{ JOB_POSTING : lists
+    FEED_JOB ||--|{ JOB_POSTING : "posted as"
+    JOB ||--o| FEED_JOB : "feed state (origin FEED)"
+    FEED_JOB ||--o| FEED_NOTIFICATION : "notified by"
 
     CANDIDATE {
         uuid id PK
@@ -119,6 +124,97 @@ erDiagram
         uuid resume_id FK
         timestamp confirmed_at
     }
+
+    SKILL_ALIAS {
+        uuid id PK
+        uuid skill_id FK
+        string alias UK
+        timestamp created_at
+    }
+
+    FEED_SOURCE {
+        uuid id PK
+        string source_key UK
+        string kind
+        string managed_by
+        string state
+        string board_token
+        jsonb options
+        timestamp next_poll_at
+        timestamp lease_until
+        string last_status
+        int consecutive_failures
+        string etag
+        char content_hash
+        timestamp baseline_at
+    }
+
+    JOB_POSTING {
+        uuid id PK
+        uuid source_id FK
+        string external_id
+        uuid job_id FK
+        string url
+        timestamp posted_at
+        timestamp first_seen_at
+        timestamp closed_at
+        boolean baseline
+        char content_hash
+    }
+
+    FEED_JOB {
+        uuid job_id PK
+        string dedup_key
+        timestamp first_seen_at
+        timestamp posted_at
+        timestamp closed_at
+        boolean baseline
+        char description_hash
+        jsonb dictionary_skills
+        jsonb ai_skills
+        jsonb ai_suggestions
+        string enrichment_status
+        string preference_verdict
+        timestamp process_after
+    }
+
+    FEED_NOTIFICATION {
+        uuid id PK
+        uuid job_id FK
+        string channel
+        string status
+        double score
+        int attempts
+        timestamp next_attempt_at
+        timestamp sent_at
+    }
+
+    JOB_PREFERENCES {
+        boolean id PK
+        jsonb preferences
+        int version
+    }
+
+    NOTIFICATION_SETTINGS {
+        boolean id PK
+        boolean enabled
+        string channel
+        double min_score
+        int max_per_hour
+    }
+
+    FEED_STATE {
+        boolean id PK
+        int applied_profile_version
+        int applied_preferences_version
+        string skill_vocab_fingerprint
+    }
+
+    FEED_API_USAGE {
+        string provider PK
+        date day PK
+        int requests
+    }
 ```
 
 ## Table Notes
@@ -140,8 +236,23 @@ default) or `FEED` (created and kept up to date by the Phase 5 job feed). The pa
 cities, a re-post), so feed jobs are deduplicated by `feed_job.dedup_key` instead. Upserts by the
 natural key must say `ON CONFLICT (title, company) WHERE origin = 'MANUAL'`. `UNIQUE (id, origin)`
 lets `feed_job` reference `(job_id, 'FEED')`, so only FEED jobs can have feed rows. FEED jobs are
-read-only in `/api/jobs` (`PUT`/`DELETE` → 409 `DATA_CONFLICT`). The remaining V5 feed tables
-are documented with the rest of Phase 5; the poller's use of them is below.
+read-only in `/api/jobs` (`PUT`/`DELETE` → 409 `DATA_CONFLICT`). The V5 feed tables follow.
+
+### `skill_alias` (V5)
+Alternative names that resolve to a skill (`Postgres` → `PostgreSQL`), used by `SkillResolver` and
+the feed's skill dictionary. Unique case-insensitively (`uq_skill_alias_lower` on `lower(alias)`)
+and never equal to a skill name. Alias and skill writes that could collide take
+`pg_advisory_xact_lock(hashtext('talentmatch.skill_vocab'))`, so the "an alias is never a skill
+name" rule holds under concurrent writes. Deleting a skill deletes its aliases.
+
+### `job_preferences`, `feed_api_usage` (V5)
+- **`job_preferences`** is a single row (`id boolean PRIMARY KEY CHECK (id)`): the owner's
+  preferences as `jsonb` plus a `version` incremented on every save. It is entered by hand through
+  `PUT /api/preferences` only; no AI code path ever writes it. No row means the feed is not filtered.
+- **`feed_api_usage`** counts requests per provider per UTC day (the Adzuna daily budget). Taking a
+  request is one atomic upsert (`FeedApiUsage.tryConsume`: `INSERT … ON CONFLICT (provider, day) DO
+  UPDATE SET requests = requests + 1 WHERE requests < :budget RETURNING requests`); no row returned
+  means the budget is used up. Probes count too.
 
 ### `feed_source`, `job_posting`, `feed_job` (V5, written by the poller)
 ```
@@ -263,6 +374,22 @@ at most 20 an hour). It is written only by `PUT /api/notifications/settings` (on
   expired rows excluded) count `FAILED` rows by `updated_at`, which the trigger sets on the database clock.
 - Deleting a source cascades to its orphaned feed jobs and their notification rows; the dispatcher's
   status writes then simply match no row.
+
+### `feed_job` AI enrichment columns (V5, written by `JobSkillEnrichmentService`)
+- `enrichment_status`: `PENDING` → `RUNNING` (claimed, `enrichment_attempts + 1`) → `SUCCEEDED`
+  (`ai_skills`, `ai_suggestions`, `enrichment_model`, `enriched_at`) | `FAILED`
+  (`enrichment_failure`, after `max-attempts` refusals or invalid answers, or a prompt that didn't
+  fit the context) | `SKIPPED` (AI off, or no description). A model busy with a CV extraction, a
+  provider fault or a database error puts the row back to `PENDING` with the attempt given back and
+  `enrichment_not_before` set. CHECKs: `enrichment_failure` is set exactly when `FAILED`;
+  `SUCCEEDED` needs `ai_skills`, `enrichment_model` and `enriched_at`.
+- `description_hash` (sha256 of the canonical description) guards the finishing write: an answer for
+  a description that changed meanwhile matches no row and is discarded.
+- A description change (the poller's canonical update) resets `enrichment_status` to `PENDING`,
+  clears `ai_skills`, `enrichment_model` and `enriched_at` to NULL and resets `ai_suggestions` to
+  `[]`, so AI skills never outlive the text they were read from.
+- Startup recovery puts `RUNNING` rows back to `PENDING` (attempts kept: they count crash loops) and,
+  when AI is available, re-queues open `SKIPPED` jobs that have a description.
 
 ### `skill`
 A normalized skill lookup table (e.g. "Java", "SQL", "React") shared between

@@ -101,6 +101,8 @@ public class JobSkillEnrichmentService {
     /** Start times of the calls in the last hour; guarded by {@link #runLock}. */
     private final Deque<Instant> calls = new ArrayDeque<>();
     private volatile Instant pausedUntil;
+    /** Set when a run stopped at the hourly cap; read by the status endpoint. */
+    private volatile Instant capReachedUntil;
 
     public JobSkillEnrichmentService(FeedEnrichmentRepository repository,
                                      ObjectProvider<JobSkillExtractionModel> model,
@@ -150,6 +152,18 @@ public class JobSkillEnrichmentService {
     public boolean modelBusy() {
         LocalModelGate g = gate.getIfAvailable();
         return g != null && g.exclusiveHeld();
+    }
+
+    /** The end of a pause after a provider fault, or null when the stage isn't paused. */
+    public Instant pausedUntil() {
+        Instant p = pausedUntil;
+        return p != null && p.isAfter(clock.instant()) ? p : null;
+    }
+
+    /** When the hourly cap last stopped a run, the time it frees up; null once that time has passed. */
+    public Instant capReachedUntil() {
+        Instant c = capReachedUntil;
+        return c != null && c.isAfter(clock.instant()) ? c : null;
     }
 
     /** Starts a background run, unless background work is off (the scheduler is off). Never blocks. */
@@ -211,8 +225,9 @@ public class JobSkillEnrichmentService {
         SkillDictionary.Snapshot vocabulary = dictionary.refresh();
         while (!Thread.currentThread().isInterrupted()) {
             now = clock.instant();
-            Instant deferred = capReachedUntil(now);
+            Instant deferred = capEnd(now);
             if (deferred != null) {
+                capReachedUntil = deferred;
                 return new Report(false, succeeded, failed, retried, noDescription, false, null, deferred);
             }
             Optional<FeedEnrichmentRepository.Task> claimed = repository.claim(settings.maxAttempts(), now);
@@ -247,7 +262,7 @@ public class JobSkillEnrichmentService {
     }
 
     /** The oldest call's hour end when {@code max-per-hour} calls were made in the last hour, else null. */
-    private Instant capReachedUntil(Instant now) {
+    private Instant capEnd(Instant now) {
         while (!calls.isEmpty() && !calls.peekFirst().isAfter(now.minus(CAP_WINDOW))) {
             calls.pollFirst();
         }

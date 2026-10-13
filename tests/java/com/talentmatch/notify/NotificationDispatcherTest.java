@@ -21,6 +21,9 @@ import com.talentmatch.notify.NotificationSettingsRepository.Settings;
 import com.talentmatch.notify.SmtpFailure.Kind;
 import com.talentmatch.notify.SmtpFailure.Reason;
 import com.talentmatch.support.MutableClock;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Timer;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -54,6 +57,7 @@ class NotificationDispatcherTest {
     private final Notifier notifier = mock(Notifier.class);
     private final TaskExecutor executor = mock(TaskExecutor.class);
     private final MutableClock clock = MutableClock.fixedAt(T0);
+    private final SimpleMeterRegistry meters = new SimpleMeterRegistry();
     private NotificationDispatcher dispatcher;
 
     private static Settings settings(boolean enabled, int maxPerHour) {
@@ -74,7 +78,17 @@ class NotificationDispatcherTest {
         f.registerSingleton("email", notifier);
         return new NotificationDispatcher(repo, settingsRepo, new NotificationChannels(f.getBeanProvider(Notifier.class)),
                 content, NotifyProperties.defaults(), mock(PlatformTransactionManager.class), executor, clock,
-                background, true);
+                background, true, new NotifyMetrics(meters));
+    }
+
+    private double count(String outcome) {
+        Counter c = meters.find(NotifyMetrics.NOTIFICATIONS).tags("channel", "email", "outcome", outcome).counter();
+        return c == null ? 0 : c.count();
+    }
+
+    private long latencySamples() {
+        Timer t = meters.find(NotifyMetrics.DETECTION_LATENCY).timer();
+        return t == null ? 0 : t.count();
     }
 
     @BeforeEach
@@ -108,6 +122,8 @@ class NotificationDispatcherTest {
         o.verify(repo).limitLockWait(Duration.ofSeconds(2));
         o.verify(repo).markSent(ID, 1, T0);
         verify(repo, times(2)).claimNext(T0);
+        assertThat(count("sent")).isEqualTo(1);
+        assertThat(latencySamples()).isOne();
     }
 
     // ------------------------------------------------------------------ D1: transient backoff, 5 sends in total
@@ -145,6 +161,9 @@ class NotificationDispatcherTest {
         verify(repo).fail(ID, 5, "SMTP 421 (transient)");
         verify(notifier, times(5)).send(any());
         assertThat(dispatcher.state().lastError()).isEqualTo("SMTP 421 (transient)");
+        assertThat(count("transient")).as("every failed send, the last one included").isEqualTo(5);
+        assertThat(count("sent")).isZero();
+        assertThat(latencySamples()).isZero();
     }
 
     @Test
@@ -170,6 +189,7 @@ class NotificationDispatcherTest {
         verify(repo).fail(ID, 1, "SMTP 550 (rejected)");
         verify(repo, times(2)).claimNext(any());
         verify(repo, never()).retry(any(), anyInt(), any(), any());
+        assertThat(count("permanent")).isEqualTo(1);
     }
 
     // ------------------------------------------------------------------ CONFIG
@@ -184,6 +204,7 @@ class NotificationDispatcherTest {
         verify(repo).release(ID, T0, text);                       // next_attempt_at = now, attempts untouched
         verify(repo, never()).retry(any(), anyInt(), any(), any());
         verify(repo, never()).fail(any(), anyInt(), any());
+        assertThat(count("config")).isEqualTo(1);
         assertThat(dispatcher.state().paused()).isTrue();
         assertThat(dispatcher.state().pausedUntil()).isEqualTo(T0.plus(Duration.ofMinutes(15)));
         assertThat(dispatcher.state().lastError()).isEqualTo(text);
@@ -240,6 +261,7 @@ class NotificationDispatcherTest {
         verify(repo, never()).claimNext(any());
         verify(notifier, never()).send(any());
         verify(repo, times(2)).expirePending(T0, Duration.ofHours(24));
+        assertThat(count("expired")).as("each run adds the rows it expired").isEqualTo(6);
     }
 
     // ------------------------------------------------------------------ D3: hourly cap before claiming
@@ -283,6 +305,8 @@ class NotificationDispatcherTest {
         dispatcher.dispatchDue();
         verify(repo).fail(ID, 0, "job no longer available");
         verify(notifier, never()).send(any());
+        assertThat(count("no_content")).isEqualTo(1);
+        assertThat(count("sent")).isZero();
     }
 
     @Test
@@ -295,6 +319,7 @@ class NotificationDispatcherTest {
         assertThat(dispatcher.dispatchDue().failed()).isOne();
         verify(repo).fail(ID, 5, "internal error");
         verify(notifier, never()).send(any());
+        assertThat(count("internal_error")).as("one per counted attempt").isEqualTo(2);
     }
 
     @Test
@@ -324,6 +349,45 @@ class NotificationDispatcherTest {
         verify(notifier, times(1)).send(any());
         dispatcher.recoverInterrupted();
         verify(repo).resetSending(List.of());
+    }
+
+    // ------------------------------------------------------------------ step 11 metrics
+
+    @Test
+    void sentLatencyUsesPostedAtElseFirstSeenAt() throws Exception {
+        clock.advance(Duration.ofMinutes(10));
+        when(repo.claimNext(any())).thenReturn(Optional.of(new Claimed(ID, JOB, Channel.EMAIL, 0.8, 0, T0)),
+                Optional.of(new Claimed(UUID.randomUUID(), JOB, Channel.EMAIL, 0.8, 0, T0)), Optional.empty());
+        when(content.load(JOB)).thenReturn(
+                Optional.of(new NotificationContent(JOB, "Backend Engineer", "Acme", "REMOTE", null, List.of("ZA"),
+                        T0.minusSeconds(120), T0, "https://jobs.example/1", "s", List.of(), List.of(), List.of(),
+                        List.of("Lever"), false)),
+                Optional.of(new NotificationContent(JOB, "Backend Engineer", "Acme", "REMOTE", null, List.of("ZA"),
+                        null, T0, "https://jobs.example/1", "s", List.of(), List.of(), List.of(),
+                        List.of("Lever"), false)));
+        assertThat(dispatcher.dispatchDue().sent()).isEqualTo(2);
+        Timer t = meters.find(NotifyMetrics.DETECTION_LATENCY).timer();
+        assertThat(t.count()).isEqualTo(2);
+        // 12 minutes (posted 2 min before T0) + 10 minutes (first seen at T0), sent at T0 + 10 min
+        assertThat(t.totalTime(TimeUnit.SECONDS)).isEqualTo(22 * 60);
+        assertThat(count("sent")).isEqualTo(2);
+    }
+
+    @Test
+    void theTenArgConstructorStillWorks() {
+        DefaultListableBeanFactory f = new DefaultListableBeanFactory();
+        f.registerSingleton("email", notifier);
+        NotificationDispatcher d = new NotificationDispatcher(repo, settingsRepo,
+                new NotificationChannels(f.getBeanProvider(Notifier.class)), content, NotifyProperties.defaults(),
+                mock(PlatformTransactionManager.class), executor, clock, false, true);
+        assertThat(d.dispatchDue().busy()).isFalse();
+    }
+
+    @Test
+    void aBlockedSendIsNotCounted() {
+        when(settingsRepo.find()).thenReturn(settings(false, 20));
+        dispatcher.dispatchDue();
+        assertThat(meters.find(NotifyMetrics.NOTIFICATIONS).meters()).isEmpty();
     }
 
     // ------------------------------------------------------------------ guards

@@ -21,6 +21,10 @@ English — turning a scoring number into something a recruiter can actually act
 - Rule-based skill-overlap matching engine
 - AI-generated natural-language explanation for each match, via LangChain4j
   (Ollama locally by default, swappable to a hosted API)
+- Master profile from your CV (PDF → AI draft → reviewed profile), matched like any candidate
+- Job feed: watches company job boards (Greenhouse, Lever, Ashby) and Adzuna searches, scores
+  new postings against your profile, filters them by your preferences and emails you the good
+  ones within minutes
 - React dashboard to browse candidates, jobs, and match results
 - Fully containerized (Docker) and deployed to AWS
 - Automated tests (JUnit, pytest) and CI on every push (GitHub Actions)
@@ -54,9 +58,13 @@ breakdown, batch recompute, and a consistent error format. Phase 3 (AI explanati
 implemented: LangChain4j explanations for the top matches (local Ollama by default,
 OpenAI/Claude via profiles), persisted with prompt-hash staleness, with a deterministic
 template fallback so every match always has an explanation. The project is now aimed at
-personal job hunting (see [`ROADMAP.md`](./ROADMAP.md)). Phase 4 (in progress): upload your
+personal job hunting (see [`ROADMAP.md`](./ROADMAP.md)). Phase 4 is complete: upload your
 CV as a PDF, let the AI turn it into a draft profile, review it and save it as your master
-profile, which is then matched against jobs like any candidate.
+profile, which is then matched against jobs like any candidate. Phase 5 (job feed) is
+implemented and being hardened: the app polls the company boards and Adzuna searches you
+watch, finds skills in each new posting (dictionary first, AI later), checks it against your
+preferences, scores it against your profile and emails you when it scores above your
+threshold.
 
 ## Getting Started
 
@@ -248,6 +256,60 @@ Your CV stays on your machine with the default Ollama provider. With the `claude
 `TALENTMATCH_PROFILE_ALLOW_REMOTE_EXTRACTION=true`; then its whole text is sent to that
 provider. Each save creates a new profile `version` (earlier ones are kept as history).
 
+### Quick start (job feed and email alerts)
+
+With the API running and your profile saved (above), add the companies to watch. Use the board
+name from the company's careers URL (`boards.greenhouse.io/<token>`, `jobs.lever.co/<site>`,
+`jobs.ashbyhq.com/<name>`); the board is checked before it is saved:
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' localhost:8080/api/feed/sources \
+  -d '{"kind": "GREENHOUSE", "boardToken": "acme"}'
+curl -s -X POST -H 'Content-Type: application/json' localhost:8080/api/feed/sources \
+  -d '{"kind": "LEVER", "boardToken": "acme", "companyName": "Acme"}'
+```
+
+The first poll of a board records what is already open (the baseline); only postings that
+appear after it (or were published in the last 24 h) count as new. Save your preferences so the
+feed is filtered (all fields optional; see [`API_SPEC.md`](./API_SPEC.md), "Preferences"):
+
+```bash
+curl -s -X PUT -H 'Content-Type: application/json' localhost:8080/api/preferences \
+  -d '{"preferences": {"targetTitles": ["Backend Engineer"], "regions": {"countries": ["ZA"]}}}'
+```
+
+Email alerts need an SMTP server. Set these before starting the app (Gmail shown; it needs an
+[app password](https://myaccount.google.com/apppasswords) on an account with 2-step
+verification, and `NOTIFY_EMAIL_FROM` must be that account's address):
+
+```bash
+export SMTP_HOST=smtp.gmail.com SMTP_PORT=587 SMTP_SECURITY=STARTTLS
+export SMTP_USERNAME=you@gmail.com SMTP_PASSWORD='<app password>'
+export NOTIFY_EMAIL_FROM=you@gmail.com NOTIFY_EMAIL_TO=you@gmail.com
+./mvnw spring-boot:run
+```
+
+Send a test email, then turn notifications on (they are off until you do):
+
+```bash
+curl -s -X POST localhost:8080/api/notifications/test
+curl -s -X PUT -H 'Content-Type: application/json' localhost:8080/api/notifications/settings \
+  -d '{"enabled": true, "minScore": 0.6, "maxPerHour": 20}'
+```
+
+For local checks without a real mailbox, run [Mailpit](https://mailpit.axllent.org)
+(`docker run -d -p 1025:1025 -p 8025:8025 axllent/mailpit`), set `SMTP_HOST=127.0.0.1
+SMTP_PORT=1025 SMTP_SECURITY=NONE` (no username or password) and open http://localhost:8025.
+
+Adzuna searches (South Africa) need free API keys from https://developer.adzuna.com: set
+`ADZUNA_APP_ID` and `ADZUNA_APP_KEY`. Searches are then derived from your preferences' target
+titles, and you can add your own with `{"kind": "ADZUNA", "options": {"what": "java developer"}}`.
+
+Check how it is doing with `curl -s localhost:8080/api/feed/status` (sources, backlog, email
+state and the median time from posting to email) and `GET /api/feed/jobs` for the jobs found.
+`FEED_ENABLED=false` switches polling off. **The laptop must be awake to poll**: nothing is
+checked while it sleeps.
+
 _(Full-stack `docker-compose up` instructions will be added once the backend and
 frontend land.)_
 
@@ -255,8 +317,8 @@ frontend land.)_
 
 Uses a seeded, synthetic dataset generated with Faker
 (`scripts/etl/generate_synthetic.py`) — no real personal or client data is used
-anywhere in this project. A real public job-postings source can be added later as
-another ETL source adapter.
+anywhere in this project. Real postings come only from the job feed (Phase 5), which reads
+official job-board and Adzuna APIs for the companies and searches you choose.
 
 ## License
 

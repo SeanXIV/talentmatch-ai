@@ -163,6 +163,11 @@ class FeedEnrichmentIT extends AbstractFeedProcessingIT {
 
         JobSkillEnrichmentService.Report r = enrichment.enrichDue();
         assertThat(r.pausedUntil()).isNotNull();
+        // step 11: the pause is on the status endpoint
+        JsonNode paused = api.get("/api/feed/status").json().get("enrichment");
+        assertThat(paused.get("pausedUntil").isNull()).as("pausedUntil in %s", paused).isFalse();
+        assertThat(Instant.parse(paused.get("pausedUntil").asText())).isEqualTo(r.pausedUntil());
+        assertThat(paused.get("capReachedUntil").isNull()).isTrue();
         Map<String, Object> f = feedJob(job);
         assertThat(f.get("enrichment_status")).isEqualTo("PENDING");
         assertThat(f.get("enrichment_attempts")).as("a provider fault gives the attempt back").isEqualTo(0);
@@ -177,6 +182,8 @@ class FeedEnrichmentIT extends AbstractFeedProcessingIT {
         await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ofMillis(1100))
                 .until(() -> enrichment.enrichDue().succeeded() == 1);
         assertThat(feedJob(job).get("enrichment_status")).isEqualTo("SUCCEEDED");
+        assertThat(api.get("/api/feed/status").json().get("enrichment").get("pausedUntil").isNull())
+                .as("the pause has ended").isTrue();
     }
 
     @Test
@@ -298,6 +305,9 @@ class FeedEnrichmentIT extends AbstractFeedProcessingIT {
         assertThat(e.get("running").asLong()).isZero();
         assertThat(e.get("failed").asLong()).isZero();
         assertThat(e.get("modelBusy").asBoolean()).isFalse();
+        assertThat(e.has("pausedUntil")).as("step 11 fields are always present").isTrue();
+        assertThat(e.has("capReachedUntil")).isTrue();
+        assertThat(e.get("capReachedUntil").isNull()).as("far below max-per-hour").isTrue();
     }
     // ------------------------------------------------------------------ 10. provider errors (tester, step 10)
 

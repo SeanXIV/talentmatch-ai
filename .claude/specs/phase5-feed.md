@@ -1222,6 +1222,19 @@ Steps 2–3 and 4–5 can run in parallel. Steps 8 and 9 depend only on 7.
    - The company name is untrusted: its line goes inside the `<job_posting>` fence, cleaned like the posting and cut to 200 characters. Fence tags are neutralized in any spelling (`</job_posting >`, `< /job_posting>`, `<job_posting x>`).
    - Ollama's context-budget check for enrichment runs only when `skills.enrichment.enabled` is true.
    - Known limit: the pause and the hourly window are in memory per instance (single-instance assumption).
+   **Step 11 deviations from this spec:**
+   - `talentmatch.feed.polls` `outcome` tag is the lower-cased `last_status` (`ok`, `suspicious_empty`, `not_modified`, `rate_limited`, `not_found`, `unauthorized`, `error`, `invalid_response`, `too_large`, `budget_exhausted`) plus `deferred` and `lease_lost`, so alerts can tell 404 from 429. The per-poll INFO line keeps its coarse words (ok / not_modified / failed with `error="…"`; deferred and lease_lost have their own wording).
+   - `talentmatch.feed.postings.new` excludes a source's first (baseline) poll.
+   - `talentmatch.feed.notifications` outcomes: `sent`, `transient`, `permanent`, `config`, `expired`, `no_content`, `internal_error`. The test email is not counted. The notify meters live in `notify.NotifyMetrics` (`notify` must not import `feed`).
+   - `/feed/status.detection` is `{p50LatencySeconds, samples, windowDays}` (7-day window); a median without its sample count is misleading. `enrichment` adds `pausedUntil` and `capReachedUntil` (null when not in effect).
+   - Recovery IT #13 is covered piecewise by `FeedLeaseIT`, `FeedEnrichmentIT`, `NotificationDeliveryIT` and `FeedRefreshIT`, with the order checked in `FeedRecoveryEnrichmentTest`; no combined IT.
+   - `/actuator/metrics` is still not exposed (PRODUCTION_READINESS §7).
+   **Step 12 decisions (lookup):**
+   - The response is an object `{companyName, candidates, found, unchecked, complete}`, not a bare array: an empty array can't tell "no board" from "couldn't check".
+   - Slug order is joined, hyphenated, then first token (≥ 3 characters): the most specific slug is probed before the budget runs out.
+   - Lever: the global instance only; EU sites are added by hand with `leverInstance`.
+   - Allowed while the feed is disabled (as `POST /feed/sources` with verify). Never creates a source; Adzuna is never probed.
+   - Limits: one lookup at a time and a 10s minimum interval (`talentmatch.feed.lookup.*`), 429 `FEED_LOOKUP_RATE_LIMITED` with `Retry-After`.
 6. LangChain4j 1.20.2: the hand-built `ResponseFormat` schema works for this shape on Ollama (same approach as `ProfileJsonSchema`).
 
 Until the owner answers §0, build with the recommended defaults. Only the modules marked against each decision would change.

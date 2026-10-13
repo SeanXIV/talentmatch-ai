@@ -312,6 +312,22 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     provider/model/outcome/latency/token counts (never prompt text, names or keys); passive
     `ai` health component (DEGRADED never fails overall health). `/actuator/metrics` is not
     exposed yet.
+    **Done in Phase 5:** five feed meters (tags lower case):
+    - `talentmatch.feed.polls` (timer; `kind` = greenhouse|lever|ashby|adzuna, `outcome` = ok|
+      suspicious_empty|not_modified|rate_limited|not_found|unauthorized|error|invalid_response|
+      too_large|budget_exhausted|deferred|lease_lost);
+    - `talentmatch.feed.postings.new` (counter; `kind`; a source's baseline poll is not counted);
+    - `talentmatch.feed.enrichments` (timer; `outcome` = success|discarded|invalid_output|refused|
+      context_overflow|timeout|provider_error|db_error);
+    - `talentmatch.feed.notifications` (counter; `channel` = email, `outcome` = sent|transient|
+      permanent|config|expired|no_content|internal_error; the test email is not counted);
+    - `talentmatch.feed.detection.latency` (timer; sent time minus the posting date, or first seen).
+
+    Plus one INFO line per poll (`Feed poll source=… kind=… outcome=… status=… fetched=… new=…
+    updated=… closed=… skipped=… latencyMs=…`), one per enrichment call and one per email; the passive
+    `feed` health component (DEGRADED never fails overall health); and `detection` in
+    `GET /api/feed/status` (median detection latency over the last 7 days). `/actuator/metrics` is
+    still not exposed.
   - **Production:** Spring Boot Actuator liveness/readiness probes; structured
     (JSON) logs; metrics (latency, error rate, LLM tokens/cost, ETL rejects);
     alerting. Error responses use the `API_SPEC.md` error format and never
@@ -411,26 +427,108 @@ shortcuts we took on purpose, written down so they don't get forgotten.
 ## 10. Job-seeker features (Phases 4–7, PROPOSED 2026-10-05)
 
 - [ ] **Job sources: terms, limits and reliability**
-  - **Now (dev):** no real job source yet (synthetic data only).
-  - **Production:** only sources with official APIs or feeds whose terms allow this use (ATS
-    job-board APIs, aggregator APIs with a key); no scraping of sites that forbid it.
-    Respect rate limits and use conditional requests; back off on errors; alert when a
-    source fails or returns nothing for too long (a silently dead source means missed jobs).
+  - **Now (Phase 5):** official APIs only: the public Greenhouse, Lever and Ashby job-board APIs
+    and the Adzuna search API with a key (`com.talentmatch.feed.source`). Adzuna jobs link to
+    Adzuna's page and emails say "Jobs by Adzuna" (attribution); Adzuna requests share a daily
+    budget (`talentmatch.feed.adzuna.daily-request-budget`, 200 per UTC day, probes included).
+    Conditional requests use the stored ETag (`If-None-Match`) plus a sha256 hash of the body;
+    no `If-Modified-Since` (the step-4 probe found no provider sends `Last-Modified` or honours
+    it). Failures back off per kind (`Backoff`: `Retry-After` for 429, exponential up to 1 h,
+    6 h for 404/401). The `feed` health component is DEGRADED when an ACTIVE source failed 3
+    times in a row or had no success for 3 × its interval. A save that loses a lock conflict is
+    deferred 5–10 s without counting a failure (`API_SPEC.md`, "Job feed sources").
+  - **Production:** alerting on DEGRADED; a scheduled review of each provider's terms; contract
+    tests against the saved fixtures (`tests/resources/feed/*.json`); re-probe Adzuna (limits,
+    terms, response shape) once keys exist (its fixture follows the docs, not a live capture).
   - **Why:** banned keys or IPs, legal exposure, and missed postings that defeat "be first".
-  - **When:** Phase 5.
+  - **When:** alerting and contract tests before relying on the feed unattended (Phase 9).
 
 - [ ] **Always-on poller**
-  - **Now (dev):** everything runs on a laptop that sleeps.
-  - **Production:** the poller and notifier run 24/7 on an always-on host, with a heartbeat
-    alert if polling stops; one active poller even with several app instances.
+  - **Now (Phase 5):** a single-instance `@Scheduled` poller (`FeedScheduler`) claims due
+    sources with DB leases and `FOR UPDATE SKIP LOCKED`, so two instances never poll the same
+    source at once. The processor, enrichment and dispatcher threads, their pauses and hourly
+    caps, and startup recovery (`FeedRecovery`) are per instance. Everything runs on a laptop
+    that sleeps: polling happens only while it is awake.
+  - **Production:** the poller and notifier run 24/7 on an always-on host; one designated worker
+    instance (or ShedLock for the scheduled work), with a heartbeat alert if polling stops.
   - **Why:** postings found hours late lose the speed advantage.
-  - **When:** Phase 9 (until then, polling only while the laptop is awake).
+  - **When:** Phase 9.
 
 - [ ] **Notification channel secrets and delivery**
-  - **Now (dev):** no notifications yet.
-  - **Production:** channel credentials (bot token, SMTP password, …) from a secrets
-    manager; delivery failures retried and logged; no duplicate alerts for the same posting.
-  - **When:** Phase 5.
+  - **Now (Phase 5):** email over SMTP (`com.talentmatch.notify`) with STARTTLS required (no
+    plaintext fallback; `SMTP_SECURITY=NONE` only for loopback hosts). The password comes only
+    from the `SMTP_PASSWORD` env var: masked in `toString`, never logged, mail debug always off.
+    Delivery is at least once: a crash mid-send can duplicate an email, and the stable
+    Message-ID lets some clients merge it. One email per job ever, an hourly cap, and SMTP errors
+    classified transient, permanent or config. `max-attempts` is 5 sends in total (retries after
+    1, 2, 4 and 8 min); a config error pauses the channel for 15 min. The settings response
+    masks both `to` and `from`.
+  - **Production:** a secrets manager; a transactional mail provider with SPF/DKIM/DMARC for the
+    from domain (otherwise alerts land in spam); bounce and delivery monitoring; an alert when
+    the channel is paused.
+  - **When:** before first prod deploy.
+
+- [ ] **The notification recipient address is PII**
+  - **Now (Phase 5):** `NOTIFY_EMAIL_TO` lives only in the env, is never logged and is masked in
+    API responses (`o•••@example.com`). Email adds the mail app's push delay (seconds to
+    minutes) on top of the polling interval.
+  - **Production:** the address in the secrets manager with the other credentials; part of the
+    PII policy (section 1).
+  - **Why:** an email address identifies the owner.
+  - **When:** before first prod deploy.
+
+- [ ] **Feed data retention**
+  - **Now (Phase 5):** postings and closed feed jobs are kept forever; only deleting a source
+    removes its postings (and jobs left with none).
+  - **Production:** purge closed feed jobs after N days (cascading to their skills, matches and
+    notifications), and follow the aggregator's storage and caching terms.
+  - **Why:** unbounded growth, and Adzuna's terms may limit how long results are stored.
+  - **When:** before first prod deploy.
+
+- [ ] **Dictionary skill extraction is heuristic**
+  - **Now (Phase 5):** `DictionarySkillMatcher` finds vocabulary skills and aliases by word
+    boundaries; ambiguous names (Go, Swift, Rust, …) need context. It has false positives
+    (an ambiguous word in another sense) and misses synonyms with no alias. AI enrichment adds
+    skills it can quote from the posting; its suggestions outside the vocabulary are never
+    created automatically.
+  - **Production:** a golden set of postings to measure precision and recall, and a curated
+    alias seed (section 11, "Near-duplicate skills").
+  - **Why:** wrong skills give wrong scores, so wrong or missed emails.
+  - **When:** after a few weeks of feed data.
+
+- [ ] **Dedup is heuristic**
+  - **Now (Phase 5):** postings from different sources join one open feed job by a key built from
+    the normalized company name, the normalized title and a coarse remote/onsite bucket
+    (`DedupKeys`, `CompanyNames`). Company-name variants ("Acme" vs "Acme Payments") still produce
+    duplicate jobs, and two different openings with the same title at one company can merge.
+  - **Production:** fuzzy matching with review, or the owner merging and splitting jobs by hand.
+  - **Why:** duplicates mean repeat emails for the same job.
+  - **When:** when duplicates show up in practice.
+
+- [ ] **Provider API drift**
+  - **Now (Phase 5):** the Greenhouse, Lever and Ashby shapes were probed live in step 4 and saved
+    as fixtures; Adzuna's was not (no keys). A provider can change its format at any time. A
+    poll that can't read more than half of its postings saves nothing and records
+    `INVALID_RESPONSE`.
+  - **Production:** alert on the skipped-posting ratio and on `INVALID_RESPONSE`
+    (`talentmatch.feed.polls` outcome `invalid_response`).
+  - **Why:** a silent format change means no new jobs.
+  - **When:** with the alerting above.
+
+- [ ] **Remote eligibility and salary filtering are best-effort**
+  - **Now (Phase 5):** locations are free text, so remote eligibility and countries are parsed
+    heuristically; salaries in another currency are flagged (`SALARY_OTHER_CURRENCY`), never
+    converted (no FX). Filters drop a job only on evidence; missing data passes with a flag.
+  - **Production:** FX conversion for salary filtering, and better location parsing if missed
+    or wrongly dropped jobs show up.
+  - **Why:** a wrong drop is a missed job.
+  - **When:** when the owner sees it matter.
+
+- [ ] **Company lookup slugs are guesses**
+  - **Now:** planned for Phase 5 step 12 (`POST /api/feed/sources/lookup`): board names are
+    guessed from the company name, so a company whose board name differs is not found.
+  - **Production:** the owner adds the board token from the board URL in that case.
+  - **When:** step 12.
 
 - [ ] **Uploaded CV files**
   - **Now (Phase 4):** built. PDF only, at most 5 MB (`talentmatch.profile.max-resume-bytes`;
@@ -537,6 +635,13 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     (`LocalModelGate`, Ollama only) for its 20–40 minutes; meanwhile match explanations return
     templates with reason `AI_BUSY` (not counted as provider failures, so the circuit stays
     closed). The 12288 context costs ~0.7 GB of KV cache on top of the model.
+    **Phase 5** adds a third consumer, background AI enrichment of feed jobs
+    (`JobSkillEnrichmentService`): it takes the model in shared mode like explanations, at most
+    30 calls an hour (`talentmatch.feed.skills.enrichment.max-per-hour`), and defers (without
+    counting an attempt) while a CV extraction holds the model. A timeout or provider error
+    pauses the enrichment stage for `failure-backoff` (5 min) without feeding the explanation
+    circuit breaker. At ~2–3 minutes per posting on this CPU, enrichment and explanations queue
+    behind each other.
   - **Production:** a GPU host, or separate model servers for interactive explanations and
     batch extraction.
   - **Why:** one CPU-bound model can't serve both without starving one of them.
@@ -590,8 +695,11 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     trailing version, or one name extends the other by up to 3 characters, e.g. "Postgres" vs
     "PostgreSQL"). It's a heuristic; it misses true synonyms ("JS" vs "JavaScript").
   - **Production:** a curated alias table (synonyms, versions) used by `SkillResolver`.
+  - **Done in Phase 5:** the alias table exists (`skill_alias`, `/api/skills/{id}/aliases`);
+    `SkillResolver` resolves aliases and the feed's skill dictionary matches them. Still open: a
+    curated alias seed (today aliases are added by hand).
   - **Why:** duplicate skill rows split matching and the Phase 5 watchlist.
-  - **When:** Phase 5.
+  - **When:** Phase 5 (table); the seed when duplicates show up in practice.
 
 - [x] **Profile version history** (DECIDED and built 2026-10-05)
   - **Now:** every successful `PUT /api/profile` appends a row to the append-only

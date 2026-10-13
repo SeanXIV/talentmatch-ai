@@ -14,6 +14,8 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Types;
 import java.time.Instant;
+import java.time.OffsetDateTime;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashSet;
@@ -179,6 +181,33 @@ public class FeedJobRepository {
         Long count = jdbc.queryForObject("SELECT count(*) FROM feed_job WHERE process_after IS NOT NULL",
                 new MapSqlParameterSource(), Long.class);
         return count == null ? 0 : count;
+    }
+
+    /**
+     * Detection latency over the emails sent since {@code since} (§5.2).
+     *
+     * @param p50Seconds the median of {@code sent_at − coalesce(posted_at, first_seen_at)} in seconds,
+     *                   negative spans counted as 0; null when nothing was sent
+     * @param samples    the emails it was computed from
+     */
+    public record DetectionStats(Double p50Seconds, long samples) {
+    }
+
+    public DetectionStats detectionStats(Instant since) {
+        return jdbc.queryForObject("""
+                        SELECT percentile_cont(0.5) WITHIN GROUP (
+                                 ORDER BY GREATEST(0, EXTRACT(EPOCH FROM
+                                     (n.sent_at - COALESCE(f.posted_at, f.first_seen_at))))::float8) AS p50,
+                               count(*) AS samples
+                        FROM feed_notification n
+                        JOIN feed_job f ON f.job_id = n.job_id
+                        WHERE n.status = 'SENT' AND n.sent_at >= :since
+                        """,
+                new MapSqlParameterSource("since", OffsetDateTime.ofInstant(since, ZoneOffset.UTC)),
+                (rs, n) -> {
+                    double p50 = rs.getDouble("p50");
+                    return new DetectionStats(rs.wasNull() ? null : p50, rs.getLong("samples"));
+                });
     }
 
     // ------------------------------------------------------------------ processing (step 7)

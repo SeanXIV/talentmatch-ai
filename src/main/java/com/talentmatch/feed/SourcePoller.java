@@ -27,6 +27,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -73,10 +74,21 @@ public class SourcePoller {
     private final int maxDetailCalls;
     private final Duration requestDeadline;
     private final Clock clock;
+    private final FeedMetrics metrics;
 
+    /** Records metrics into the global registry. */
     public SourcePoller(SourceAdapters adapters, PollWriter writer, FeedSourceRepository sources,
                         JobPostingRepository postings, FeedProperties properties, SourceProperties sourceProperties,
                         PollIntervals intervals, FeedApiUsage usage, Clock clock) {
+        this(adapters, writer, sources, postings, properties, sourceProperties, intervals, usage, clock,
+                FeedMetrics.global());
+    }
+
+    @Autowired
+    public SourcePoller(SourceAdapters adapters, PollWriter writer, FeedSourceRepository sources,
+                        JobPostingRepository postings, FeedProperties properties, SourceProperties sourceProperties,
+                        PollIntervals intervals, FeedApiUsage usage, Clock clock, FeedMetrics metrics) {
+        this.metrics = Objects.requireNonNull(metrics, "metrics");
         this.adapters = adapters;
         this.writer = writer;
         this.sources = sources;
@@ -107,7 +119,13 @@ public class SourcePoller {
         } catch (RuntimeException e) {
             outcome = unexpected(source, e);
         }
-        logOutcome(source, outcome, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+        long latencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        logOutcome(source, outcome, latencyMs);
+        metrics.poll(source.kind(), outcome, latencyMs);
+        // the claim-time snapshot: a source without a baseline is on its first (baseline) poll
+        if (outcome instanceof PollOutcome.Ok ok && source.baselineAt() != null) {
+            metrics.newPostings(source.kind(), ok.stats().created());
+        }
         return outcome;
     }
 

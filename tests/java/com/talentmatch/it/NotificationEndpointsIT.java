@@ -18,6 +18,14 @@ import org.springframework.boot.test.system.OutputCaptureExtension;
 @ExtendWith(OutputCaptureExtension.class)
 class NotificationEndpointsIT extends AbstractNotifyIT {
 
+    @org.springframework.beans.factory.annotation.Autowired
+    private io.micrometer.core.instrument.MeterRegistry meters;
+
+    private double notificationMeterTotal() {
+        return meters.find(com.talentmatch.notify.NotifyMetrics.NOTIFICATIONS).counters().stream()
+                .mapToDouble(io.micrometer.core.instrument.Counter::count).sum();
+    }
+
     private static void assertNoSecrets(Res r) {
         assertThat(r.body()).doesNotContain(SMTP_PASSWORD).doesNotContain(SMTP_LOGIN).doesNotContain(TO)
                 .doesNotContain(FROM_ADDRESS).doesNotContain("zqowner").doesNotContain("zqalerts");
@@ -105,6 +113,7 @@ class NotificationEndpointsIT extends AbstractNotifyIT {
 
     @Test
     void testSendDeliversThenRateLimits(CapturedOutput output) throws Exception {
+        double notificationsBefore = notificationMeterTotal();
         Res r = api.post("/api/notifications/test", "");
         assertThat(r.status()).as("%s", r).isEqualTo(200);
         JsonNode b = r.json();
@@ -120,6 +129,8 @@ class NotificationEndpointsIT extends AbstractNotifyIT {
         assertThat(got[0].getHeader("Auto-Submitted", null)).isEqualTo("auto-generated");
         assertThat(String.valueOf(got[0].getContent())).contains("Notifications: disabled");
         assertThat(countRows("feed_notification")).as("no row for a test").isZero();
+        assertThat(notificationMeterTotal()).as("step 11: the test email is not counted")
+                .isEqualTo(notificationsBefore);
 
         Res again = api.post("/api/notifications/test", "");
         JsonNode err = assertError(again, 429, "NOTIFICATION_TEST_RATE_LIMITED");
