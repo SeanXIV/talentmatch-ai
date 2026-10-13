@@ -3,11 +3,13 @@ package com.talentmatch.feed.skills;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.regex.Matcher;
@@ -38,6 +40,7 @@ public final class DictionarySkillMatcher {
 
     private static final String BEFORE = "(?<![\\p{L}\\p{N}+#.])";
     private static final String AFTER = "(?![\\p{L}\\p{N}+#])";
+    private static final Pattern WHITESPACE = Pattern.compile("\\s+");
     private static final Pattern TECH_CONTEXT = Pattern.compile(
             "(?iu)\\b(?:languages?|frameworks?|experience with|stacks?|developers?|engineers?)\\b");
 
@@ -52,6 +55,8 @@ public final class DictionarySkillMatcher {
     }
 
     private final List<CompiledTerm> terms;
+    /** Each skill's name and alias patterns (AI grounding). */
+    private final Map<UUID, List<Pattern>> patternsBySkill;
 
     public DictionarySkillMatcher(Collection<Term> terms, Collection<String> ambiguousNames) {
         Set<String> ambiguous = new HashSet<>();
@@ -75,6 +80,12 @@ public final class DictionarySkillMatcher {
                     text.toLowerCase(Locale.ROOT), isAmbiguous));
         }
         this.terms = List.copyOf(compiled);
+        Map<UUID, List<Pattern>> bySkill = new HashMap<>();
+        for (CompiledTerm ct : compiled) {
+            bySkill.computeIfAbsent(ct.term().skillId(), id -> new ArrayList<>()).add(ct.pattern());
+        }
+        bySkill.replaceAll((id, patterns) -> List.copyOf(patterns));
+        this.patternsBySkill = Map.copyOf(bySkill);
     }
 
     /** Matches in the title and description together (title first, as its own paragraph). */
@@ -144,5 +155,57 @@ public final class DictionarySkillMatcher {
 
     public int termCount() {
         return terms.size();
+    }
+
+    /**
+     * True when {@code text} mentions {@code term} by the matcher's rules: token boundaries, and
+     * case-sensitive for terms of {@value #CASE_SENSITIVE_MAX_LENGTH} characters or fewer (AI grounding,
+     * §4.7). No ambiguity check: the caller already has the phrase that names the skill.
+     */
+    public static boolean mentions(String text, String term) {
+        if (text == null || term == null || term.isBlank()) {
+            return false;
+        }
+        String t = term.strip();
+        int flags = t.length() <= CASE_SENSITIVE_MAX_LENGTH ? 0 : Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE;
+        return Pattern.compile(BEFORE + Pattern.quote(t) + AFTER, flags).matcher(text).find();
+    }
+
+    /**
+     * True when {@code text} mentions the skill by its stored name or one of its stored aliases, by the
+     * matcher's boundary and case rules (AI grounding, §4.7). No ambiguity check, as {@link #mentions}.
+     */
+    public boolean mentionsSkill(String text, UUID skillId) {
+        if (text == null || skillId == null) {
+            return false;
+        }
+        for (Pattern p : patternsBySkill.getOrDefault(skillId, List.of())) {
+            if (p.matcher(text).find()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The phrase {@code evidence} as it appears in {@code text}: its words in order, separated by any
+     * whitespace (line breaks included), ignoring case, starting and ending on token boundaries. Empty
+     * when the text doesn't contain it.
+     */
+    public static Optional<String> locate(String text, String evidence) {
+        if (text == null || evidence == null || evidence.isBlank()) {
+            return Optional.empty();
+        }
+        StringBuilder regex = new StringBuilder(BEFORE);
+        String[] tokens = WHITESPACE.split(evidence.strip());
+        for (int i = 0; i < tokens.length; i++) {
+            if (i > 0) {
+                regex.append("\\s+");
+            }
+            regex.append(Pattern.quote(tokens[i]));
+        }
+        regex.append(AFTER);
+        Matcher m = Pattern.compile(regex.toString(), Pattern.CASE_INSENSITIVE | Pattern.UNICODE_CASE).matcher(text);
+        return m.find() ? Optional.of(m.group()) : Optional.empty();
     }
 }

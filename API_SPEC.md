@@ -453,7 +453,14 @@ adding a skill or alias re-processes every open job (no repeat notifications).
   `WORK_PERMIT`. `flags`: `LOCATION_UNKNOWN`, `REMOTE_ELIGIBILITY_UNKNOWN`, `SALARY_OTHER_CURRENCY`,
   `IMMEDIATE_START` (never filter).
 - `skills[].source`: `DICTIONARY`, `AI` or `BOTH`. `aiSuggestions` (`{name, requirement, evidence}`)
-  are skills the AI found that aren't in the vocabulary; they are never created automatically.
+  are skills the AI found that aren't in the vocabulary; they are never created automatically (add
+  one with `POST /skills` or as an alias, and open jobs are re-matched).
+- `enrichmentStatus`: the background AI stage. `PENDING` (waiting, or retrying after a failure),
+  `RUNNING`, `SUCCEEDED`, `FAILED` (after 3 tries; the job keeps its dictionary skills) or `SKIPPED`
+  (AI is off; skipped open jobs are queued again when the app starts with AI on). The AI only adds
+  skills it can quote from the posting, decides required vs nice-to-have, and a job it changes is
+  re-scored (it can then be notified, once, if it is still new). It runs at most 30 calls an hour and
+  waits while a CV extraction uses the local model.
 - `notification` is `null` when none was queued.
 - `sources` lists every posting of the job (several providers can post the same job).
 
@@ -472,7 +479,8 @@ adding a skill or alias re-processes every open job (no repeat notifications).
                      "pending": 1, "failedLast24h": 0, "paused": false, "pausedUntil": null, "lastError": null },
   "sources": { "total": 4, "active": 3, "failing": 1, "lastSuccessAt": "…" },
   "aggregator": { "configured": true, "requestsToday": 37, "dailyBudget": 200 },
-  "processing": { "pending": 12 } }
+  "processing": { "pending": 12 },
+  "enrichment": { "pending": 3, "running": 1, "failed": 0, "modelBusy": false, "aiEnabled": true } }
 ```
 - `schedulerEnabled`: sources are polled and their jobs processed automatically (the feed and its
   scheduler are both on).
@@ -481,6 +489,9 @@ adding a skill or alias re-processes every open job (no repeat notifications).
 - `preferences.present`: `false` means the feed is not filtered.
 - `sources.failing`: ACTIVE sources whose last poll failed.
 - `processing.pending`: feed jobs waiting to be processed (skills, filter, score).
+- `enrichment`: open jobs waiting for, in, or failed by the AI stage; `modelBusy` while a CV
+  extraction holds the local model; `aiEnabled` false when AI is off (or
+  `talentmatch.feed.skills.enrichment.enabled=false`).
 - `aggregator`: whether the Adzuna keys are set, and the requests counted against today's (UTC)
   budget, probes included.
 - `notifications`: the saved settings (`enabled`, `channel`, `minScore`), whether the channel is

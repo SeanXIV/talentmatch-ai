@@ -126,7 +126,9 @@ public class FeedJobRepository {
     /**
      * Writes the canonical fields (§4.4) and hands the job to the processor ({@code process_after}).
      * When the description changed ({@code description_hash} differs), AI enrichment starts over:
-     * PENDING, attempts 0, no failure, no wait. The {@code job} row is only updated when its title,
+     * PENDING, attempts 0, no failure, no wait, the old AI skills, model and time are cleared (NULL) and
+     * the AI suggestions are reset to an empty array (the column is NOT NULL). The {@code job} row is
+     * only updated when its title,
      * company or description changed, so an unchanged job keeps its {@code updated_at} (cached
      * matches stay fresh).
      */
@@ -162,6 +164,12 @@ public class FeedJobRepository {
                 + "enrichment_attempts = CASE WHEN " + changed + " THEN 0 ELSE enrichment_attempts END, "
                 + "enrichment_failure = CASE WHEN " + changed + " THEN NULL ELSE enrichment_failure END, "
                 + "enrichment_not_before = CASE WHEN " + changed + " THEN NULL ELSE enrichment_not_before END, "
+                // the old description's AI skills must not outlive it (a failed or skipped re-run keeps none)
+                + "ai_skills = CASE WHEN " + changed + " THEN NULL ELSE ai_skills END, "
+                // ai_suggestions is NOT NULL DEFAULT '[]' (V5): reset to empty, never NULL
+                + "ai_suggestions = CASE WHEN " + changed + " THEN '[]'::jsonb ELSE ai_suggestions END, "
+                + "enrichment_model = CASE WHEN " + changed + " THEN NULL ELSE enrichment_model END, "
+                + "enriched_at = CASE WHEN " + changed + " THEN NULL ELSE enriched_at END, "
                 + "description_hash = CAST(:hash AS char(64)), process_after = :now "
                 + "WHERE job_id = :id", params);
     }

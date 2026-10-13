@@ -1,6 +1,8 @@
 package com.talentmatch.ai.config;
 
 import com.talentmatch.ai.AiProperties;
+import com.talentmatch.feed.skills.JobSkillExtractionModel;
+import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.profile.ProfileProperties;
 import com.talentmatch.profile.ResumeExtractionModel;
 import dev.langchain4j.model.chat.Capability;
@@ -33,6 +35,14 @@ public class OpenAiChatModelConfig {
     public ResumeExtractionModel openAiResumeExtractionModel(AiProperties ai, ProfileProperties profile) {
         ProfileProperties.Extraction x = profile.extraction();
         return ResumeExtractionModel.remote(build(ai, x.callTimeout(), x.maxOutputTokens(), x.temperature(), false),
+                ModelInfo.of(ai).label());
+    }
+
+    /** Same model for job-skill enrichment (§4.7; postings are public, decision m). Strict schema. */
+    @Bean
+    public JobSkillExtractionModel openAiJobSkillExtractionModel(AiProperties ai, SkillsProperties skills) {
+        SkillsProperties.Enrichment e = skills.enrichment();
+        return JobSkillExtractionModel.remote(build(ai, e.callTimeout(), e.maxOutputTokens(), e.temperature(), true),
                 ModelInfo.of(ai).label());
     }
 

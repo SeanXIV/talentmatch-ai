@@ -946,6 +946,7 @@ talentmatch:
         failure-backoff: 5m
         busy-retry: 60s
         max-per-hour: 30
+        sweep: 60s                          # how often the stage looks for work without being woken (1s..1h)
   notify:
     zone: Africa/Johannesburg
     app-base-url: ${NOTIFY_APP_BASE_URL:http://127.0.0.1:8080}   # only used for the "Details:" link
@@ -1200,6 +1201,27 @@ Steps 2–3 and 4–5 can run in parallel. Steps 8 and 9 depend only on 7.
    - Keys Adzuna rejects on `POST /feed/sources` with `verify` → 400 on `kind` (not a warning): every poll would fail.
    - A failing page 2 is ignored (page 1 is written). Page 2 counts against the budget.
    - A derived search whose key matches an owner-added search is not created.
+   **Step 10 deviations from this spec:**
+   - `JobSkillEnrichmentService` and its SQL (`FeedEnrichmentRepository`) live in `feed`, not `feed.skills`: they need `FeedJobRepository`/`FeedProcessor`, and `feed.skills` must not depend on `feed` (no cycles). Prompts, schema, validator, model holder, `EnrichmentFailure` and `SkillsProperties` are in `feed.skills`.
+   - Prompt: the posting is fenced and fence tags inside it neutralized (as the CV prompt), not HTML-escaped like explanations, so the evidence the model quotes can be checked against the text exactly.
+   - Grounding: the evidence is located in the posting text itself (its words in order on token boundaries, any whitespace between them, case ignored); no match → ungrounded. The skill must then be named in that span of the posting, not in the model's copy: a vocabulary skill by its stored name or a stored alias under the dictionary's boundary and case rules (`DictionarySkillMatcher.mentionsSkill`; "go" in "ready to go" is not Go, "rust" in "trust" is nothing), a name outside the vocabulary as written. An alias the model wrote ("postgres") is grounded when the span names the skill ("PostgreSQL").
+   - Hourly cap checked before claiming (nothing claimed and released, as notifications D3); the run stops when it is reached.
+   - REFUSED and INVALID_OUTPUT retry after `failure-backoff` without pausing the stage; a prompt that overflowed the context fails at once (INVALID_OUTPUT), since it would be cut again.
+   - Claude gets at least 4000 output tokens for enrichment (adaptive thinking).
+   - `FeedRecovery` also re-queues open SKIPPED jobs when AI is available (they were skipped while it was off).
+   - The `talentmatch.feed.enrichments` timer (§6.6) is recorded now. Outcome tags: `success`, `discarded`, `invalid_output`, `refused`, `context_overflow`, `timeout`, `provider_error`, `db_error`.
+   - `feedAiExecutor` has queue capacity 1 with `DiscardPolicy` (the spec said 0), as the processor's executor: one follow-up run is queued, further wake-ups are dropped.
+   - The claim puts `enrichment_attempts < :max` inside the row-picking subquery, so one exhausted row can't block the queue.
+   - The claim requires a non-null description; PENDING jobs without one are SKIPPED at the start of each run (dictionary only). A later description change resets them to PENDING; `FeedRecovery` does not re-queue SKIPPED jobs that still have no description.
+   - Finishing writes are guarded by `description_hash`: an answer for a description that changed meanwhile is DISCARDED (outcome `discarded`), nothing written.
+   - Status `modelBusy` means the local model's exclusive hold (a CV extraction) is held, nothing else.
+   - A description change also clears `ai_skills`, `enrichment_model` and `enriched_at` (to NULL) and resets `ai_suggestions` to `[]` (the column is NOT NULL), with the reset to PENDING in `applyCanonical`, so stale AI skills never outlive their description, even if re-enrichment fails or is skipped.
+   - Provider faults (TIMEOUT / PROVIDER_ERROR) don't count attempts: the job goes back to PENDING with its attempt given back, and the stage pauses `failure-backoff`. The pause bounds the retries, so a provider fault never makes a job FAILED; only REFUSED and INVALID_OUTPUT count toward `max-attempts`. (Supersedes "After `max-attempts` → FAILED/<kind>" for TIMEOUT / PROVIDER_ERROR in §4.7.)
+   - Only the model call is classified by `FailureKind`. A database error while storing a model's answer does not pause the stage: the job goes back to PENDING (attempt given back, after `busy-retry`) and the run ends (outcome `db_error`). A failed release or FAILED write is logged and left for `FeedRecovery`.
+   - `FeedRecovery` resets enrichment rows right after releasing the leases (§6.3 step 2), before reconciling the applied versions and the Adzuna searches.
+   - The company name is untrusted: its line goes inside the `<job_posting>` fence, cleaned like the posting and cut to 200 characters. Fence tags are neutralized in any spelling (`</job_posting >`, `< /job_posting>`, `<job_posting x>`).
+   - Ollama's context-budget check for enrichment runs only when `skills.enrichment.enabled` is true.
+   - Known limit: the pause and the hourly window are in memory per instance (single-instance assumption).
 6. LangChain4j 1.20.2: the hand-built `ResponseFormat` schema works for this shape on Ollama (same approach as `ProfileJsonSchema`).
 
 Until the owner answers §0, build with the recommended defaults. Only the modules marked against each decision would change.

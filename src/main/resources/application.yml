@@ -129,6 +129,22 @@ talentmatch:
       daily-request-budget: 200       # all Adzuna requests per UTC day (polls, page 2, probes); spread over the searches
       derived-queries: 3              # searches from the target titles (plus "remote" when remote jobs are wanted)
       unseen-close-after: 14d         # an Adzuna posting unseen this long is closed
+    # Skill extraction (com.talentmatch.feed.skills.SkillsProperties). Stage 1 is the dictionary (skill
+    # names + aliases); stage 2, below, asks the AI model in the background and keeps only skills it can
+    # quote from the posting. Unknown skills become suggestions; nothing is created automatically.
+    skills:
+      max-description-chars: 8000     # posting text sent to the model; with Ollama it must fit context-tokens
+      ambiguous-names: [Go, Swift, Rust, Spark, Chef, Puppet, Ruby]   # count only near other tech words
+      enrichment:
+        enabled: true                 # false (or AI off): jobs keep their dictionary skills only
+        call-timeout: 5m
+        max-output-tokens: 600        # Claude gets at least 4000 (adaptive thinking)
+        temperature: 0.0
+        max-attempts: 3
+        failure-backoff: 5m           # after a timeout/provider error the job and the stage wait this long
+        busy-retry: 60s               # the local model is busy with a CV extraction
+        max-per-hour: 30              # model calls per sliding hour
+        sweep: 60s
 
   # Email notifications (Phase 5, com.talentmatch.notify.NotifyProperties). Email is off until SMTP_HOST,
   # NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO are set, and nothing is sent until the owner turns notifications

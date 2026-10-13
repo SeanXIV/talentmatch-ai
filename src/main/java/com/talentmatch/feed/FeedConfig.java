@@ -1,6 +1,7 @@
 package com.talentmatch.feed;
 
 import com.talentmatch.ai.config.MdcTaskDecorator;
+import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.feed.source.SourceProperties;
 import com.talentmatch.notify.NotificationDispatcher;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -24,6 +25,9 @@ import org.springframework.scheduling.config.ScheduledTaskRegistrar;
  *       {@code talentmatch.feed.scheduler.enabled} are both true (both default to true; tests set the
  *       scheduler off and call {@link FeedScheduler#tick()} themselves). The tick delays come from
  *       {@link FeedProperties.Scheduler}.</li>
+ *   <li>{@code feedAiExecutor}: the single {@code feed-ai-} thread of {@link JobSkillEnrichmentService}
+ *       (one follow-up run queued, further wake-ups dropped); its sweep ({@code skills.enrichment.sweep},
+ *       60s) is registered with the scheduler tick, like the processor's.</li>
  *   <li>{@code feedProcessorExecutor}: the single {@code feed-proc-} thread of {@link FeedProcessor}. Its
  *       sweep ({@code processor.sweep}, 30s) is registered with the scheduler tick, so the processor runs
  *       in the background exactly when the poller does; tests call {@link FeedProcessor#processDue()}.</li>
@@ -34,6 +38,22 @@ public class FeedConfig {
 
     public static final String POLL_EXECUTOR = "feedPollExecutor";
     public static final String PROCESSOR_EXECUTOR = "feedProcessorExecutor";
+    public static final String AI_EXECUTOR = "feedAiExecutor";
+
+    /** One {@code feed-ai-} thread; a queued follow-up run covers further wake-ups (as the processor). */
+    @Bean(AI_EXECUTOR)
+    public ThreadPoolTaskExecutor feedAiExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(1);
+        executor.setMaxPoolSize(1);
+        executor.setQueueCapacity(1);
+        executor.setThreadNamePrefix("feed-ai-");
+        executor.setTaskDecorator(new MdcTaskDecorator());
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.DiscardPolicy());
+        // A shutdown interrupts a running call; the job is left RUNNING and FeedRecovery resets it.
+        executor.setWaitForTasksToCompleteOnShutdown(false);
+        return executor;
+    }
 
     /**
      * One {@code feed-proc-} thread. The queue holds a single follow-up run: a wake-up while a run is in
@@ -81,13 +101,18 @@ public class FeedConfig {
         private final FeedProperties properties;
         private final ObjectProvider<FeedProcessor> processor;
         private final ObjectProvider<NotificationDispatcher> dispatcher;
+        private final ObjectProvider<JobSkillEnrichmentService> enrichment;
+        private final SkillsProperties skills;
 
         FeedSchedulingConfig(FeedScheduler scheduler, FeedProperties properties,
-                             ObjectProvider<FeedProcessor> processor, ObjectProvider<NotificationDispatcher> dispatcher) {
+                             ObjectProvider<FeedProcessor> processor, ObjectProvider<NotificationDispatcher> dispatcher,
+                             ObjectProvider<JobSkillEnrichmentService> enrichment, SkillsProperties skills) {
             this.scheduler = scheduler;
             this.properties = properties;
             this.processor = processor;
             this.dispatcher = dispatcher;
+            this.enrichment = enrichment;
+            this.skills = skills;
         }
 
         @Override
@@ -104,6 +129,11 @@ public class FeedConfig {
             NotificationDispatcher d = dispatcher.getIfAvailable();
             if (d != null) {
                 registrar.addFixedDelayTask(new FixedDelayTask(d::wake, properties.processor().sweep(),
+                        s.initialDelay()));
+            }
+            JobSkillEnrichmentService e = enrichment.getIfAvailable();
+            if (e != null) {
+                registrar.addFixedDelayTask(new FixedDelayTask(e::wake, skills.enrichment().sweep(),
                         s.initialDelay()));
             }
         }

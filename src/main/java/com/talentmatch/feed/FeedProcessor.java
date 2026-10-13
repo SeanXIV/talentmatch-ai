@@ -84,6 +84,7 @@ public class FeedProcessor {
     private final NotificationRepository notifications;
     private final NotificationChannels channels;
     private final NotificationDispatcher dispatcher;
+    private final JobSkillEnrichmentService enrichment;
     private final FeedProperties properties;
     private final TransactionTemplate tx;
     private final ThreadPoolTaskExecutor executor;
@@ -93,10 +94,12 @@ public class FeedProcessor {
                          PreferencesRepository preferences, OwnerProfileRepository profiles, FeedScorer scorer,
                          MatchJdbcRepository matches,
                          NotificationSettingsRepository settings, NotificationRepository notifications,
-                         NotificationChannels channels, NotificationDispatcher dispatcher, FeedProperties properties,
+                         NotificationChannels channels, NotificationDispatcher dispatcher,
+                         JobSkillEnrichmentService enrichment, FeedProperties properties,
                          PlatformTransactionManager transactionManager,
                          @Qualifier(FeedConfig.PROCESSOR_EXECUTOR) ThreadPoolTaskExecutor executor, Clock clock) {
         this.dispatcher = dispatcher;
+        this.enrichment = enrichment;
         this.jobs = jobs;
         this.dictionary = dictionary;
         this.refresh = refresh;
@@ -183,6 +186,7 @@ public class FeedProcessor {
         }
         if (total > 0) {
             log.info("Feed processor: processed={}", total);
+            enrichment.wake();                                  // step 6: new or changed jobs wait for the AI stage
         }
         return total;
     }
@@ -322,7 +326,7 @@ public class FeedProcessor {
                 notifications.existsForJob(jobId)), now, properties.freshWindow());
         boolean queued = decision.shouldNotify() && notifications.insertIfAbsent(jobId, channel, score, now);
 
-        // 6: AI enrichment of PENDING jobs is woken here with step 10.
+        // 6: AI enrichment of PENDING jobs is woken once the run ends (processDue).
 
         jobs.markProcessed(jobId, new FeedJobRepository.Processed(
                 FeedJobJson.write(result.dictionarySkills()),

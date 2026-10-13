@@ -6,7 +6,7 @@ import java.time.Instant;
 /**
  * The feed's state for {@code GET /api/feed/status} (§5.2). Step 6 filled the poller's part; step 7
  * adds the profile and preferences the processor works against; step 8 the notifications; step 9
- * the aggregator. The enrichment and detection parts join with later steps.
+ * the aggregator; step 10 the AI enrichment. The detection part joins with step 11.
  *
  * @param enabled          {@code talentmatch.feed.enabled}
  * @param schedulerEnabled the scheduler polls (and the processor runs) on its own: the feed and its
@@ -14,7 +14,7 @@ import java.time.Instant;
  */
 public record FeedStatusView(boolean enabled, boolean schedulerEnabled, Profile profile, Preferences preferences,
                              Notifications notifications, Sources sources, Aggregator aggregator,
-                             Processing processing) {
+                             Processing processing, Enrichment enrichment) {
 
     /**
      * Notification delivery (§5.2, step 8). {@code paused}, {@code pausedUntil} and {@code lastError} are
@@ -62,6 +62,16 @@ public record FeedStatusView(boolean enabled, boolean schedulerEnabled, Profile 
      * @param dailyBudget   {@code talentmatch.feed.adzuna.daily-request-budget}
      */
     public record Aggregator(boolean configured, int requestsToday, int dailyBudget) {
+    }
+
+    /**
+     * AI enrichment of open feed jobs (§5.2).
+     *
+     * @param failed    open jobs whose enrichment FAILED (they keep their dictionary skills)
+     * @param modelBusy a CV extraction holds the local model right now
+     * @param aiEnabled a model exists and {@code talentmatch.feed.skills.enrichment.enabled} is true
+     */
+    public record Enrichment(long pending, long running, long failed, boolean modelBusy, boolean aiEnabled) {
     }
 
     /** @param pending feed jobs waiting for the processor ({@code process_after} set) */

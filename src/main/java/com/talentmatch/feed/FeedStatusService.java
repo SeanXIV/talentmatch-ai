@@ -15,7 +15,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 /**
  * {@code GET /api/feed/status} (§5.2): switches, profile and preferences versions, notifications,
- * sources, the Adzuna budget and the processing backlog.
+ * sources, the Adzuna budget, the processing backlog and AI enrichment.
  */
 @Service
 public class FeedStatusService {
@@ -34,12 +34,17 @@ public class FeedStatusService {
     private final FeedProperties properties;
     private final FeedApiUsage usage;
     private final SourceProperties.Adzuna adzuna;
+    private final FeedEnrichmentRepository enrichmentRows;
+    private final JobSkillEnrichmentService enrichment;
 
     public FeedStatusService(FeedSourceRepository sources, FeedJobRepository jobs, FeedStateRepository state,
                              OwnerProfileRepository profiles, PreferencesRepository preferences,
                              NotificationSettingsRepository notificationSettings, NotificationRepository notifications,
                              NotificationChannels channels, NotificationDispatcher dispatcher,
-                             FeedProperties properties, FeedApiUsage usage, SourceProperties sourceProperties) {
+                             FeedProperties properties, FeedApiUsage usage, SourceProperties sourceProperties,
+                             FeedEnrichmentRepository enrichmentRows, JobSkillEnrichmentService enrichment) {
+        this.enrichmentRows = enrichmentRows;
+        this.enrichment = enrichment;
         this.sources = sources;
         this.jobs = jobs;
         this.state = state;
@@ -74,6 +79,12 @@ public class FeedStatusService {
                 new FeedStatusView.Sources(counts.total(), counts.active(), counts.failing(), counts.lastSuccessAt()),
                 new FeedStatusView.Aggregator(adzuna.configured(), usage.requestsToday(SourceKind.ADZUNA),
                         adzuna.dailyRequestBudget()),
-                new FeedStatusView.Processing(jobs.countPendingProcessing()));
+                new FeedStatusView.Processing(jobs.countPendingProcessing()),
+                enrichment(enrichmentRows.counts()));
+    }
+
+    private FeedStatusView.Enrichment enrichment(FeedEnrichmentRepository.Counts c) {
+        return new FeedStatusView.Enrichment(c.pending(), c.running(), c.failed(), enrichment.modelBusy(),
+                enrichment.aiEnabled());
     }
 }
