@@ -20,12 +20,15 @@ import com.talentmatch.feed.FeedSourceService.SourceOptions;
 import com.talentmatch.feed.source.BoardInfo;
 import com.talentmatch.feed.source.SourceFailure;
 import com.talentmatch.feed.source.SourceKind;
+import com.talentmatch.feed.source.SourceProperties;
 import com.talentmatch.service.exception.ApiException;
 import com.talentmatch.service.exception.ConflictException;
 import com.talentmatch.service.exception.NotFoundException;
 import com.talentmatch.service.exception.RequestValidationException;
 import com.talentmatch.web.error.ErrorCode;
 import com.talentmatch.web.error.FieldErrorDto;
+import java.net.URI;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -43,13 +46,15 @@ class FeedSourceServiceTest {
 
     private FeedSourceRepository repo;
     private SourceProber prober;
+    private FeedApiUsage usage;
     private FeedSourceService service;
 
     @BeforeEach
     void setUp() {
         repo = mock(FeedSourceRepository.class);
         prober = mock(SourceProber.class);
-        service = new FeedSourceService(repo, prober, FeedProperties.defaults());
+        usage = mock(FeedApiUsage.class);
+        service = service(SourceProperties.defaults());
         when(repo.findByKey(anyString())).thenReturn(Optional.empty());
         when(repo.insertIfAbsent(any())).thenAnswer(inv -> {
             FeedSourceRepository.NewSource n = inv.getArgument(0);
@@ -63,6 +68,21 @@ class FeedSourceServiceTest {
         Instant now = Instant.now();
         return new FeedSource(id, key, kind, managedBy, state, companyName, token, options, interval, now, null, null,
                 null, null, null, 0, null, null, null, null, null, 0, now, now);
+    }
+
+    private FeedSourceService service(SourceProperties sourceProperties) {
+        return new FeedSourceService(repo, prober, FeedProperties.defaults(),
+                new PollIntervals(repo, FeedProperties.defaults(), sourceProperties), usage, sourceProperties);
+    }
+
+    /** Adzuna keys set, budget 200. */
+    private static SourceProperties withAdzunaKeys() {
+        return new SourceProperties(5000, null, null, null, null, new SourceProperties.Adzuna(
+                URI.create("https://api.adzuna.com"), "id", "key", "za", 50, 2, 200, 3, Duration.ofDays(14)));
+    }
+
+    private static NewSource adzuna(String what, String where) {
+        return new NewSource(SourceKind.ADZUNA, null, null, new SourceOptions(null, what, where), null, null);
     }
 
     private static NewSource req(SourceKind kind, String token) {
@@ -93,7 +113,7 @@ class FeedSourceServiceTest {
     void kindMissing() {
         Map<String, String> errors = createErrors(req(null, "acme"));
         assertThat(errors).containsOnlyKeys("kind");
-        assertThat(errors.get("kind")).contains("kind is required").contains("GREENHOUSE, LEVER or ASHBY");
+        assertThat(errors.get("kind")).contains("kind is required").contains("GREENHOUSE, LEVER, ASHBY or ADZUNA");
         verifyNoInteractions(prober);
         verify(repo, never()).insertIfAbsent(any());
     }
@@ -103,12 +123,94 @@ class FeedSourceServiceTest {
         assertThat(createErrors(null)).containsKey("kind");
     }
 
+    // ------------------------------------------------------------------ Adzuna searches
+
     @Test
-    void adzunaRejected() {
-        Map<String, String> errors = createErrors(req(SourceKind.ADZUNA, null));
+    void adzunaWithoutKeysIsRejectedOnKind() {
+        Map<String, String> errors = createErrors(adzuna("java developer", null));
         assertThat(errors).containsOnlyKeys("kind");
-        assertThat(errors.get("kind")).contains("Adzuna sources can't be added yet");
+        assertThat(errors.get("kind")).contains("ADZUNA_APP_ID").contains("ADZUNA_APP_KEY");
+        verifyNoInteractions(prober, usage);
+    }
+
+    @Test
+    void adzunaNeedsWhatAndNoToken() {
+        service = service(withAdzunaKeys());
+        Map<String, String> errors = createErrors(new NewSource(SourceKind.ADZUNA, "acme", null,
+                new SourceOptions("eu", "  ", "x".repeat(101)), null, null));
+        assertThat(errors).containsOnlyKeys("boardToken", "options.leverInstance", "options.what", "options.where");
+        assertThat(errors.get("options.what")).contains("required");
+        assertThat(errors.get("options.where")).contains("at most 100");
+        assertThat(createErrors(adzuna("x".repeat(101), null))).containsOnlyKeys("options.what");
+        assertThat(createErrors(new NewSource(SourceKind.ADZUNA, null, null, new SourceOptions(null, "java", null),
+                300, null))).containsOnlyKeys("pollIntervalSeconds");
+        verifyNoInteractions(prober, usage);
+    }
+
+    @Test
+    void adzunaSearchStoredWithCountryAndTidiedTermsAndProbeCountsAgainstBudget() {
+        service = service(withAdzunaKeys());
+        when(usage.tryConsume(SourceKind.ADZUNA, 200)).thenReturn(true);
+        when(prober.probe(eq(SourceKind.ADZUNA), any(), anyMap()))
+                .thenReturn(new SourceProber.Found(new BoardInfo(null, 12, null)));
+
+        FeedSourceView view = service.create(adzuna("  Java\n  Developer ", "Cape Town"));
+
+        ArgumentCaptor<FeedSourceRepository.NewSource> saved = ArgumentCaptor.forClass(FeedSourceRepository.NewSource.class);
+        verify(repo).insertIfAbsent(saved.capture());
+        assertThat(saved.getValue().boardToken()).isNull();
+        assertThat(saved.getValue().managedBy()).isEqualTo(SourceManagedBy.OWNER);
+        assertThat(saved.getValue().options())
+                .containsExactlyInAnyOrderEntriesOf(Map.of("country", "za", "what", "Java Developer", "where", "Cape Town"));
+        assertThat(saved.getValue().sourceKey()).startsWith("adzuna:za:")
+                .isEqualTo(SourceKeys.sourceKey(SourceKind.ADZUNA, null, Map.of("country", "za",
+                        "what", "java developer", "where", "cape town")));
+        verify(usage).tryConsume(SourceKind.ADZUNA, 200);
+        assertThat(view.warnings()).isEmpty();
+        assertThat(view.effectivePollIntervalSeconds()).isEqualTo(900);
+    }
+
+    @Test
+    void adzunaBudgetSpentSkipsTheCheckWithAWarning() {
+        service = service(withAdzunaKeys());
+        when(usage.tryConsume(SourceKind.ADZUNA, 200)).thenReturn(false);
+        FeedSourceView view = service.create(adzuna("java", null));
         verifyNoInteractions(prober);
+        assertThat(view.warnings()).singleElement().asString().contains("budget is used up");
+        verify(repo).insertIfAbsent(any());
+    }
+
+    @Test
+    void adzunaRejectedKeysAre400OnKind() {
+        service = service(withAdzunaKeys());
+        when(usage.tryConsume(SourceKind.ADZUNA, 200)).thenReturn(true);
+        when(prober.probe(eq(SourceKind.ADZUNA), any(), anyMap()))
+                .thenReturn(new SourceProber.Unchecked(SourceFailure.Kind.UNAUTHORIZED));
+        Map<String, String> errors = createErrors(adzuna("java", null));
+        assertThat(errors).containsOnlyKeys("kind");
+        assertThat(errors.get("kind")).contains("Adzuna rejected");
+        verify(repo, never()).insertIfAbsent(any());
+    }
+
+    @Test
+    void adzunaNoResultsWarningAndUnreachableWordsSearch() {
+        service = service(withAdzunaKeys());
+        when(usage.tryConsume(SourceKind.ADZUNA, 200)).thenReturn(true);
+        when(prober.probe(eq(SourceKind.ADZUNA), any(), anyMap()))
+                .thenReturn(new SourceProber.Unchecked(SourceFailure.Kind.TIMEOUT));
+        assertThat(service.create(adzuna("java", null)).warnings()).singleElement().asString()
+                .contains("check the search");
+    }
+
+    @Test
+    void adzunaEffectiveIntervalSharesTheBudget() {
+        service = service(withAdzunaKeys());
+        when(repo.countActive(SourceKind.ADZUNA)).thenReturn(4);
+        when(usage.tryConsume(SourceKind.ADZUNA, 200)).thenReturn(true);
+        when(prober.probe(eq(SourceKind.ADZUNA), any(), anyMap()))
+                .thenReturn(new SourceProber.Found(new BoardInfo(null, 3, null)));
+        // 24h × 4 / 200 = 1728s, above the 900s default
+        assertThat(service.create(adzuna("java", null)).effectivePollIntervalSeconds()).isEqualTo(1728);
     }
 
     @Test

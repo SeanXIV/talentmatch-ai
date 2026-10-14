@@ -37,4 +37,15 @@ public interface SourceAdapter {
     default Optional<RawPosting> fetchDetail(SourceTarget target, String externalId) {
         return Optional.empty();
     }
+
+    /**
+     * A later page of a paged search (Adzuna); {@link #fetch} is page 1. Always unconditional.
+     * Default: not paged, empty.
+     *
+     * @param page 2 or more
+     * @throws SourceException on any HTTP, network or format failure
+     */
+    default Optional<FetchResult> fetchPage(SourceTarget target, int page) {
+        return Optional.empty();
+    }
 }

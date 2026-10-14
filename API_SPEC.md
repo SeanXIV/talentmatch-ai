@@ -280,7 +280,8 @@ of 3 attempts), the save still succeeds and the next processor run catches up.
 
 ## Job feed sources (Phase 5)
 
-The watchlist of company job boards the feed polls. Each ACTIVE source is polled every
+The watchlist the feed polls: company job boards (Greenhouse, Lever, Ashby) and Adzuna searches
+(`ADZUNA`, South Africa). Each ACTIVE source is polled every
 `effectivePollIntervalSeconds` (±10% jitter) by a background scheduler, or on request with
 `POST /feed/sources/{id}/poll`. The outcome of the last poll is in `lastStatus`:
 
@@ -292,7 +293,8 @@ The watchlist of company job boards the feed polls. Each ACTIVE source is polled
 | `RATE_LIMITED` | the provider said `429` | after its `Retry-After` (at least the interval, at most 1 h), else as `ERROR` |
 | `ERROR` | 5xx, network error or timeout (or saving failed) | interval × 2^failures, at most 1 h |
 | `INVALID_RESPONSE` / `TOO_LARGE` | unreadable listing, more than half of the postings unreadable, or a body over 20 MB; nothing was saved | as `ERROR` |
-| `NOT_FOUND` / `UNAUTHORIZED` | the board is gone or refused access; the source stays `ACTIVE` in case it comes back | after 6 h |
+| `NOT_FOUND` / `UNAUTHORIZED` | the board is gone or refused access; the source stays `ACTIVE` in case it comes back. For Adzuna, also `"Adzuna isn't configured: set ADZUNA_APP_ID and ADZUNA_APP_KEY."` (not counted as a failure) | after 6 h |
+| `BUDGET_EXHAUSTED` | Adzuna only: today's request budget (`talentmatch.feed.adzuna.daily-request-budget`, default 200 per UTC day, shared by every Adzuna search, probes included) is used up. No request is made and no failure is counted | after midnight UTC (+0–5 min) |
 
 A poll whose save loses a database lock conflict with a concurrent update of the same jobs is not a
 failure: nothing is saved, `lastStatus`, `lastError` and `consecutiveFailures` stay as they were, and
@@ -300,7 +302,10 @@ the source is polled again 5–10 s later.
 `consecutiveFailures` resets on `OK`/`NOT_MODIFIED`; `lastError` is a short sanitized note (no
 response body, no URL query, no key). The first successful poll sets `baselineAt`: postings seen
 then count as already known (not new) unless they were published within the last 24 h. A posting
-that leaves a board's listing is closed; one that comes back is reopened.
+that leaves a board's listing is closed; one that comes back is reopened. An Adzuna search is never
+a complete listing: its postings close only after 14 days unseen (`adzuna.unseen-close-after`).
+When page 1 of an Adzuna search is full and everything on it is newer than the last successful
+poll, page 2 is fetched too (within the budget).
 
 **`FeedSourceResponse`**
 ```json
@@ -311,7 +316,18 @@ that leaves a board's listing is closed; one that comes back is reopened.
   "baselineAt": null, "createdAt": "…", "warnings": [] }
 ```
 `effectivePollIntervalSeconds` is the interval actually used: `pollIntervalSeconds`, or the default
-for the kind (company boards: 300), and never below the minimum (company boards: 120).
+for the kind (company boards: 300; Adzuna: 900), and never below the minimum (company boards: 120;
+Adzuna: 600). Adzuna searches share the daily budget, so each one waits at least
+`24 h × active Adzuna searches / budget` (4 searches with a budget of 200: 1728 s).
+
+An Adzuna source has `boardToken: null` and `options: {"country": "za", "what": "java developer",
+"where": "Cape Town"}` (`where` only when set). Sources with `managedBy: "PREFERENCES"` are the
+**derived searches**: one per target title in your preferences (at most 3; with no target titles,
+your confirmed profile's most recent job title), plus `"remote"` when remote jobs are wanted. They
+are kept in step automatically when preferences are saved or the profile is confirmed (and at
+startup), only while the Adzuna keys are set; they can't be edited or deleted here. Adzuna jobs
+show `"via": "Adzuna"` in `sources[]`, link to Adzuna's own page (attribution), and email
+notifications add "Jobs by Adzuna".
 `warnings` is filled only by `POST`. No ETag, body hash or API key is ever returned.
 
 ### `GET /feed/sources`
@@ -329,12 +345,13 @@ for the kind (company boards: 300), and never below the minimum (company boards:
 ```
 | Field | Rule |
 |---|---|
-| `kind` | required: `GREENHOUSE`, `LEVER` or `ASHBY`. `ADZUNA` is not available yet (`400` on `kind`) |
-| `boardToken` | required; `[A-Za-z0-9._-]{1,100}`, the board name from the URL (`boards.greenhouse.io/<token>`, `jobs.lever.co/<site>`, `jobs.ashbyhq.com/<name>`) |
+| `kind` | required: `GREENHOUSE`, `LEVER`, `ASHBY` or `ADZUNA`. `ADZUNA` needs `ADZUNA_APP_ID` and `ADZUNA_APP_KEY` (`400` on `kind` without them) |
+| `boardToken` | company boards: required; `[A-Za-z0-9._-]{1,100}`, the board name from the URL (`boards.greenhouse.io/<token>`, `jobs.lever.co/<site>`, `jobs.ashbyhq.com/<name>`). `ADZUNA`: must be absent |
+| `options.what` / `options.where` | `ADZUNA` only: search terms (required) and location (optional), each at most 100 characters; whitespace is collapsed. The country is `talentmatch.feed.adzuna.country` (`za`) |
 | `companyName` | optional, max 200; Greenhouse fills it from the board when omitted |
 | `options.leverInstance` | Lever only: `"eu"` (jobs.eu.lever.co) or `"global"` (default) |
-| `pollIntervalSeconds` | optional, 120..86400 for company boards |
-| `verify` | default `true`: check the board with the provider first (waits at most 10 s) |
+| `pollIntervalSeconds` | optional, 120..86400 for company boards, 600..86400 for `ADZUNA` |
+| `verify` | default `true`: check the board with the provider first (waits at most 10 s). For `ADZUNA`, runs the search once for one result (counts against the daily budget) |
 
 Greenhouse and Ashby tokens are case-insensitive (`Acme` and `acme` are the same source). **Lever
 site names are case-sensitive** and kept as given.
@@ -344,10 +361,13 @@ site names are case-sensitive** and kept as given.
 - `"Couldn't reach Lever to check the board; it will be checked on the first poll."` (network
   error, timeout or 5xx; the source is saved anyway). Rate limits and odd answers get a similar note.
 - `verify: false` saves without a check and says so.
+- Adzuna: `"The Adzuna search finds no jobs right now; it keeps checking for new ones."`, or
+  `"Today's Adzuna request budget is used up, so the search wasn't checked; …"`.
 
 **Errors:**
 - `400 VALIDATION_FAILED`: invalid fields, or the provider has no such board (field `boardToken`:
-  `"Greenhouse has no job board 'acme'. Check the token in the board URL (boards.greenhouse.io/<token>)."`).
+  `"Greenhouse has no job board 'acme'. Check the token in the board URL (boards.greenhouse.io/<token>)."`),
+  or Adzuna rejected the keys (field `kind`: `"Adzuna rejected ADZUNA_APP_ID / ADZUNA_APP_KEY. …"`).
 - `400 MALFORMED_REQUEST`: unknown fields or an unknown `kind`.
 - `409 FEED_SOURCE_ALREADY_EXISTS`: `"Lever site 'acme' is already on your watchlist (source id …)."`
 
@@ -386,6 +406,70 @@ If every poll thread is busy, the source is made due and the scheduler polls it 
 - `409 FEED_POLL_IN_PROGRESS`: the source is being polled right now.
 - `429 FEED_POLL_RATE_LIMITED` with `Retry-After: n`: the source was polled less than 60 s ago
   (`"This source was polled less than a minute ago. You can poll it again in 42 seconds; …"`).
+
+### `POST /feed/sources/lookup`
+Finds a company's job boards by name, for when you don't know the board token. **Read-only**: it
+never adds a source; add a board it finds with `POST /feed/sources` (its `kind` and `boardToken`).
+```json
+{ "companyName": "Acme Payments (Pty) Ltd" }
+```
+| Field | Rule |
+|---|---|
+| `companyName` | required, max 200; the name as on the company's careers page. Whitespace is collapsed |
+
+The name is turned into up to 3 board-name **guesses**, most specific first: run together,
+hyphenated, then the first word alone (only with two words or more, and at least 3 characters).
+Accents are dropped, dots and apostrophes removed, other punctuation separates words, and trailing
+legal suffixes (`Pty`, `Ltd`, `Inc`, `GmbH`, …) are ignored: `"Acme Payments (Pty) Ltd"` →
+`acmepayments`, `acme-payments`, `acme`. Each guess is checked on Greenhouse, Lever (global instance
+only; add `jobs.eu.lever.co` sites by hand with `options.leverInstance: "eu"`) and Ashby, within a
+10 s budget for the whole lookup. Adzuna is never queried (no budget is used). A board already on
+your watchlist is reported from the database without a check. Works while the feed is disabled.
+
+**Response `200`**
+```json
+{ "companyName": "Acme Payments (Pty) Ltd",
+  "candidates": ["acmepayments", "acme-payments", "acme"],
+  "found": [
+    { "kind": "GREENHOUSE", "boardToken": "acmepayments", "companyName": "Acme Payments",
+      "openPostings": null, "warning": null, "sourceId": null },
+    { "kind": "LEVER", "boardToken": "acme", "companyName": "Acme",
+      "openPostings": 12, "warning": "Already on your watchlist.", "sourceId": "…" },
+    { "kind": "ASHBY", "boardToken": "acme", "companyName": null,
+      "openPostings": 0, "warning": "The board exists but has no open postings right now.", "sourceId": null }
+  ],
+  "unchecked": [ { "kind": "LEVER", "boardToken": "acme-payments", "reason": "TIMEOUT" } ],
+  "complete": true }
+```
+- `found`: boards that exist, in the order checked (per guess, most specific first: Greenhouse,
+  Lever, Ashby). `companyName` is the board's name (Greenhouse
+  only) or, for a board already watched, the source's name. `openPostings` is known for Ashby boards,
+  empty boards (`0`, with the warning) and watched sources; otherwise `null`. `sourceId` is set only
+  for a board already on your watchlist.
+- `unchecked`: boards that couldn't be checked. `reason`: `TIMEOUT`, `NETWORK`, `SERVER_ERROR`,
+  `RATE_LIMITED`, `UNAUTHORIZED`, `INVALID_RESPONSE`, `TOO_LARGE`, `BUSY` (every check worker busy,
+  or an unexpected error) or `BUDGET_EXCEEDED` (the 10 s budget ran out first).
+- `complete`: `false` when the budget ran out before every guess was checked (some `unchecked` have
+  `BUDGET_EXCEEDED`).
+- Boards the providers don't know are left out. An empty `found` with `complete: true` and no
+  `unchecked` means none of the guesses exists; the board may still use another name.
+- A guess can match **another company** with the same name: check the board before adding it.
+
+**Errors:**
+- `400 VALIDATION_FAILED` on `companyName`: missing or blank, longer than 200 characters, with no
+  letters or digits to build a board name from (`"companyName has no letters or digits (a–z, 0–9) to
+  build a board name from. …"`), or giving no usable board name, e.g. a single word over 100
+  characters (`"companyName gives no usable board name (board names are at most 100 characters of
+  a–z, 0–9 and -). …"`). Both say to add the source with the `boardToken` from its board URL instead.
+- `400 MALFORMED_REQUEST`: malformed JSON or unknown fields.
+- `429 FEED_LOOKUP_RATE_LIMITED` with `Retry-After: n`: another lookup is running (`"Another company
+  lookup is running; try again in 10 seconds."`), or the last one started less than 10 s ago (`"A
+  company lookup ran less than 10 seconds ago; try again in 4 seconds."`). Invalid requests don't
+  count.
+
+The 10 s budget, the 10 s spacing between lookups and the 3 guesses are defaults, set by
+`talentmatch.feed.lookup.budget`, `talentmatch.feed.lookup.min-interval` and
+`talentmatch.feed.lookup.max-candidates`; the messages above show the configured values.
 
 ---
 
@@ -433,7 +517,14 @@ adding a skill or alias re-processes every open job (no repeat notifications).
   `WORK_PERMIT`. `flags`: `LOCATION_UNKNOWN`, `REMOTE_ELIGIBILITY_UNKNOWN`, `SALARY_OTHER_CURRENCY`,
   `IMMEDIATE_START` (never filter).
 - `skills[].source`: `DICTIONARY`, `AI` or `BOTH`. `aiSuggestions` (`{name, requirement, evidence}`)
-  are skills the AI found that aren't in the vocabulary; they are never created automatically.
+  are skills the AI found that aren't in the vocabulary; they are never created automatically (add
+  one with `POST /skills` or as an alias, and open jobs are re-matched).
+- `enrichmentStatus`: the background AI stage. `PENDING` (waiting, or retrying after a failure),
+  `RUNNING`, `SUCCEEDED`, `FAILED` (after 3 tries; the job keeps its dictionary skills) or `SKIPPED`
+  (AI is off; skipped open jobs are queued again when the app starts with AI on). The AI only adds
+  skills it can quote from the posting, decides required vs nice-to-have, and a job it changes is
+  re-scored (it can then be notified, once, if it is still new). It runs at most 30 calls an hour and
+  waits while a CV extraction uses the local model.
 - `notification` is `null` when none was queued.
 - `sources` lists every posting of the job (several providers can post the same job).
 
@@ -443,13 +534,19 @@ adding a skill or alias re-processes every open job (no repeat notifications).
 `"Job … is not from the job feed. Read it with GET /api/jobs/…."`)
 
 ### `GET /feed/status`
-**Response `200`** (more sections are added as the feed grows)
+**Response `200`**
 ```json
 { "enabled": true, "schedulerEnabled": true,
   "profile": { "present": true, "version": 3, "appliedVersion": 3 },
   "preferences": { "present": true, "version": 2 },
+  "notifications": { "enabled": true, "channel": "EMAIL", "configured": true, "minScore": 0.6,
+                     "pending": 1, "failedLast24h": 0, "paused": false, "pausedUntil": null, "lastError": null },
   "sources": { "total": 4, "active": 3, "failing": 1, "lastSuccessAt": "…" },
-  "processing": { "pending": 12 } }
+  "aggregator": { "configured": true, "requestsToday": 37, "dailyBudget": 200 },
+  "processing": { "pending": 12 },
+  "enrichment": { "pending": 3, "running": 1, "failed": 0, "modelBusy": false, "aiEnabled": true,
+                  "pausedUntil": null, "capReachedUntil": null },
+  "detection": { "p50LatencySeconds": 312, "samples": 9, "windowDays": 7 } }
 ```
 - `schedulerEnabled`: sources are polled and their jobs processed automatically (the feed and its
   scheduler are both on).
@@ -458,10 +555,103 @@ adding a skill or alias re-processes every open job (no repeat notifications).
 - `preferences.present`: `false` means the feed is not filtered.
 - `sources.failing`: ACTIVE sources whose last poll failed.
 - `processing.pending`: feed jobs waiting to be processed (skills, filter, score).
+- `enrichment`: open jobs waiting for, in, or failed by the AI stage; `modelBusy` while a CV
+  extraction holds the local model; `aiEnabled` false when AI is off (or
+  `talentmatch.feed.skills.enrichment.enabled=false`); `pausedUntil` while the stage waits after the
+  model timed out or failed; `capReachedUntil` while the hourly cap (30 calls) holds it. Both are
+  `null` when not in effect.
+- `detection`: how fast new jobs reach you. `p50LatencySeconds` is the median of
+  `sent_at − postedAt` (or `firstSeenAt` when the provider gives no date) over the notification emails
+  sent in the last `windowDays` (7) days, negative spans counted as 0; `samples` is how many emails
+  that was. `p50LatencySeconds` is `null` with no samples. `samples` and `windowDays` go beyond the
+  Phase 5 spec §5.2.
+- `aggregator`: whether the Adzuna keys are set, and the requests counted against today's (UTC)
+  budget, probes included.
+- `notifications`: the saved settings (`enabled`, `channel`, `minScore`), whether the channel is
+  `configured`, `pending` (queued or being sent), `failedLast24h` (failed in the last 24 hours,
+  expired ones included), and the sender's state: `paused` / `pausedUntil` after a configuration
+  error (bad login, TLS, unknown host) and `lastError`, the sanitized text of the last failed send
+  (e.g. `"SMTP login failed (535). Check SMTP_USERNAME and SMTP_PASSWORD."`; cleared by a successful
+  send). `paused`, `pausedUntil` and `lastError` go beyond the Phase 5 spec §5.2.
 
 The actuator health component `feed` is `UP`, or `DEGRADED` when an ACTIVE source failed 3 times
 in a row or has had no successful poll for more than 3 × its interval (details: counts and source
-ids). It never turns overall health `DOWN`.
+ids), with reason `EMAIL_CONFIG` while email sending is paused after a configuration error, or
+`NOTIFICATIONS_FAILED` when a notification failed in the last hour (expired ones aren't counted).
+Details include `notifications: {configured, paused, pausedUntil, failedLastHour}`. It never opens an
+SMTP connection and never turns overall health `DOWN`.
+
+Metrics (Micrometer, not exposed over HTTP yet): `talentmatch.feed.polls` (timer; tags `kind`,
+`outcome` = the lower-cased `lastStatus`, or `deferred` / `lease_lost`), `talentmatch.feed.postings.new`
+(counter; tag `kind`; a source's first poll is not counted), `talentmatch.feed.enrichments` (timer; tag
+`outcome`), `talentmatch.feed.notifications` (counter; tags `channel`, `outcome` = `sent`, `transient`,
+`permanent`, `config`, `expired`, `no_content`, `internal_error`; the test email is not counted) and
+`talentmatch.feed.detection.latency` (timer, one sample per email sent).
+
+---
+
+## Notifications (Phase 5)
+
+Email over SMTP is the only channel. Email is **configured** when `SMTP_HOST`, `NOTIFY_EMAIL_FROM` and
+`NOTIFY_EMAIL_TO` are set (plus `SMTP_USERNAME` and `SMTP_PASSWORD` if the server needs a login);
+notifications are **disabled** until the owner turns them on. An email holds only the job's facts
+(title, company, workplace, location, score, matched/missing required skills, apply link), never CV
+data. At most one notification per job, ever; at most `maxPerHour` emails an hour. Delivery is at
+least once: a crash mid-send can send the same email again, with the same `Message-ID`.
+
+### `GET /notifications/settings`
+**Response `200`** (defaults when nothing was saved: disabled, EMAIL, 0.6, 20)
+```json
+{ "enabled": true, "channel": "EMAIL", "minScore": 0.6, "maxPerHour": 20,
+  "email": { "configured": true, "host": "smtp.gmail.com", "port": 587, "security": "STARTTLS",
+             "from": "o•••@gmail.com", "to": "o•••@example.com", "authenticated": true } }
+```
+Not configured: `"email": { "configured": false, "missing": ["SMTP_HOST", "NOTIFY_EMAIL_TO"] }` (the
+blank variables). The username and password are never returned; `from` and `to` are masked
+(`from` is masked too, which goes beyond the Phase 5 spec, because it is usually the owner's own
+address).
+
+### `PUT /notifications/settings`
+**Request** (full replacement)
+```json
+{ "enabled": true, "minScore": 0.6, "maxPerHour": 20, "channel": "EMAIL" }
+```
+**Response `200`** as `GET`. `channel` is optional (only `"EMAIL"` exists). A new `minScore` applies to
+new evaluations only; turning notifications off stops sending, and queued ones expire after 24 hours.
+**Errors:** `400 VALIDATION_FAILED` with field errors: `enabled` `"enabled is required."`;
+`minScore` `"minScore must be a number between 0 and 1."`; `maxPerHour`
+`"maxPerHour must be a whole number between 1 and 200."`; `enabled: true` while email isn't configured:
+`enabled` `"Email isn't configured: set SMTP_HOST, NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO (plus
+SMTP_USERNAME and SMTP_PASSWORD if your server needs a login), then restart."`.
+`400 MALFORMED_REQUEST` for an unknown field or another `channel` value (`"SMS"`).
+
+### `POST /notifications/test`
+No body. Sends the fixed email `[TalentMatch] Test notification` (the settings summary, no job or CV
+data) synchronously, bounded by the SMTP timeouts (10 s each). Works while notifications are disabled;
+creates no notification and doesn't count toward the hourly cap. A success also ends a pause after a
+configuration error.
+**Response `200`**
+```json
+{ "channel": "EMAIL", "delivered": true, "to": "o•••@example.com",
+  "messageId": "<test-3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6@example.com>" }
+```
+**Errors:** `409 NOTIFICATION_NOT_CONFIGURED` (same text as the `PUT` message above);
+`429 NOTIFICATION_TEST_RATE_LIMITED` with `Retry-After: n` (one attempt per 30 s, failed ones
+included); `502 NOTIFICATION_DELIVERY_FAILED`, e.g. `"The mail server rejected the login (535). Check
+SMTP_USERNAME and SMTP_PASSWORD."`, `"Couldn't connect to smtp.example.com:587 within 10 seconds."`,
+`"The mail server refused the recipient address (550). Check NOTIFY_EMAIL_TO."`, `"The mail server
+doesn't offer STARTTLS on port 587. Use port 465 with SMTP_SECURITY=SSL."`.
+
+### `GET /notifications`
+**Query:** `page`, `size` (see Paging). **Response `200`** `PageResponse` of
+```json
+{ "id": "…", "jobId": "…", "title": "Backend Engineer", "company": "Acme", "channel": "EMAIL",
+  "status": "SENT", "score": 0.8, "attempts": 1, "lastError": null,
+  "createdAt": "…", "sentAt": "…" }
+```
+newest `createdAt` first. `status`: `PENDING`, `SENDING`, `SENT` or `FAILED`. `lastError` is sanitized
+text only: `"SMTP 421 (transient)"`, `"connect timeout"`, `"SMTP 550 (rejected)"`, `"expired"`.
+**Errors:** `400 INVALID_PARAMETER`.
 
 ---
 
@@ -868,7 +1058,11 @@ exception class names or SQL.
 | 409 | `FEED_POLL_IN_PROGRESS` | the feed source is being polled right now **(Phase 5)** |
 | 409 | `FEED_DISABLED` | the job feed is switched off (`FEED_ENABLED=false`) **(Phase 5)** |
 | 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job within the regenerate window (`Retry-After: n`) **(extension, Phase 3)** |
+| 409 | `NOTIFICATION_NOT_CONFIGURED` | `POST /notifications/test` while email isn't configured **(Phase 5)** |
 | 429 | `FEED_POLL_RATE_LIMITED` | a poll on request within 60 s of the source's last poll (`Retry-After: n`) **(Phase 5)** |
+| 429 | `FEED_LOOKUP_RATE_LIMITED` | a company lookup while another runs, or within 10 s of the last one (`Retry-After: n`) **(Phase 5)** |
+| 429 | `NOTIFICATION_TEST_RATE_LIMITED` | a test email within 30 s of the last attempt, failed attempts included (`Retry-After: n`) **(Phase 5)** |
+| 502 | `NOTIFICATION_DELIVERY_FAILED` | the test email couldn't be delivered; the message names the cause, host:port and the SMTP code, never the server's reply text or a credential. The only 502 in the API; a container-level 502 on `/error` still reports `INTERNAL_ERROR` **(Phase 5)** |
 | 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`); `/jobs/{id}/matches` and `/matches/**` only |
 | 503 | `SERVICE_BUSY` | any other endpoint lost a lock conflict with a concurrent update; nothing was saved, retry (`Retry-After: 2`) **(Phase 5)** |
 | 503 | `DATABASE_UNAVAILABLE` | database unreachable (`Retry-After: 5`) |

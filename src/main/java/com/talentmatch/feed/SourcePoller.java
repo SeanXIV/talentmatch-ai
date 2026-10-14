@@ -27,6 +27,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -39,6 +40,10 @@ import org.springframework.stereotype.Component;
  *       pending postings, new ones first, at most {@code greenhouse.max-detail-calls-per-poll}, and
  *       only while the lease leaves room for another request. Postings still waiting keep their old
  *       content (or go in without a description) and the next fetch is unconditional.</li>
+ *   <li>Adzuna: no keys → not polled (no failure counted); every request first takes one from the
+ *       daily budget ({@link FeedApiUsage}), and an exhausted budget waits for the next UTC midnight.
+ *       A full first page whose results are all newer than the last successful poll is followed
+ *       by page 2 (within the budget).</li>
  *   <li>Normalize. One bad posting is skipped; more than half skipped → INVALID_RESPONSE and nothing
  *       is written (likely a provider format change).</li>
  *   <li>{@link PollWriter}: one transaction for the postings and the source state.</li>
@@ -63,18 +68,35 @@ public class SourcePoller {
     private final FeedSourceRepository sources;
     private final JobPostingRepository postings;
     private final FeedProperties properties;
+    private final PollIntervals intervals;
+    private final FeedApiUsage usage;
+    private final SourceProperties.Adzuna adzuna;
     private final int maxDetailCalls;
     private final Duration requestDeadline;
     private final Clock clock;
+    private final FeedMetrics metrics;
 
+    /** Records metrics into the global registry. */
     public SourcePoller(SourceAdapters adapters, PollWriter writer, FeedSourceRepository sources,
                         JobPostingRepository postings, FeedProperties properties, SourceProperties sourceProperties,
-                        Clock clock) {
+                        PollIntervals intervals, FeedApiUsage usage, Clock clock) {
+        this(adapters, writer, sources, postings, properties, sourceProperties, intervals, usage, clock,
+                FeedMetrics.global());
+    }
+
+    @Autowired
+    public SourcePoller(SourceAdapters adapters, PollWriter writer, FeedSourceRepository sources,
+                        JobPostingRepository postings, FeedProperties properties, SourceProperties sourceProperties,
+                        PollIntervals intervals, FeedApiUsage usage, Clock clock, FeedMetrics metrics) {
+        this.metrics = Objects.requireNonNull(metrics, "metrics");
         this.adapters = adapters;
         this.writer = writer;
         this.sources = sources;
         this.postings = postings;
         this.properties = properties;
+        this.intervals = intervals;
+        this.usage = usage;
+        this.adzuna = sourceProperties.adzuna();
         this.maxDetailCalls = sourceProperties.greenhouse().maxDetailCallsPerPoll();
         this.requestDeadline = sourceProperties.http().connectTimeout().plus(sourceProperties.http().readTimeout());
         this.clock = clock;
@@ -97,7 +119,13 @@ public class SourcePoller {
         } catch (RuntimeException e) {
             outcome = unexpected(source, e);
         }
-        logOutcome(source, outcome, TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
+        long latencyMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        logOutcome(source, outcome, latencyMs);
+        metrics.poll(source.kind(), outcome, latencyMs);
+        // the claim-time snapshot: a source without a baseline is on its first (baseline) poll
+        if (outcome instanceof PollOutcome.Ok ok && source.baselineAt() != null) {
+            metrics.newPostings(source.kind(), ok.stats().created());
+        }
         return outcome;
     }
 
@@ -105,17 +133,26 @@ public class SourcePoller {
         Instant now = clock.instant();
         Duration interval = interval(source);
         Optional<SourceAdapter> found = adapters.find(source.kind());
-        if (found.isEmpty() || source.boardToken() == null) {
-            // Adzuna arrives with step 9; such a source can't be added yet.
+        if (found.isEmpty()) {
             return fail(source, SourceFailure.of(SourceFailure.Kind.UNAUTHORIZED), "ERROR",
-                    FeedSourceService.display(source.kind()) + " sources can't be polled yet.", now, interval);
+                    FeedSourceService.display(source.kind()) + " sources can't be polled.", now, interval);
         }
         SourceAdapter adapter = found.get();
         SourceTarget target = source.target();
+        boolean aggregator = source.kind() == SourceKind.ADZUNA;
+        if (aggregator) {
+            Optional<PollOutcome> skipped = checkAggregator(source, now);
+            if (skipped.isPresent()) {
+                return skipped.get();
+            }
+        }
 
         FetchResult result;
         try {
             result = adapter.fetch(target, new FetchRequest(source.etag(), source.lastModified(), source.contentHash()));
+            if (aggregator && !result.notModified()) {
+                result = withNextPage(source, adapter, target, result);
+            }
         } catch (SourceException e) {
             return fail(source, e.failure(), statusOf(e.kind()), e.getMessage(), now, interval);
         }
@@ -149,6 +186,68 @@ public class SourcePoller {
                     "Saving the postings failed (" + e.getClass().getSimpleName() + "); the next poll retries.",
                     clock.instant(), interval);
         }
+    }
+
+    // ------------------------------------------------------------------ Adzuna
+
+    /**
+     * Not configured → recorded as UNAUTHORIZED (not a failure: nothing is wrong with the search) and
+     * looked at again after {@code not-found-backoff}. Budget spent → BUDGET_EXHAUSTED until the next
+     * UTC midnight (not a failure, §6.1). Otherwise one request is taken from today's budget.
+     */
+    private Optional<PollOutcome> checkAggregator(FeedSource source, Instant now) {
+        if (!adzuna.configured()) {
+            Instant next = now.plus(properties.intervals().notFoundBackoff());
+            return Optional.of(skip(source, SourceFailure.of(SourceFailure.Kind.UNAUTHORIZED), "UNAUTHORIZED",
+                    NOT_CONFIGURED, now, next));
+        }
+        if (!usage.tryConsume(SourceKind.ADZUNA, adzuna.dailyRequestBudget())) {
+            Instant next = Backoff.nextUtcMidnight(now, ThreadLocalRandom.current());
+            return Optional.of(skip(source, SourceFailure.of(SourceFailure.Kind.RATE_LIMITED), "BUDGET_EXHAUSTED",
+                    "The daily Adzuna budget of " + adzuna.dailyRequestBudget() + " requests is used up; searching "
+                            + "again after midnight UTC.", now, next));
+        }
+        return Optional.empty();
+    }
+
+    static final String NOT_CONFIGURED = "Adzuna isn't configured: set ADZUNA_APP_ID and ADZUNA_APP_KEY.";
+
+    /**
+     * Page 2 when page 1 was full and every result on it is newer than the last successful poll
+     * (so more new ones may be behind it), and the budget allows. A failing page 2 is ignored:
+     * page 1 is kept, and its postings are what the poll writes.
+     */
+    private FetchResult withNextPage(FeedSource source, SourceAdapter adapter, SourceTarget target,
+                                     FetchResult first) {
+        Instant since = source.lastSuccessAt();
+        int size = first.postings().size() + first.skipped();
+        boolean allNew = since != null && !first.postings().isEmpty()
+                && first.postings().stream().allMatch(p -> p.postedAt() != null && p.postedAt().isAfter(since));
+        if (size < adzuna.resultsPerPage() || !allNew
+                || !usage.tryConsume(SourceKind.ADZUNA, adzuna.dailyRequestBudget())) {
+            return first;
+        }
+        Optional<FetchResult> next;
+        try {
+            next = adapter.fetchPage(target, 2);
+        } catch (SourceException e) {
+            log.info("Feed poll source={} kind={}: page 2 failed ({}); page 1 is used", source.id(), source.kind(),
+                    e.getMessage());
+            return first;
+        }
+        if (next.isEmpty()) {
+            return first;
+        }
+        List<RawPosting> merged = new ArrayList<>(first.postings());
+        Set<String> ids = new LinkedHashSet<>();
+        first.postings().forEach(p -> ids.add(p.externalId()));
+        for (RawPosting p : next.get().postings()) {
+            if (ids.add(p.externalId())) {
+                merged.add(p);
+            }
+        }
+        return new FetchResult(false, first.etag(), first.lastModified(), first.bodyHash(), first.complete(), merged,
+                first.skipped() + next.get().skipped());
     }
 
     /** Details (Greenhouse), normalization and the entry list; HTTP only, no database writes. */
@@ -323,6 +422,19 @@ public class SourcePoller {
         }
     }
 
+    /** A poll not made (no keys, budget spent): recorded without counting a failure. */
+    private PollOutcome skip(FeedSource source, SourceFailure failure, String status, String message, Instant now,
+                             Instant next) {
+        try {
+            boolean recorded = sources.recordFailure(source.id(), source.leaseUntil(), now, next, status, message, false);
+            return recorded ? new PollOutcome.Failed(failure, status, message) : new PollOutcome.LeaseLost();
+        } catch (RuntimeException e) {
+            log.warn("Feed poll source={} kind={}: could not record the skipped poll ({})", source.id(), source.kind(),
+                    describe(e));
+            return new PollOutcome.Failed(failure, status, message);
+        }
+    }
+
     private PollOutcome unexpected(FeedSource source, RuntimeException e) {
         log.warn("Feed poll source={} kind={} failed unexpectedly ({})", source.id(), source.kind(), describe(e));
         try {
@@ -347,7 +459,7 @@ public class SourcePoller {
     }
 
     private Duration interval(FeedSource source) {
-        return Duration.ofSeconds(properties.intervals().effectiveSeconds(source.kind(), source.pollIntervalSeconds()));
+        return Duration.ofSeconds(intervals.seconds(source));
     }
 
     // ------------------------------------------------------------------ logging

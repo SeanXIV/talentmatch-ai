@@ -946,6 +946,7 @@ talentmatch:
         failure-backoff: 5m
         busy-retry: 60s
         max-per-hour: 30
+        sweep: 60s                          # how often the stage looks for work without being woken (1s..1h)
   notify:
     zone: Africa/Johannesburg
     app-base-url: ${NOTIFY_APP_BASE_URL:http://127.0.0.1:8080}   # only used for the "Details:" link
@@ -1172,7 +1173,70 @@ Steps 2–3 and 4–5 can run in parallel. Steps 8 and 9 depend only on 7.
 2. Lever: `mode=json` returns every posting with no pagination needed; the `country` and `workplaceType` fields; an unknown site returns 404; the EU host.
 3. Ashby: the endpoint path; field names (`publishedAt`, `isListed`, `workplaceType`, `compensation.summaryComponents`); unknown-board behaviour.
 4. Adzuna: the exact free-tier limits and terms (attribution, storing and caching ads); `za` coverage; the `max_days_old`/`sort_by=date` semantics.
-5. Email:
+5. Email (verified in step 8 by unit tests: `EmailNotifierSocketTest`, `EmailSettingsTest`, `NotifyConfigTest`):
+   - Angus Mail 2.0.x (Boot 3.5): `org.eclipse.angus.mail.smtp.SMTP{Send,Address,Sender}FailedException` (`getReturnCode()`) and `org.eclipse.angus.mail.util.MailConnectException` come with `spring-boot-starter-mail`; a refused connection surfaces as `MailConnectException`.
+   - `JavaMailSenderImpl` keeps an explicitly set Message-ID across `saveChanges()`; mail arrives with `<feed-{id}@from-domain>` (no `MimeMessage` subclass needed).
+   - GreenMail with a configured user answers a wrong password with 535 (`AuthenticationFailedException`), classified CONFIG.
+   - `InternetAddress(addr, true)` accepts a bare local part with no domain, so `EmailSettings.parse` requires `local@domain` explicitly (and rejects CR/LF).
+   - An empty `SMTP_PORT` / `SMTP_SECURITY` binds to null, so the defaults 587 / STARTTLS apply.
+
+   **Step 8 deviations from this spec** (also in API_SPEC.md / DATA_MODEL.md):
+   - Retries (§4.9 vs §9.1 #14): `max-attempts` = 5 sends in total; delays 1, 2, 4, 8 min; the 5th failure is FAILED (the 15m cap stays in the backoff function).
+   - Notifications disabled: PENDING rows are not claimed and expire after 24h.
+   - Hourly cap (§4.9 step 4): checked before claiming, so rows are never claimed and released; exact within one instance.
+   - Settings response (§5.4): `from` is masked like `to`; `NotifyProperties.toString` masks username, from and to.
+   - §5.6: 502 is not mapped in `ApiErrorAttributes.codeFor` (a container 502 isn't a mail failure); it stays `INTERNAL_ERROR`.
+   - "Failed in the last 24h/1h" counts use `updated_at` on the DB clock; health `NOTIFICATIONS_FAILED` ignores `last_error='expired'`.
+   - `/feed/status` notifications section adds `paused`, `pausedUntil`, `lastError`.
+   - A CONFIG error releases the row to PENDING with `next_attempt_at = now`; the in-memory pause blocks claims, so a successful test send (which clears the pause) or a restart sends at once.
+   - A run stops after a transient failure; the remaining rows wait for the next sweep or wake.
+   - §7 vs §4.9: `SMTP_USERNAME` without `SMTP_PASSWORD` (or the reverse) fails startup even when host/from/to are blank.
+   - Pause and cap are per instance (single-instance assumption, §6.3); startup recovery resets every SENDING row.
+   **Step 9 findings and deviations** (also in API_SPEC.md):
+   - No Adzuna keys were available, so `tests/resources/feed/adzuna.json` follows the documented response, not a live capture. Checked live: wrong keys answer `401 {"exception":"AUTH_FAIL"}` → UNAUTHORIZED. Re-check the fixture, the free-tier limits and the terms (attribution, caching) once keys exist (decision c).
+   - Adzuna settings bind in `SourceProperties.adzuna` (the adapter needs host, keys and paging); the budget, derived-query count and close-after live there too, so there is one `talentmatch.feed.adzuna.*` record.
+   - Closing after `unseen-close-after` runs on every successful poll of the search (in `PollWriter`), not as a daily sweep; a paused search keeps its postings open until it is resumed.
+   - Results without `company.display_name` are left out (not counted as skipped): they can't be deduplicated.
+   - No keys: a poll records `UNAUTHORIZED` "Adzuna isn't configured…" without counting a failure (next try after `not-found-backoff`); derived searches are neither created nor deleted.
+   - Keys Adzuna rejects on `POST /feed/sources` with `verify` → 400 on `kind` (not a warning): every poll would fail.
+   - A failing page 2 is ignored (page 1 is written). Page 2 counts against the budget.
+   - A derived search whose key matches an owner-added search is not created.
+   **Step 10 deviations from this spec:**
+   - `JobSkillEnrichmentService` and its SQL (`FeedEnrichmentRepository`) live in `feed`, not `feed.skills`: they need `FeedJobRepository`/`FeedProcessor`, and `feed.skills` must not depend on `feed` (no cycles). Prompts, schema, validator, model holder, `EnrichmentFailure` and `SkillsProperties` are in `feed.skills`.
+   - Prompt: the posting is fenced and fence tags inside it neutralized (as the CV prompt), not HTML-escaped like explanations, so the evidence the model quotes can be checked against the text exactly.
+   - Grounding: the evidence is located in the posting text itself (its words in order on token boundaries, any whitespace between them, case ignored); no match → ungrounded. The skill must then be named in that span of the posting, not in the model's copy: a vocabulary skill by its stored name or a stored alias under the dictionary's boundary and case rules (`DictionarySkillMatcher.mentionsSkill`; "go" in "ready to go" is not Go, "rust" in "trust" is nothing), a name outside the vocabulary as written. An alias the model wrote ("postgres") is grounded when the span names the skill ("PostgreSQL").
+   - Hourly cap checked before claiming (nothing claimed and released, as notifications D3); the run stops when it is reached.
+   - REFUSED and INVALID_OUTPUT retry after `failure-backoff` without pausing the stage; a prompt that overflowed the context fails at once (INVALID_OUTPUT), since it would be cut again.
+   - Claude gets at least 4000 output tokens for enrichment (adaptive thinking).
+   - `FeedRecovery` also re-queues open SKIPPED jobs when AI is available (they were skipped while it was off).
+   - The `talentmatch.feed.enrichments` timer (§6.6) is recorded now. Outcome tags: `success`, `discarded`, `invalid_output`, `refused`, `context_overflow`, `timeout`, `provider_error`, `db_error`.
+   - `feedAiExecutor` has queue capacity 1 with `DiscardPolicy` (the spec said 0), as the processor's executor: one follow-up run is queued, further wake-ups are dropped.
+   - The claim puts `enrichment_attempts < :max` inside the row-picking subquery, so one exhausted row can't block the queue.
+   - The claim requires a non-null description; PENDING jobs without one are SKIPPED at the start of each run (dictionary only). A later description change resets them to PENDING; `FeedRecovery` does not re-queue SKIPPED jobs that still have no description.
+   - Finishing writes are guarded by `description_hash`: an answer for a description that changed meanwhile is DISCARDED (outcome `discarded`), nothing written.
+   - Status `modelBusy` means the local model's exclusive hold (a CV extraction) is held, nothing else.
+   - A description change also clears `ai_skills`, `enrichment_model` and `enriched_at` (to NULL) and resets `ai_suggestions` to `[]` (the column is NOT NULL), with the reset to PENDING in `applyCanonical`, so stale AI skills never outlive their description, even if re-enrichment fails or is skipped.
+   - Provider faults (TIMEOUT / PROVIDER_ERROR) don't count attempts: the job goes back to PENDING with its attempt given back, and the stage pauses `failure-backoff`. The pause bounds the retries, so a provider fault never makes a job FAILED; only REFUSED and INVALID_OUTPUT count toward `max-attempts`. (Supersedes "After `max-attempts` → FAILED/<kind>" for TIMEOUT / PROVIDER_ERROR in §4.7.)
+   - Only the model call is classified by `FailureKind`. A database error while storing a model's answer does not pause the stage: the job goes back to PENDING (attempt given back, after `busy-retry`) and the run ends (outcome `db_error`). A failed release or FAILED write is logged and left for `FeedRecovery`.
+   - `FeedRecovery` resets enrichment rows right after releasing the leases (§6.3 step 2), before reconciling the applied versions and the Adzuna searches.
+   - The company name is untrusted: its line goes inside the `<job_posting>` fence, cleaned like the posting and cut to 200 characters. Fence tags are neutralized in any spelling (`</job_posting >`, `< /job_posting>`, `<job_posting x>`).
+   - Ollama's context-budget check for enrichment runs only when `skills.enrichment.enabled` is true.
+   - Known limit: the pause and the hourly window are in memory per instance (single-instance assumption).
+   **Step 11 deviations from this spec:**
+   - `talentmatch.feed.polls` `outcome` tag is the lower-cased `last_status` (`ok`, `suspicious_empty`, `not_modified`, `rate_limited`, `not_found`, `unauthorized`, `error`, `invalid_response`, `too_large`, `budget_exhausted`) plus `deferred` and `lease_lost`, so alerts can tell 404 from 429. The per-poll INFO line keeps its coarse words (ok / not_modified / failed with `error="…"`; deferred and lease_lost have their own wording).
+   - `talentmatch.feed.postings.new` excludes a source's first (baseline) poll.
+   - `talentmatch.feed.notifications` outcomes: `sent`, `transient`, `permanent`, `config`, `expired`, `no_content`, `internal_error`. The test email is not counted. The notify meters live in `notify.NotifyMetrics` (`notify` must not import `feed`).
+   - `/feed/status.detection` is `{p50LatencySeconds, samples, windowDays}` (7-day window); a median without its sample count is misleading. `enrichment` adds `pausedUntil` and `capReachedUntil` (null when not in effect).
+   - Recovery IT #13 is covered piecewise by `FeedLeaseIT`, `FeedEnrichmentIT`, `NotificationDeliveryIT` and `FeedRefreshIT`, with the order checked in `FeedRecoveryEnrichmentTest`; no combined IT.
+   - `/actuator/metrics` is still not exposed (PRODUCTION_READINESS §7).
+   **Step 12 decisions (lookup):**
+   - The response is an object `{companyName, candidates, found, unchecked, complete}`, not a bare array: an empty array can't tell "no board" from "couldn't check".
+   - Slug order is joined, hyphenated, then first token (≥ 3 characters): the most specific slug is probed before the budget runs out.
+   - Lever: the global instance only; EU sites are added by hand with `leverInstance`.
+   - Allowed while the feed is disabled (as `POST /feed/sources` with verify). Never creates a source; Adzuna is never probed.
+   - Limits: one lookup at a time and a 10s minimum interval (`talentmatch.feed.lookup.*`), 429 `FEED_LOOKUP_RATE_LIMITED` with `Retry-After`. Only a started lookup sets the interval; rejected and invalid requests don't.
+   - The probe-timeout overload caps the timeout at `probe-timeout`; the service passes `min(probe-timeout, remaining budget)` and skips a board (BUDGET_EXCEEDED) when under 1s is left. `complete` is false only for BUDGET_EXCEEDED; provider failures and BUSY are listed in `unchecked` but leave it true.
+   - A watched board is reported from the DB (stored token and `open_postings`, warning "Already on your watchlist.") without a request, even after the budget runs out. The Greenhouse board name is normalized and cut to 200 characters so it can go straight into `POST /feed/sources`.
 6. LangChain4j 1.20.2: the hand-built `ResponseFormat` schema works for this shape on Ollama (same approach as `ProfileJsonSchema`).
 
 Until the owner answers §0, build with the recommended defaults. Only the modules marked against each decision would change.

@@ -46,15 +46,11 @@ public record FeedSource(
     }
 
     /**
-     * What an ATS adapter needs to fetch or probe this source ({@code feed.source} doesn't know
-     * {@code FeedSource}, so the mapping lives here).
-     *
-     * @throws IllegalStateException for an Adzuna source (it has no board token)
+     * What an adapter needs to fetch or probe this source ({@code feed.source} doesn't know
+     * {@code FeedSource}, so the mapping lives here). An Adzuna search has no board token; its query is
+     * in the options.
      */
     public SourceTarget target() {
-        if (boardToken == null) {
-            throw new IllegalStateException("Feed source " + id + " (" + kind + ") has no board token");
-        }
         return new SourceTarget(boardToken, companyName, options);
     }
 }

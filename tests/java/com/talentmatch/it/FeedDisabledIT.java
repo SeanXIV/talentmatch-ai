@@ -94,4 +94,19 @@ class FeedDisabledIT extends AbstractApiIT {
                 Boolean.class, job)).as("left untouched").isTrue();
         assertThat(jdbc.queryForObject("SELECT count(*) FROM job_skill", Integer.class)).isZero();
     }
+
+    /** Step 12: the company lookup works while the feed is disabled (providers on a closed port here). */
+    @Test
+    void lookupStillAnswersWhileDisabled() {
+        UUID id = source();
+        Res r = api.post("/api/feed/sources/lookup", "{\"companyName\":\"Acme\"}");
+        assertThat(r.status()).as("%s", r).isEqualTo(200);
+        JsonNode b = r.json();
+        assertThat(b.get("complete").asBoolean()).isTrue();
+        assertThat(b.get("found").size()).isEqualTo(1);
+        assertThat(b.get("found").get(0).get("kind").asText()).isEqualTo("LEVER");
+        assertThat(b.get("found").get(0).get("sourceId").asText()).isEqualTo(id.toString());
+        assertThat(b.get("unchecked").size()).isEqualTo(2);
+        b.get("unchecked").forEach(u -> assertThat(u.get("reason").asText()).isEqualTo("NETWORK"));
+    }
 }

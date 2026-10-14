@@ -1,6 +1,8 @@
 package com.talentmatch.ai.config;
 
 import com.talentmatch.ai.AiProperties;
+import com.talentmatch.feed.skills.JobSkillExtractionModel;
+import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.profile.ProfileProperties;
 import com.talentmatch.profile.ResumeExtractionModel;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
@@ -30,6 +32,8 @@ import org.springframework.context.annotation.Configuration;
 public class ClaudeChatModelConfig {
 
     static final int MIN_EXTRACTION_TOKENS = 16000;
+    /** Floor for enrichment answers: adaptive thinking spends output tokens before the JSON. */
+    static final int MIN_ENRICHMENT_TOKENS = 4000;
 
     @Bean
     public ChatModel claudeChatModel(AiProperties ai) {
@@ -45,6 +49,17 @@ public class ClaudeChatModelConfig {
         ProfileProperties.Extraction x = profile.extraction();
         return ResumeExtractionModel.remote(build(ai, x.callTimeout(), Math.max(x.maxOutputTokens(), MIN_EXTRACTION_TOKENS)),
                 ModelInfo.of(ai).label());
+    }
+
+    /**
+     * Same model for job-skill enrichment (§4.7; postings are public, decision m), with at least
+     * {@value #MIN_ENRICHMENT_TOKENS} output tokens. No temperature (this model family rejects it).
+     */
+    @Bean
+    public JobSkillExtractionModel claudeJobSkillExtractionModel(AiProperties ai, SkillsProperties skills) {
+        SkillsProperties.Enrichment e = skills.enrichment();
+        return JobSkillExtractionModel.remote(build(ai, e.callTimeout(),
+                Math.max(e.maxOutputTokens(), MIN_ENRICHMENT_TOKENS)), ModelInfo.of(ai).label());
     }
 
     private static ChatModel build(AiProperties ai, Duration timeout, int maxTokens) {

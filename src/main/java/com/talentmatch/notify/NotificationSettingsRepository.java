@@ -6,8 +6,8 @@ import org.springframework.stereotype.Repository;
 
 /**
  * JDBC access to the single-row {@code notification_settings} table (V5). No row means the defaults:
- * notifications disabled, channel EMAIL, min score 0.6, at most 20 an hour (§3.4). Step 7 only
- * reads; the settings endpoint (step 8) writes.
+ * notifications disabled, channel EMAIL, min score 0.6, at most 20 an hour (§3.4). Written only by
+ * {@code PUT /api/notifications/settings} ({@link NotificationSettingsService}).
  */
 @Repository
 public class NotificationSettingsRepository {
@@ -37,8 +37,25 @@ public class NotificationSettingsRepository {
     /** The stored settings, or the defaults when none were saved. */
     public Settings find() {
         return jdbc.query("SELECT enabled, channel, min_score, max_per_hour FROM notification_settings WHERE id",
-                new MapSqlParameterSource(), (rs, n) -> new Settings(rs.getBoolean("enabled"),
-                        Channel.valueOf(rs.getString("channel").strip()), rs.getDouble("min_score"),
-                        rs.getInt("max_per_hour"))).stream().findFirst().orElseGet(Settings::defaults);
+                new MapSqlParameterSource(), (rs, n) -> map(rs)).stream().findFirst().orElseGet(Settings::defaults);
+    }
+
+    /** Replaces the settings (one upsert statement, autocommit) and returns what was stored. */
+    public Settings save(Settings s) {
+        return jdbc.queryForObject("INSERT INTO notification_settings (id, enabled, channel, min_score, max_per_hour) "
+                        + "VALUES (true, :enabled, :channel, :minScore, :maxPerHour) "
+                        + "ON CONFLICT (id) DO UPDATE SET enabled = EXCLUDED.enabled, channel = EXCLUDED.channel, "
+                        + "min_score = EXCLUDED.min_score, max_per_hour = EXCLUDED.max_per_hour "
+                        + "RETURNING enabled, channel, min_score, max_per_hour",
+                new MapSqlParameterSource("enabled", s.enabled())
+                        .addValue("channel", s.channel().name())
+                        .addValue("minScore", s.minScore())
+                        .addValue("maxPerHour", s.maxPerHour()),
+                (rs, n) -> map(rs));
+    }
+
+    private static Settings map(java.sql.ResultSet rs) throws java.sql.SQLException {
+        return new Settings(rs.getBoolean("enabled"), Channel.valueOf(rs.getString("channel").strip()),
+                rs.getDouble("min_score"), rs.getInt("max_per_hour"));
     }
 }

@@ -2,6 +2,8 @@ package com.talentmatch.ai.config;
 
 import com.talentmatch.ai.AiProperties;
 import com.talentmatch.ai.LocalModelGate;
+import com.talentmatch.feed.skills.JobSkillExtractionModel;
+import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.profile.ProfileProperties;
 import com.talentmatch.profile.ResumeExtractionModel;
 import dev.langchain4j.model.chat.Capability;
@@ -45,6 +47,35 @@ public class OllamaChatModelConfig {
         ProfileProperties.Extraction x = profile.extraction();
         return new ResumeExtractionModel(build(ai.ollama(), x.callTimeout(), x.maxOutputTokens(), x.temperature()),
                 ModelInfo.of(ai).label(), ai.ollama().contextTokens(), true);
+    }
+
+    /** Same model for job-skill enrichment (§4.7): its own timeout and output budget, same num_ctx. */
+    @Bean
+    public JobSkillExtractionModel ollamaJobSkillExtractionModel(AiProperties ai, SkillsProperties skills) {
+        SkillsProperties.Enrichment e = skills.enrichment();
+        if (e.enabled()) {                                  // disabled: the model is never called
+            requireEnrichmentBudget(ai.ollama(), skills);
+        }
+        return new JobSkillExtractionModel(build(ai.ollama(), e.callTimeout(), e.maxOutputTokens(), e.temperature()),
+                ModelInfo.of(ai).label(), ai.ollama().contextTokens(), true);
+    }
+
+    /** Fails startup when the context window cannot hold the longest posting text plus prompt and answer. */
+    static void requireEnrichmentBudget(AiProperties.Ollama ollama, SkillsProperties skills) {
+        int required = skills.requiredContextTokens();
+        if (required <= ollama.contextTokens()) {
+            return;
+        }
+        throw new AiConfigurationException(
+                "talentmatch.ai.ollama.context-tokens is " + ollama.contextTokens() + ", but job-skill enrichment "
+                        + "needs at least " + required + " (talentmatch.feed.skills.max-description-chars "
+                        + skills.maxDescriptionChars() + " / " + SkillsProperties.CHARS_PER_TOKEN + " + "
+                        + SkillsProperties.PROMPT_OVERHEAD_TOKENS + " prompt + "
+                        + "talentmatch.feed.skills.enrichment.max-output-tokens "
+                        + skills.enrichment().maxOutputTokens() + ").",
+                "Raise talentmatch.ai.ollama.context-tokens to at least " + required + ", or lower "
+                        + "talentmatch.feed.skills.max-description-chars or "
+                        + "talentmatch.feed.skills.enrichment.max-output-tokens.");
     }
 
     /**

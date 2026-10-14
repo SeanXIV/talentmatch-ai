@@ -29,6 +29,10 @@ spring:
     max-file-size: 6MB            # above talentmatch.profile.max-resume-bytes so our own 413 message wins
     max-request-size: 7MB
   lifecycle.timeout-per-shutdown-phase: 30s
+  # No auto-configured JavaMailSender: the email notifier builds its own sender from talentmatch.notify.email.*,
+  # so a stray SPRING_MAIL_* env var can't create a second sender (or a mail health check).
+  # Note for tests: a test that sets spring.autoconfigure.exclude itself replaces this list.
+  autoconfigure.exclude: org.springframework.boot.autoconfigure.mail.MailSenderAutoConfiguration
 
 server:
   address: ${SERVER_ADDRESS:127.0.0.1}  # loopback only: no auth yet, and /api/profile is personal data (PRODUCTION_READINESS §6)
@@ -48,6 +52,7 @@ management:
     show-details: always
     probes.enabled: true
     status.order: down,out-of-service,up,degraded,unknown   # 'ai' DEGRADED never fails overall health
+  health.mail.enabled: false          # never open SMTP connections from health probes
 
 talentmatch:
   scoring:
@@ -89,7 +94,7 @@ talentmatch:
 
   # Job feed (Phase 5). Source layer: com.talentmatch.feed.source.SourceProperties (max-postings,
   # http, provider hosts). Feed level: com.talentmatch.feed.FeedProperties (switches, scheduler,
-  # intervals, probe-timeout, fresh window, lease, closing, processor).
+  # intervals, probe-timeout, fresh window, lease, closing, processor, lookup).
   feed:
     enabled: ${FEED_ENABLED:true}     # false: no scheduler, no polling, no processing; endpoints still answer
     scheduler: { enabled: true, tick: 15s, initial-delay: 20s }   # tests: enabled=false, they call tick()
@@ -100,6 +105,9 @@ talentmatch:
     lease: 5m                         # a claimed source is leased this long (> connect + read timeout)
     closing: { suspicious-drop-ratio: 0.5 }
     probe-timeout: 10s                # POST /api/feed/sources waits this long for the board check
+    # POST /api/feed/sources/lookup: board names guessed from a company name, checked on Greenhouse,
+    # Lever (global) and Ashby within the budget. One lookup at a time, min-interval between starts.
+    lookup: { budget: 10s, min-interval: 10s, max-candidates: 3 }
     intervals: { ats: 5m, ats-min: 2m, aggregator: 15m, aggregator-min: 10m, max-backoff: 1h, not-found-backoff: 6h }
     max-postings-per-source: 5000     # more in one listing -> INVALID_RESPONSE (runaway data)
     http:
@@ -112,5 +120,57 @@ talentmatch:
     greenhouse: { base-url: https://boards-api.greenhouse.io, max-detail-calls-per-poll: 20 }
     lever: { base-url: https://api.lever.co, eu-base-url: https://api.eu.lever.co }
     ashby: { base-url: https://api.ashbyhq.com }
+    # Aggregator (decision c). Off until both keys are set (free keys: developer.adzuna.com). The keys
+    # travel in the request URL, so no log line ever holds a full Adzuna URL.
+    adzuna:
+      base-url: https://api.adzuna.com
+      app-id: ${ADZUNA_APP_ID:}
+      app-key: ${ADZUNA_APP_KEY:}     # secret: env var only
+      country: za
+      results-per-page: 50
+      max-days-old: 2
+      daily-request-budget: 200       # all Adzuna requests per UTC day (polls, page 2, probes); spread over the searches
+      derived-queries: 3              # searches from the target titles (plus "remote" when remote jobs are wanted)
+      unseen-close-after: 14d         # an Adzuna posting unseen this long is closed
+    # Skill extraction (com.talentmatch.feed.skills.SkillsProperties). Stage 1 is the dictionary (skill
+    # names + aliases); stage 2, below, asks the AI model in the background and keeps only skills it can
+    # quote from the posting. Unknown skills become suggestions; nothing is created automatically.
+    skills:
+      max-description-chars: 8000     # posting text sent to the model; with Ollama it must fit context-tokens
+      ambiguous-names: [Go, Swift, Rust, Spark, Chef, Puppet, Ruby]   # count only near other tech words
+      enrichment:
+        enabled: true                 # false (or AI off): jobs keep their dictionary skills only
+        call-timeout: 5m
+        max-output-tokens: 600        # Claude gets at least 4000 (adaptive thinking)
+        temperature: 0.0
+        max-attempts: 3
+        failure-backoff: 5m           # after a timeout/provider error the job and the stage wait this long
+        busy-retry: 60s               # the local model is busy with a CV extraction
+        max-per-hour: 30              # model calls per sliding hour
+        sweep: 60s
+
+  # Email notifications (Phase 5, com.talentmatch.notify.NotifyProperties). Email is off until SMTP_HOST,
+  # NOTIFY_EMAIL_FROM and NOTIFY_EMAIL_TO are set, and nothing is sent until the owner turns notifications
+  # on (PUT /api/notifications/settings). Background sending runs only while the feed scheduler runs.
+  notify:
+    zone: Africa/Johannesburg
+    app-base-url: ${NOTIFY_APP_BASE_URL:http://127.0.0.1:8080}   # only used for the "Details:" link
+    max-attempts: 5                   # sends per notification: retries after 1, 2, 4, 8 min, then FAILED
+    retry-initial: 1m
+    retry-max: 15m
+    config-error-pause: 15m           # a login/TLS/host error pauses sending this long (or until a test succeeds)
+    max-age: 24h                      # unsent after this long -> FAILED "expired"
+    test-interval: 30s                # POST /api/notifications/test at most this often
+    email:
+      host: ${SMTP_HOST:}             # blank = email off (dev default)
+      port: ${SMTP_PORT:587}
+      security: ${SMTP_SECURITY:STARTTLS}   # STARTTLS (587) | SSL (465) | NONE (loopback hosts only)
+      username: ${SMTP_USERNAME:}
+      password: ${SMTP_PASSWORD:}     # env var only; never write a value in any yml file
+      from: ${NOTIFY_EMAIL_FROM:}
+      to: ${NOTIFY_EMAIL_TO:}
+      connection-timeout: 10s
+      read-timeout: 10s
+      write-timeout: 10s
 
 logging.pattern.level: "%5p [%X{requestId:-}]"

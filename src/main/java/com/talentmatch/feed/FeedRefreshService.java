@@ -51,8 +51,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * lock conflict or timeout a few times ({@link LockRetry}, {@link #MARKER_LOCK_TIMEOUT} per wait); the
  * processor's own check ({@link #reconcileForRun}) tries once with {@link #RUN_LOCK_TIMEOUT} and the
  * run goes on without it. A marker that fails rolls back with its {@code feed_state} update, so the
- * difference is still there for the next comparison. Derived Adzuna queries (also regenerated on
- * profile and preference changes) arrive with step 9. Logs hold versions and counts only.
+ * difference is still there for the next comparison. After a profile or preferences change (by event
+ * or found by the comparison), the derived Adzuna searches are reconciled too
+ * ({@link AggregatorQueries}), in a transaction of their own after the marking. Logs hold versions and
+ * counts only.
  */
 @Service
 public class FeedRefreshService {
@@ -81,18 +83,21 @@ public class FeedRefreshService {
     private final OwnerProfileRepository profiles;
     private final PreferencesRepository preferences;
     private final SkillDictionary dictionary;
+    private final AggregatorQueries aggregatorQueries;
     private final TransactionTemplate tx;
     private final TransactionTemplate newTx;
     private final Clock clock;
 
     public FeedRefreshService(FeedJobRepository jobs, FeedStateRepository state, OwnerProfileRepository profiles,
                               PreferencesRepository preferences, SkillDictionary dictionary,
-                              PlatformTransactionManager transactionManager, Clock clock) {
+                              AggregatorQueries aggregatorQueries, PlatformTransactionManager transactionManager,
+                              Clock clock) {
         this.jobs = jobs;
         this.state = state;
         this.profiles = profiles;
         this.preferences = preferences;
         this.dictionary = dictionary;
+        this.aggregatorQueries = aggregatorQueries;
         this.tx = new TransactionTemplate(transactionManager);
         this.newTx = new TransactionTemplate(transactionManager);
         this.newTx.setPropagationBehavior(TransactionDefinition.PROPAGATION_REQUIRES_NEW);
@@ -120,6 +125,7 @@ public class FeedRefreshService {
             log.warn("Feed refresh after preferences version {} failed ({}); the next processor run catches up",
                     event.version(), SourcePoller.describe(e));
         }
+        aggregatorQueries.reconcileSafely();
     }
 
     /**
@@ -143,6 +149,7 @@ public class FeedRefreshService {
             log.warn("Feed refresh after profile version {} failed ({}); the next processor run catches up",
                     event.version(), SourcePoller.describe(e));
         }
+        aggregatorQueries.reconcileSafely();
     }
 
     /** {@link #reconcile(String)} with the current vocabulary fingerprint (rebuilds the dictionary if it changed). */
@@ -162,14 +169,19 @@ public class FeedRefreshService {
      */
     public boolean reconcile(String vocabFingerprint) {
         if (TransactionSynchronizationManager.isActualTransactionActive()) {
-            // A lost lock aborts the caller's transaction: no retry is possible there.
-            return Boolean.TRUE.equals(tx.execute(status -> reconcileLocked(vocabFingerprint)));
+            // A lost lock aborts the caller's transaction: no retry is possible there. The derived
+            // searches are left to the next processor run (they need a transaction of their own).
+            Change change = tx.execute(status -> reconcileLocked(vocabFingerprint));
+            if (change != null && change.inputs()) {
+                aggregatorQueries.markPending();
+            }
+            return change != null && change.marked();
         }
-        Supplier<Boolean> attempt = () -> tx.execute(status -> {
+        Supplier<Change> attempt = () -> tx.execute(status -> {
             state.limitLockWait(MARKER_LOCK_TIMEOUT);
             return reconcileLocked(vocabFingerprint);
         });
-        return Boolean.TRUE.equals(LockRetry.run("Feed reconcile", attempt));
+        return afterReconcile(LockRetry.run("Feed reconcile", attempt));
     }
 
     /**
@@ -181,13 +193,32 @@ public class FeedRefreshService {
      * @return true when the open jobs were marked
      */
     boolean reconcileForRun(String vocabFingerprint) {
-        return Boolean.TRUE.equals(newTx.execute(status -> {
+        aggregatorQueries.reconcileIfPending();
+        return afterReconcile(newTx.execute(status -> {
             state.limitLockWait(RUN_LOCK_TIMEOUT);
             return reconcileLocked(vocabFingerprint);
         }));
     }
 
-    private boolean reconcileLocked(String vocabFingerprint) {
+    /**
+     * @param marked the open jobs were marked
+     * @param inputs the profile or preferences version changed (the derived searches depend on them)
+     */
+    private record Change(boolean marked, boolean inputs) {
+    }
+
+    /** After the comparison committed: a profile or preferences change also reconciles the derived searches. */
+    private boolean afterReconcile(Change change) {
+        if (change == null) {
+            return false;
+        }
+        if (change.inputs()) {
+            aggregatorQueries.reconcileSafely();
+        }
+        return change.marked();
+    }
+
+    private Change reconcileLocked(String vocabFingerprint) {
         FeedStateRepository.State applied = state.lock();
         Integer profileVersion = profiles.findRef().map(OwnerProfileRepository.OwnerRef::version).orElse(null);
         Integer preferencesVersion = preferences.findVersion().orElse(null);
@@ -200,15 +231,16 @@ public class FeedRefreshService {
             state.setPreferencesVersion(preferencesVersion);
             changed.add("preferences " + applied.appliedPreferencesVersion() + "->" + preferencesVersion);
         }
+        boolean inputs = !changed.isEmpty();
         if (vocabFingerprint != null && !vocabFingerprint.equals(applied.vocabFingerprint())) {
             state.setVocabFingerprint(vocabFingerprint);
             changed.add("skill vocabulary");
         }
         if (changed.isEmpty()) {
-            return false;
+            return new Change(false, false);
         }
         int n = jobs.markOpenForProcessing(clock.instant());
         log.info("Feed refresh: {} changed; {} open job(s) queued for processing", String.join(", ", changed), n);
-        return true;
+        return new Change(true, inputs);
     }
 }
