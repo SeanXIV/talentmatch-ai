@@ -1,5 +1,6 @@
 package com.talentmatch.web.controller;
 
+import com.talentmatch.feed.CompanyLookupService;
 import com.talentmatch.feed.FeedJobService;
 import com.talentmatch.feed.FeedPollService;
 import com.talentmatch.feed.FeedSourceService;
@@ -8,6 +9,8 @@ import com.talentmatch.feed.FeedStatusService;
 import com.talentmatch.feed.source.SourceKind;
 import com.talentmatch.service.Paging;
 import com.talentmatch.service.exception.InvalidParameterException;
+import com.talentmatch.web.dto.CompanyLookupRequest;
+import com.talentmatch.web.dto.CompanyLookupResponse;
 import com.talentmatch.web.dto.FeedJobResponse;
 import com.talentmatch.web.dto.FeedPollResponse;
 import com.talentmatch.web.dto.FeedSourceRequest;
@@ -37,7 +40,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 /**
  * The job feed (Phase 5): the watchlist of sources (step 5), polling on request and the feed status
- * (step 6), and the feed jobs (step 7).
+ * (step 6), the feed jobs (step 7) and the company lookup (step 12).
  */
 @RestController
 @RequestMapping("/api/feed")
@@ -48,13 +51,16 @@ public class FeedController {
     private final FeedPollService pollService;
     private final FeedStatusService statusService;
     private final FeedJobService jobService;
+    private final CompanyLookupService lookupService;
 
     public FeedController(FeedSourceService sourceService, FeedPollService pollService,
-                          FeedStatusService statusService, FeedJobService jobService) {
+                          FeedStatusService statusService, FeedJobService jobService,
+                          CompanyLookupService lookupService) {
         this.sourceService = sourceService;
         this.pollService = pollService;
         this.statusService = statusService;
         this.jobService = jobService;
+        this.lookupService = lookupService;
     }
 
     @GetMapping("/sources")
@@ -79,6 +85,12 @@ public class FeedController {
         FeedSourceResponse created = FeedSourceResponse.of(
                 sourceService.create(request == null ? null : request.toNewSource()));
         return ResponseEntity.created(URI.create("/api/feed/sources/" + created.id())).body(created);
+    }
+
+    /** Guesses a company's boards and checks them (read-only; step 12). */
+    @PostMapping("/sources/lookup")
+    public CompanyLookupResponse lookupSources(@RequestBody CompanyLookupRequest request) {
+        return CompanyLookupResponse.of(lookupService.lookup(request == null ? null : request.companyName()));
     }
 
     @PutMapping("/sources/{id}")

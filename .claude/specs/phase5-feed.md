@@ -1234,7 +1234,9 @@ Steps 2–3 and 4–5 can run in parallel. Steps 8 and 9 depend only on 7.
    - Slug order is joined, hyphenated, then first token (≥ 3 characters): the most specific slug is probed before the budget runs out.
    - Lever: the global instance only; EU sites are added by hand with `leverInstance`.
    - Allowed while the feed is disabled (as `POST /feed/sources` with verify). Never creates a source; Adzuna is never probed.
-   - Limits: one lookup at a time and a 10s minimum interval (`talentmatch.feed.lookup.*`), 429 `FEED_LOOKUP_RATE_LIMITED` with `Retry-After`.
+   - Limits: one lookup at a time and a 10s minimum interval (`talentmatch.feed.lookup.*`), 429 `FEED_LOOKUP_RATE_LIMITED` with `Retry-After`. Only a started lookup sets the interval; rejected and invalid requests don't.
+   - The probe-timeout overload caps the timeout at `probe-timeout`; the service passes `min(probe-timeout, remaining budget)` and skips a board (BUDGET_EXCEEDED) when under 1s is left. `complete` is false only for BUDGET_EXCEEDED; provider failures and BUSY are listed in `unchecked` but leave it true.
+   - A watched board is reported from the DB (stored token and `open_postings`, warning "Already on your watchlist.") without a request, even after the budget runs out. The Greenhouse board name is normalized and cut to 200 characters so it can go straight into `POST /feed/sources`.
 6. LangChain4j 1.20.2: the hand-built `ResponseFormat` schema works for this shape on Ollama (same approach as `ProfileJsonSchema`).
 
 Until the owner answers §0, build with the recommended defaults. Only the modules marked against each decision would change.

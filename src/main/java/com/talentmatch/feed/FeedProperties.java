@@ -23,6 +23,7 @@ import org.springframework.validation.annotation.Validated;
  *                     HTTP deadline (checked by {@code SourcePoller})
  * @param closing      the suspicious-drop guard (§4.5)
  * @param processor    the feed-job processor (§1.2 step 7): sweep interval, batch size, retry delay
+ * @param lookup       the company lookup ({@code POST /api/feed/sources/lookup}, step 12): budget and limits
  */
 @Validated
 @ConfigurationProperties("talentmatch.feed")
@@ -34,7 +35,8 @@ public record FeedProperties(
         @DefaultValue("24h") Duration freshWindow,
         @DefaultValue("5m") Duration lease,
         @DefaultValue @Valid Closing closing,
-        @DefaultValue @Valid Processor processor) {
+        @DefaultValue @Valid Processor processor,
+        @DefaultValue @Valid Lookup lookup) {
 
     /** The V5 CHECK on {@code feed_source.poll_interval_seconds}. */
     public static final int MIN_INTERVAL_SECONDS = 60;
@@ -58,6 +60,13 @@ public record FeedProperties(
         lease = lease == null ? DEFAULT_LEASE : lease;
         requireBetween("talentmatch.feed.lease", lease, Duration.ofMinutes(1), Duration.ofHours(1));
         processor = processor == null ? Processor.defaults() : processor;
+        lookup = lookup == null ? Lookup.defaults() : lookup;
+    }
+
+    /** Step-7 shape (no lookup settings); the lookup takes its defaults. */
+    public FeedProperties(boolean enabled, Scheduler scheduler, Intervals intervals, Duration probeTimeout,
+                          Duration freshWindow, Duration lease, Closing closing, Processor processor) {
+        this(enabled, scheduler, intervals, probeTimeout, freshWindow, lease, closing, processor, null);
     }
 
     /** Step-6 shape (no processor settings); the processor takes its defaults. */
@@ -150,6 +159,37 @@ public record FeedProperties(
 
         public static Processor defaults() {
             return new Processor(Duration.ofSeconds(30), 50, Duration.ofMinutes(1));
+        }
+    }
+
+    /**
+     * The company lookup ({@code POST /api/feed/sources/lookup}): guesses board names from a company
+     * name and checks them on Greenhouse, Lever and Ashby. Read-only; never uses the Adzuna budget.
+     *
+     * @param budget        how long one lookup may spend checking boards (1s..60s); boards left over are
+     *                      reported as unchecked
+     * @param minInterval   the shortest time between the starts of two lookups (0..10m); one lookup runs
+     *                      at a time regardless
+     * @param maxCandidates board names guessed per company (1..5)
+     */
+    public record Lookup(
+            @DefaultValue("10s") Duration budget,
+            @DefaultValue("10s") Duration minInterval,
+            @DefaultValue("3") int maxCandidates) {
+
+        public Lookup {
+            budget = budget == null ? Duration.ofSeconds(10) : budget;
+            minInterval = minInterval == null ? Duration.ofSeconds(10) : minInterval;
+            requireBetween("talentmatch.feed.lookup.budget", budget, Duration.ofSeconds(1), Duration.ofSeconds(60));
+            requireBetween("talentmatch.feed.lookup.min-interval", minInterval, Duration.ZERO, Duration.ofMinutes(10));
+            if (maxCandidates < 1 || maxCandidates > 5) {
+                throw new IllegalArgumentException("talentmatch.feed.lookup.max-candidates is " + maxCandidates
+                        + " but must be between 1 and 5");
+            }
+        }
+
+        public static Lookup defaults() {
+            return new Lookup(Duration.ofSeconds(10), Duration.ofSeconds(10), 3);
         }
     }
 

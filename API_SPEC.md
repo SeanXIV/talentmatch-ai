@@ -407,6 +407,70 @@ If every poll thread is busy, the source is made due and the scheduler polls it 
 - `429 FEED_POLL_RATE_LIMITED` with `Retry-After: n`: the source was polled less than 60 s ago
   (`"This source was polled less than a minute ago. You can poll it again in 42 seconds; …"`).
 
+### `POST /feed/sources/lookup`
+Finds a company's job boards by name, for when you don't know the board token. **Read-only**: it
+never adds a source; add a board it finds with `POST /feed/sources` (its `kind` and `boardToken`).
+```json
+{ "companyName": "Acme Payments (Pty) Ltd" }
+```
+| Field | Rule |
+|---|---|
+| `companyName` | required, max 200; the name as on the company's careers page. Whitespace is collapsed |
+
+The name is turned into up to 3 board-name **guesses**, most specific first: run together,
+hyphenated, then the first word alone (only with two words or more, and at least 3 characters).
+Accents are dropped, dots and apostrophes removed, other punctuation separates words, and trailing
+legal suffixes (`Pty`, `Ltd`, `Inc`, `GmbH`, …) are ignored: `"Acme Payments (Pty) Ltd"` →
+`acmepayments`, `acme-payments`, `acme`. Each guess is checked on Greenhouse, Lever (global instance
+only; add `jobs.eu.lever.co` sites by hand with `options.leverInstance: "eu"`) and Ashby, within a
+10 s budget for the whole lookup. Adzuna is never queried (no budget is used). A board already on
+your watchlist is reported from the database without a check. Works while the feed is disabled.
+
+**Response `200`**
+```json
+{ "companyName": "Acme Payments (Pty) Ltd",
+  "candidates": ["acmepayments", "acme-payments", "acme"],
+  "found": [
+    { "kind": "GREENHOUSE", "boardToken": "acmepayments", "companyName": "Acme Payments",
+      "openPostings": null, "warning": null, "sourceId": null },
+    { "kind": "LEVER", "boardToken": "acme", "companyName": "Acme",
+      "openPostings": 12, "warning": "Already on your watchlist.", "sourceId": "…" },
+    { "kind": "ASHBY", "boardToken": "acme", "companyName": null,
+      "openPostings": 0, "warning": "The board exists but has no open postings right now.", "sourceId": null }
+  ],
+  "unchecked": [ { "kind": "LEVER", "boardToken": "acme-payments", "reason": "TIMEOUT" } ],
+  "complete": true }
+```
+- `found`: boards that exist, in the order checked (per guess, most specific first: Greenhouse,
+  Lever, Ashby). `companyName` is the board's name (Greenhouse
+  only) or, for a board already watched, the source's name. `openPostings` is known for Ashby boards,
+  empty boards (`0`, with the warning) and watched sources; otherwise `null`. `sourceId` is set only
+  for a board already on your watchlist.
+- `unchecked`: boards that couldn't be checked. `reason`: `TIMEOUT`, `NETWORK`, `SERVER_ERROR`,
+  `RATE_LIMITED`, `UNAUTHORIZED`, `INVALID_RESPONSE`, `TOO_LARGE`, `BUSY` (every check worker busy,
+  or an unexpected error) or `BUDGET_EXCEEDED` (the 10 s budget ran out first).
+- `complete`: `false` when the budget ran out before every guess was checked (some `unchecked` have
+  `BUDGET_EXCEEDED`).
+- Boards the providers don't know are left out. An empty `found` with `complete: true` and no
+  `unchecked` means none of the guesses exists; the board may still use another name.
+- A guess can match **another company** with the same name: check the board before adding it.
+
+**Errors:**
+- `400 VALIDATION_FAILED` on `companyName`: missing or blank, longer than 200 characters, with no
+  letters or digits to build a board name from (`"companyName has no letters or digits (a–z, 0–9) to
+  build a board name from. …"`), or giving no usable board name, e.g. a single word over 100
+  characters (`"companyName gives no usable board name (board names are at most 100 characters of
+  a–z, 0–9 and -). …"`). Both say to add the source with the `boardToken` from its board URL instead.
+- `400 MALFORMED_REQUEST`: malformed JSON or unknown fields.
+- `429 FEED_LOOKUP_RATE_LIMITED` with `Retry-After: n`: another lookup is running (`"Another company
+  lookup is running; try again in 10 seconds."`), or the last one started less than 10 s ago (`"A
+  company lookup ran less than 10 seconds ago; try again in 4 seconds."`). Invalid requests don't
+  count.
+
+The 10 s budget, the 10 s spacing between lookups and the 3 guesses are defaults, set by
+`talentmatch.feed.lookup.budget`, `talentmatch.feed.lookup.min-interval` and
+`talentmatch.feed.lookup.max-candidates`; the messages above show the configured values.
+
 ---
 
 ## Job feed (Phase 5)
@@ -996,6 +1060,7 @@ exception class names or SQL.
 | 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job within the regenerate window (`Retry-After: n`) **(extension, Phase 3)** |
 | 409 | `NOTIFICATION_NOT_CONFIGURED` | `POST /notifications/test` while email isn't configured **(Phase 5)** |
 | 429 | `FEED_POLL_RATE_LIMITED` | a poll on request within 60 s of the source's last poll (`Retry-After: n`) **(Phase 5)** |
+| 429 | `FEED_LOOKUP_RATE_LIMITED` | a company lookup while another runs, or within 10 s of the last one (`Retry-After: n`) **(Phase 5)** |
 | 429 | `NOTIFICATION_TEST_RATE_LIMITED` | a test email within 30 s of the last attempt, failed attempts included (`Retry-After: n`) **(Phase 5)** |
 | 502 | `NOTIFICATION_DELIVERY_FAILED` | the test email couldn't be delivered; the message names the cause, host:port and the SMTP code, never the server's reply text or a credential. The only 502 in the API; a container-level 502 on `/error` still reports `INTERNAL_ERROR` **(Phase 5)** |
 | 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`); `/jobs/{id}/matches` and `/matches/**` only |

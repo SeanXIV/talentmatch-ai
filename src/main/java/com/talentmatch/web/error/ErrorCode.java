@@ -39,6 +39,7 @@ public enum ErrorCode {
     // 429
     REGENERATE_RATE_LIMITED,
     FEED_POLL_RATE_LIMITED,
+    FEED_LOOKUP_RATE_LIMITED,
     NOTIFICATION_TEST_RATE_LIMITED,
     // 502
     /** The test email couldn't be delivered (the only 502 in the API). */

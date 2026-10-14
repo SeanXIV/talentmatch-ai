@@ -269,6 +269,16 @@ curl -s -X POST -H 'Content-Type: application/json' localhost:8080/api/feed/sour
   -d '{"kind": "LEVER", "boardToken": "acme", "companyName": "Acme"}'
 ```
 
+Don't know the board name? Look the company up: a few likely board names are checked on
+Greenhouse, Lever and Ashby (about 10 s; nothing is added). Add what it `found` with the call
+above, after checking it is the right company. Budget, spacing and guess count are set by
+`talentmatch.feed.lookup.budget|min-interval|max-candidates` (defaults `10s`, `10s`, `3`):
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' localhost:8080/api/feed/sources/lookup \
+  -d '{"companyName": "Acme Payments"}'
+```
+
 The first poll of a board records what is already open (the baseline); only postings that
 appear after it (or were published in the last 24 h) count as new. Save your preferences so the
 feed is filtered (all fields optional; see [`API_SPEC.md`](./API_SPEC.md), "Preferences"):

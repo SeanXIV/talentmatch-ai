@@ -525,10 +525,21 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **When:** when the owner sees it matter.
 
 - [ ] **Company lookup slugs are guesses**
-  - **Now:** planned for Phase 5 step 12 (`POST /api/feed/sources/lookup`): board names are
-    guessed from the company name, so a company whose board name differs is not found.
-  - **Production:** the owner adds the board token from the board URL in that case.
-  - **When:** step 12.
+  - **Now (Phase 5):** `POST /api/feed/sources/lookup` guesses up to 3 board names from the
+    company name (run together, hyphenated, first word; legal suffixes dropped) and checks each
+    on Greenhouse, Lever and Ashby within a 10 s budget (`talentmatch.feed.lookup.*`). It is
+    read-only: nothing is added. Limits: a company whose board name differs is not found; a guess
+    can belong to another company with the same name; Lever is checked on the global instance
+    only (EU sites are added by hand); Ashby's check downloads the whole board, so a large board
+    uses more of the budget; boards left when the budget runs out are reported as
+    `BUDGET_EXCEEDED` (`complete: false`). One lookup at a time, 10 s between starts (429
+    `FEED_LOOKUP_RATE_LIMITED`). Adzuna is never queried. INFO logs hold counts and failure kinds only, never the name or a
+    guessed board name; `SourceHttpClient` logs request URLs (with the board name) at DEBUG,
+    which is off by default.
+  - **Production:** the owner adds the board token from the board URL when the lookup misses; a
+    curated name → board mapping if lookups miss often.
+  - **Why:** a wrong guess either misses a company or watches the wrong one.
+  - **When:** if missed or wrong boards show up in practice.
 
 - [ ] **Uploaded CV files**
   - **Now (Phase 4):** built. PDF only, at most 5 MB (`talentmatch.profile.max-resume-bytes`;

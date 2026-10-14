@@ -94,7 +94,7 @@ talentmatch:
 
   # Job feed (Phase 5). Source layer: com.talentmatch.feed.source.SourceProperties (max-postings,
   # http, provider hosts). Feed level: com.talentmatch.feed.FeedProperties (switches, scheduler,
-  # intervals, probe-timeout, fresh window, lease, closing, processor).
+  # intervals, probe-timeout, fresh window, lease, closing, processor, lookup).
   feed:
     enabled: ${FEED_ENABLED:true}     # false: no scheduler, no polling, no processing; endpoints still answer
     scheduler: { enabled: true, tick: 15s, initial-delay: 20s }   # tests: enabled=false, they call tick()
@@ -105,6 +105,9 @@ talentmatch:
     lease: 5m                         # a claimed source is leased this long (> connect + read timeout)
     closing: { suspicious-drop-ratio: 0.5 }
     probe-timeout: 10s                # POST /api/feed/sources waits this long for the board check
+    # POST /api/feed/sources/lookup: board names guessed from a company name, checked on Greenhouse,
+    # Lever (global) and Ashby within the budget. One lookup at a time, min-interval between starts.
+    lookup: { budget: 10s, min-interval: 10s, max-candidates: 3 }
     intervals: { ats: 5m, ats-min: 2m, aggregator: 15m, aggregator-min: 10m, max-backoff: 1h, not-found-backoff: 6h }
     max-postings-per-source: 5000     # more in one listing -> INVALID_RESPONSE (runaway data)
     http:

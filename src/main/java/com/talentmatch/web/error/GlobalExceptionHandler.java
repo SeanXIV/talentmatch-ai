@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonMappingException;
 import com.fasterxml.jackson.databind.exc.MismatchedInputException;
 import com.fasterxml.jackson.databind.exc.UnrecognizedPropertyException;
 import com.talentmatch.service.exception.ApiException;
+import com.talentmatch.service.exception.FeedLookupRateLimitedException;
 import com.talentmatch.service.exception.FeedPollRateLimitedException;
 import com.talentmatch.service.exception.MatchesBusyException;
 import com.talentmatch.service.exception.NotificationTestRateLimitedException;
@@ -139,6 +140,15 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(FeedPollRateLimitedException.class)
     ResponseEntity<ApiError> feedPollRateLimited(FeedPollRateLimitedException ex, HttpServletRequest req) {
         log.info("Feed poll rate-limited on {} (retry after {}s)", req.getRequestURI(), ex.getRetryAfterSeconds());
+        HttpHeaders headers = new HttpHeaders();
+        headers.set(HttpHeaders.RETRY_AFTER, String.valueOf(ex.getRetryAfterSeconds()));
+        return respond(ex.getStatus(), ex.getCode(), ex.getMessage(), ex.getFieldErrors(), req, headers);
+    }
+
+    @ExceptionHandler(FeedLookupRateLimitedException.class)
+    ResponseEntity<ApiError> feedLookupRateLimited(FeedLookupRateLimitedException ex, HttpServletRequest req) {
+        log.info("Feed lookup rate-limited on {} busy={} (retry after {}s)", req.getRequestURI(), ex.isBusy(),
+                ex.getRetryAfterSeconds());
         HttpHeaders headers = new HttpHeaders();
         headers.set(HttpHeaders.RETRY_AFTER, String.valueOf(ex.getRetryAfterSeconds()));
         return respond(ex.getStatus(), ex.getCode(), ex.getMessage(), ex.getFieldErrors(), req, headers);

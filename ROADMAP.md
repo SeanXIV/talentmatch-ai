@@ -122,8 +122,10 @@ Principles for everything below:
       AI-extracted from the CV; stored separately from the CV profile and used to filter the
       feed. The watchlist is refreshed when the confirmed profile `version` changes (Phase 4)
 - [x] Skill aliases (`skill_alias`), feed status, health component and metrics
-- [ ] Tests: unit and Testcontainers integration tests for polling, dedup, processing,
-      enrichment, notifications, recovery and the status endpoint (GreenMail for SMTP, stub HTTP
+- [x] Company lookup helper (`POST /api/feed/sources/lookup`): guesses board names and checks
+      Greenhouse, Lever and Ashby; read-only
+- [x] Tests: unit and Testcontainers integration tests for polling, dedup, processing,
+      enrichment, notifications, recovery, the status endpoint and the company lookup (GreenMail for SMTP, stub HTTP
       servers for the providers; no real network or model in CI)
 
 **Demonstrable output:** a phone notification minutes after a matching job goes live.
