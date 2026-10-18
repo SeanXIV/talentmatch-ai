@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_schema.sh - Verify the TalentMatch AI schema (V1 to V5) in the running
+# test_schema.sh - Verify the TalentMatch AI schema (V1 to V6) in the running
 # talentmatch-postgres container. Behavioral checks run in a transaction that
 # is rolled back, so no test data is left behind.
 #
@@ -44,7 +44,11 @@ BEGIN
                    WHERE version = '5' AND success) THEN
         RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V5';
     END IF;
-    RAISE NOTICE 'PASS: PostgreSQL 16, Flyway V1 to V5 success';
+    IF NOT EXISTS (SELECT 1 FROM flyway_schema_history
+                   WHERE version = '6' AND success) THEN
+        RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V6';
+    END IF;
+    RAISE NOTICE 'PASS: PostgreSQL 16, Flyway V1 to V6 success';
 END $$;
 
 -- ---------- Tables ----------
@@ -251,6 +255,48 @@ BEGIN
     RAISE NOTICE 'PASS: V3 explanation columns and ck_job_match_explanation_complete present';
 END $$;
 
+-- ---------- V6 seeker explanation columns, check and candidate index ----------
+DO $$
+DECLARE r record; actual text;
+BEGIN
+    FOR r IN SELECT * FROM (VALUES
+        ('seeker_explanation_payload',      'jsonb'),
+        ('seeker_explanation_input_hash',   'character(64)'),
+        ('seeker_explanation_model',        'character varying(200)'),
+        ('seeker_explanation_generated_at', 'timestamp with time zone')
+    ) AS v(col, typ) LOOP
+        SELECT format_type(a.atttypid, a.atttypmod) INTO actual
+          FROM pg_attribute a
+         WHERE a.attrelid = 'public.job_match'::regclass AND a.attname = r.col AND NOT a.attisdropped;
+        IF actual IS NULL THEN
+            RAISE EXCEPTION 'FAIL: missing column job_match.%', r.col;
+        END IF;
+        IF actual <> r.typ THEN
+            RAISE EXCEPTION 'FAIL: job_match.% is % (expected %)', r.col, actual, r.typ;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = 'public.job_match'::regclass AND a.attname = r.col AND a.attnotnull) THEN
+            RAISE EXCEPTION 'FAIL: job_match.% must be nullable', r.col;
+        END IF;
+    END LOOP;
+    IF EXISTS (SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = 'public.job_match'::regclass AND a.attname = 'seeker_ai_explanation') THEN
+        RAISE EXCEPTION 'FAIL: unexpected seeker text column (the payload holds the text)';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ck_job_match_seeker_explanation_complete' AND contype = 'c'
+                     AND conrelid = 'public.job_match'::regclass AND convalidated) THEN
+        RAISE EXCEPTION 'FAIL: missing validated check constraint ck_job_match_seeker_explanation_complete';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes
+                    WHERE schemaname = 'public' AND tablename = 'job_match'
+                      AND indexname = 'ix_job_match_candidate_score'
+                      AND indexdef LIKE '%(candidate_id, score DESC)%') THEN
+        RAISE EXCEPTION 'FAIL: missing index ix_job_match_candidate_score on job_match (candidate_id, score DESC)';
+    END IF;
+    RAISE NOTICE 'PASS: V6 seeker columns, ck_job_match_seeker_explanation_complete and ix_job_match_candidate_score present';
+END $$;
+
 -- ---------- Behavioral checks (rolled back) ----------
 BEGIN;
 
@@ -391,6 +437,83 @@ BEGIN
            explanation_model = NULL, explanation_generated_at = NULL
      WHERE candidate_id = c_id AND job_id = j_id;
     RAISE NOTICE 'PASS: clearing a whole explanation accepted';
+END $$;
+
+ROLLBACK;
+
+-- ---------- V6 behavioral checks (rolled back) ----------
+BEGIN;
+
+DO $$
+DECLARE
+    c_id uuid; j_id uuid;
+    h constant text := repeat('b', 64);
+    p constant jsonb := '{"headline":"h","explanation":"You fit.","strengths":[],"gaps":[]}';
+    r record; n int;
+BEGIN
+    INSERT INTO candidate (full_name, email) VALUES ('QA V6', 'qa.v6@example.com') RETURNING id INTO c_id;
+    INSERT INTO job (title, company) VALUES ('QA V6 Engineer', 'QA V6 Corp') RETURNING id INTO j_id;
+    INSERT INTO job_match (candidate_id, job_id, score) VALUES (c_id, j_id, 0.5);
+    RAISE NOTICE 'PASS: a row without a seeker explanation satisfies the V6 check';
+
+    -- a complete seeker explanation is accepted, independently of the (empty) recruiter columns
+    UPDATE job_match SET seeker_explanation_payload = p, seeker_explanation_input_hash = h,
+           seeker_explanation_model = 'ollama/qa', seeker_explanation_generated_at = now()
+     WHERE candidate_id = c_id AND job_id = j_id;
+    RAISE NOTICE 'PASS: complete seeker explanation accepted with recruiter columns NULL';
+
+    -- and both audiences can be stored side by side
+    UPDATE job_match SET ai_explanation = 'QA text', explanation_payload = '{"headline":"h"}',
+           explanation_input_hash = repeat('a', 64), explanation_model = 'ollama/qa',
+           explanation_generated_at = now()
+     WHERE candidate_id = c_id AND job_id = j_id;
+    RAISE NOTICE 'PASS: recruiter and seeker explanations coexist';
+
+    -- every partial or malformed seeker combination is rejected
+    FOR r IN SELECT * FROM (VALUES
+        ('payload only',            p,                         NULL::text,       NULL::text,  false),
+        ('no hash',                 p,                         NULL,             'ollama/qa', true),
+        ('no model',                p,                         h,                NULL,        true),
+        ('blank model',             p,                         h,                '  ',        true),
+        ('no generated_at',         p,                         h,                'ollama/qa', false),
+        ('no payload',              NULL::jsonb,               h,                'ollama/qa', true),
+        ('payload w/o explanation', '{"headline":"h"}'::jsonb, h,                'ollama/qa', true),
+        ('array payload',           '["explanation"]'::jsonb,  h,                'ollama/qa', true),
+        ('string payload',          '"explanation"'::jsonb,    h,                'ollama/qa', true),
+        ('upper-case hash',         p,                         repeat('B', 64),  'ollama/qa', true),
+        ('non-hex hash',            p,                         repeat('g', 64),  'ollama/qa', true),
+        ('timestamp only',          NULL::jsonb,               NULL,             NULL,        true)
+    ) AS v(label, payload, hash, model, with_ts) LOOP
+        BEGIN
+            UPDATE job_match SET seeker_explanation_payload = r.payload, seeker_explanation_input_hash = r.hash,
+                   seeker_explanation_model = r.model,
+                   seeker_explanation_generated_at = CASE WHEN r.with_ts THEN now() END
+             WHERE candidate_id = c_id AND job_id = j_id;
+            RAISE EXCEPTION 'FAIL: partial seeker explanation accepted (%)', r.label;
+        EXCEPTION WHEN check_violation THEN
+            NULL;
+        END;
+    END LOOP;
+    RAISE NOTICE 'PASS: partial / malformed seeker explanations rejected by ck_job_match_seeker_explanation_complete';
+
+    BEGIN
+        UPDATE job_match SET seeker_explanation_input_hash = 'abc' WHERE candidate_id = c_id AND job_id = j_id;
+        RAISE EXCEPTION 'FAIL: short seeker hash accepted';
+    EXCEPTION WHEN check_violation THEN
+        RAISE NOTICE 'PASS: short seeker hash rejected';
+    END;
+
+    -- clearing the seeker explanation leaves the recruiter one in place (independent checks)
+    UPDATE job_match SET seeker_explanation_payload = NULL, seeker_explanation_input_hash = NULL,
+           seeker_explanation_model = NULL, seeker_explanation_generated_at = NULL
+     WHERE candidate_id = c_id AND job_id = j_id;
+    SELECT count(*) INTO n FROM job_match
+     WHERE candidate_id = c_id AND job_id = j_id AND ai_explanation = 'QA text'
+       AND seeker_explanation_payload IS NULL;
+    IF n <> 1 THEN
+        RAISE EXCEPTION 'FAIL: clearing the seeker explanation affected the recruiter one';
+    END IF;
+    RAISE NOTICE 'PASS: clearing a whole seeker explanation accepted; recruiter explanation kept';
 END $$;
 
 ROLLBACK;

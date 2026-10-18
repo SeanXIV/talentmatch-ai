@@ -684,3 +684,16 @@ Steps 1 and 3 can run in parallel; step 2 needs step 1 (the `saveExplanation` ov
 
 Until the owner answers §0, build with the recommended defaults. Only the parts named against each decision would change.
 
+
+---
+
+## 12. Addendum: architect rulings after step 1 (2026-10-18)
+
+1. **No `repository` → `ai` cycle.** Add `com.talentmatch.repository.ExplanationTarget { RECRUITER, SEEKER }`; `MatchJdbcRepository.saveExplanation(ExplanationTarget, …)` replaces `saveExplanation(Audience, …)` (deviation from §2). `ai.Audience` stays in `ai` and gets `ExplanationTarget target()`; `ExplanationGenerator` calls `saveExplanation(task.audience().target(), …)`. Dependency direction is `ai → repository` only. Done in step 2.
+2. **`Audience.systemPrompt()`** and the SEEKER branch of `ExplanationInputHasher.hash(Audience, …)` land in step 3. In step 2 the SEEKER hasher branch may throw `IllegalStateException("SEEKER is wired in step 3")`.
+3. **Step 4 starts with locking fixes:**
+   - `JobService.update`: `matchRepository.lockJob(id)` as the first statement (before `findWithSkillsById`). Not in `create`/`delete`. Let `PessimisticLockingFailureException` propagate → existing `503 SERVICE_BUSY` + `Retry-After: 2`. Add to the PUT `/api/jobs/{id}` errors in API_SPEC.
+   - New `MatchJdbcRepository.lockCandidate(UUID)`: advisory lock `candidate_match:{id}`, same 10s timeout. Taken first in `CandidateService.update` and `updateProfileCandidate`, and first in every candidate-side scoring chunk transaction, before the job locks (order: candidate lock, then job locks ascending).
+   - `GlobalExceptionHandler.MATCHES_PATH` must also match `candidates/[^/]+/matches` and `profile/matches`, so lock failures there return `MATCHES_BUSY`.
+   - PRODUCTION_READINESS §5: log the manual-job path as fixed; log the job-side GET not serializing with candidate edits as a known gap.
+   - Tests: an IT that holds `job_match:{id}` and expects `PUT /api/jobs/{id}` → 503 `SERVICE_BUSY`; the same pattern for a candidate update holding `candidate_match:{id}`; matches endpoints → `MATCHES_BUSY`.

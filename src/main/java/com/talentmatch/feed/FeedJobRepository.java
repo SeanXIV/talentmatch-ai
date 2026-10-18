@@ -8,6 +8,7 @@ import com.talentmatch.feed.source.SourceKind;
 import com.talentmatch.preferences.SalaryPeriod;
 import com.talentmatch.preferences.Seniority;
 import com.talentmatch.preferences.Workplace;
+import com.talentmatch.repository.UuidOrder;
 import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -370,14 +371,11 @@ public class FeedJobRepository {
      * compares signed halves and would disagree for ids with the high bit set.
      */
     static List<UUID> sortedForDatabase(Collection<UUID> ids) {
-        return ids.stream().distinct().sorted(DATABASE_ORDER).toList();
+        return UuidOrder.sortedDistinct(ids);
     }
 
-    /** PostgreSQL's ordering of {@code uuid} values. */
-    static final java.util.Comparator<UUID> DATABASE_ORDER = (a, b) -> {
-        int c = Long.compareUnsigned(a.getMostSignificantBits(), b.getMostSignificantBits());
-        return c != 0 ? c : Long.compareUnsigned(a.getLeastSignificantBits(), b.getLeastSignificantBits());
-    };
+    /** PostgreSQL's ordering of {@code uuid} values ({@link UuidOrder#COMPARATOR}). */
+    static final java.util.Comparator<UUID> DATABASE_ORDER = UuidOrder.COMPARATOR;
 
     // ------------------------------------------------------------------ feed API (step 7)
 

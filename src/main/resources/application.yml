@@ -61,6 +61,7 @@ talentmatch:
   matches:
     default-limit: 10
     max-limit: 100
+    rescore-chunk: 200          # jobs scored per transaction on the candidate side (1..1000)
   recompute:
     history-size: 20
     max-failures-reported: 50
