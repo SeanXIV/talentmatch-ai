@@ -149,12 +149,37 @@ Principles for everything below:
   is never in the prompt).
 
 ## Phase 6 — Jobs for me
-- [ ] `GET /api/candidates/{id}/matches`: rank jobs for a candidate (the reverse of
+- [x] `GET /api/candidates/{id}/matches`: rank jobs for a candidate (the reverse of
       Phase 2), filters for posted-since, location/remote, minimum score, and a
-      newest-first sort
-- [ ] Explanations written for the job seeker: why you fit and what you're missing
+      newest-first sort (plus `GET /api/profile/matches` for the owner)
+- [x] Explanations written for the job seeker: why you fit and what you're missing
+      (stored separately from the recruiter's, with free-text grounding)
+- [ ] Tests: unit tests for parameters, seeker prompt, hasher, template and grounding check;
+      Testcontainers ITs for V6, ranking, two-way staleness, filters, dates, locks, seeker
+      explanations, invalidation, regenerate and errors (no real network or model in CI)
 
-**Demonstrable output:** a ranked, explained list of the newest jobs that fit you.
+**Demonstrable output:** a ranked, explained list of the newest jobs that fit you
+(`GET /api/profile/matches?sort=newest&postedSince=P2D&minScore=0.6`).
+
+**Decisions (2026-10-18)** (details in the Phase 6 spec):
+- a. `GET /api/profile/matches` is the owner's shortcut to `/candidates/{ownerId}/matches`.
+- b. Seeker explanations are stored in four new `job_match` columns (V6), next to the
+  recruiter's.
+- c. All jobs are in scope by default (`origin=all`); `origin=feed|manual` narrows it.
+- d. `listedAt` is the earlier of the provider date and first-seen time (feed), first-seen
+  without a provider date, `created_at` for manual jobs; baseline feed jobs without a provider
+  date are undated.
+- e. `country` keeps jobs in those countries, remote jobs (with `remote=include`) and jobs with
+  no location data (flagged); `location` text is a strict match.
+- f. Preference verdicts apply only to the owner; filtered and closed jobs are hidden by default.
+- g. A seeker explanation is invalidated by its input hash only (not the profile version).
+- h. Same explanation shape as Phase 3, in the second person; the name is never sent.
+- i. A seeker explanation naming a skill or number not in the facts is rejected as a whole.
+- j. One explanation stack with an `Audience` (recruiter, seeker), sharing executor and circuit.
+- k. Default sort by score; `sort=newest` on request.
+- l. Default `minScore` 0.
+- m. No background pre-generation and no explanations in notification emails in Phase 6.
+- n. Paging with `page` + `limit`, as on `/jobs/{id}/matches`.
 
 ## Phase 7 — Tailored CV and cover letter
 - [ ] For one job, generate a tailored CV (pick, order and rephrase entries from the
@@ -201,6 +226,9 @@ Principles for everything below:
   (PRODUCTION_READINESS section 6).
 - **Push notifications (ntfy or Telegram)** as a second `Notifier`, if email proves too slow to
   notice. Only if useful; nothing in Phase 5 depends on it.
+- **Background seeker explanations** for new feed jobs, and the explanation in notification
+  emails (Phase 6 decision m).
+- **Stricter free-text grounding for recruiter explanations**, like the Phase 6 seeker check.
 
 ## Minimum Viable Version
 

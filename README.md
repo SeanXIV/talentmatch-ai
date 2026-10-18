@@ -64,7 +64,9 @@ profile, which is then matched against jobs like any candidate. Phase 5 (job fee
 implemented and being hardened: the app polls the company boards and Adzuna searches you
 watch, finds skills in each new posting (dictionary first, AI later), checks it against your
 preferences, scores it against your profile and emails you when it scores above your
-threshold.
+threshold. Phase 6 (jobs for me) is implemented: `GET /api/profile/matches` ranks the jobs
+for your profile, with filters for date, country/remote, location and minimum score, a
+newest-first sort, and an explanation written to you (why you fit, what you're missing).
 
 ## Getting Started
 
@@ -319,6 +321,25 @@ Check how it is doing with `curl -s localhost:8080/api/feed/status` (sources, ba
 state and the median time from posting to email) and `GET /api/feed/jobs` for the jobs found.
 `FEED_ENABLED=false` switches polling off. **The laptop must be awake to poll**: nothing is
 checked while it sleeps.
+
+### Quick start (jobs for me)
+
+With your profile saved, list the newest jobs from the last two days that fit you at least 60%,
+each with an explanation written to you:
+
+```bash
+curl -s 'localhost:8080/api/profile/matches?sort=newest&postedSince=P2D&minScore=0.6' \
+  | jq '.matches[] | {rank, title, company, listedAt, scorePercent, explanationStatus, text: .explanation.text}'
+```
+
+Add `&country=ZA` to keep jobs in South Africa plus remote jobs (a job with no location data
+stays in, flagged `LOCATION_UNKNOWN`), `&remote=only` for remote jobs only, or `&origin=feed` to
+hide jobs you typed in yourself (and the ETL's sample jobs). The default sort is by score
+(`sort=score`). The top 5 get an AI explanation (with Ollama on a CPU the first one can take
+minutes: the item says `PENDING`, reload later); the rest get a template built from the skill
+breakdown. Any candidate's list is at `GET /api/candidates/{id}/matches` with the same
+parameters (without your preference verdicts). All parameters are in
+[`API_SPEC.md`](./API_SPEC.md), "Jobs for a candidate".
 
 _(Full-stack `docker-compose up` instructions will be added once the backend and
 frontend land.)_

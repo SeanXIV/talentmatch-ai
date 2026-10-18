@@ -13,6 +13,9 @@ The schema is created by the Flyway migrations in `src/main/resources/db/migrati
 - `V5__job_feed.sql`: job origin (`MANUAL` | `FEED`), skill aliases, and the job feed tables
   (`feed_source`, `feed_job`, `job_posting`, `job_preferences`, `notification_settings`,
   `feed_notification`, `feed_state`, `feed_api_usage`) (Phase 5; see "Job origin" below).
+- `V6__seeker_matches.sql`: seeker-facing AI explanations on `job_match` (four
+  `seeker_explanation_*` columns and their CHECK) and the candidate-side ranking index
+  (Phase 6; see "AI explanations" below).
 
 ## Entity-Relationship Diagram
 
@@ -82,6 +85,10 @@ erDiagram
         string explanation_input_hash
         string explanation_model
         timestamp explanation_generated_at
+        jsonb seeker_explanation_payload
+        string seeker_explanation_input_hash
+        string seeker_explanation_model
+        timestamp seeker_explanation_generated_at
         timestamp computed_at
         timestamp updated_at
     }
@@ -416,9 +423,16 @@ every time the dashboard is opened. There is at most one row per
 `job_match` is written **only** by the API's set-based upsert
 (`INSERT ... SELECT FROM unnest(...) ON CONFLICT (candidate_id, job_id) DO UPDATE SET score,
 computed_at`), never through JPA. `computed_at` means "verified fresh at": every upsert
-advances it to `now()`, even when the score is unchanged. `ai_explanation` and the V3
-`explanation_*` columns are never touched by the upsert; they are written only by the guarded
-explanation `UPDATE` (below).
+advances it to `now()`, even when the score is unchanged. `ai_explanation`, the V3
+`explanation_*` columns and the V6 `seeker_explanation_*` columns are never touched by the upsert;
+they are written only by the guarded explanation `UPDATE`s (below). The job side
+(`GET /jobs/{id}/matches`, `POST /matches/recompute`, the feed processor) upserts one job × many
+candidates; the candidate side (`GET /candidates/{id}/matches`, Phase 6) upserts one candidate ×
+many jobs with the same SQL shape (joined to `job`, so a job deleted meanwhile is skipped).
+
+**Index (V6):** `ix_job_match_candidate_score (candidate_id, score DESC)` serves the
+candidate-side ranking (score sort) and counts, mirroring V1's `ix_job_match_job_score (job_id,
+score DESC)` for the job side.
 
 ### AI explanations (V3)
 
@@ -459,6 +473,36 @@ UPDATE job_match m SET ai_explanation = …, explanation_payload = CAST(… AS j
 The timestamps and score are the values read with the page. Equality detects any committed
 edit of the candidate, the job or their skill links (V2 triggers), and any rescore, so an
 explanation generated from outdated inputs is discarded (0 rows) instead of stored.
+
+### Seeker explanations (V6): two audiences, two hashes, one guarded write each
+
+Phase 6 adds a second explanation per row, written **to the job seeker** (second person) for
+`GET /api/candidates/{id}/matches` and `GET /api/profile/matches`. The recruiter explanation (V3
+columns, `GET /api/jobs/{id}/matches`) and the seeker explanation live side by side, so neither
+overwrites, or marks stale, the other.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `seeker_explanation_payload` | `jsonb` | validated seeker AI output `{headline, explanation, strengths[], gaps[]}` (second person); its `explanation` key is the text (there is no separate text column) |
+| `seeker_explanation_input_hash` | `char(64)` | sha256 hex of the exact seeker prompt (seeker system prompt + user message) |
+| `seeker_explanation_model` | `varchar(200)` | provider/model label |
+| `seeker_explanation_generated_at` | `timestamptz` | when it was generated |
+
+Check constraint `ck_job_match_seeker_explanation_complete`: all four columns are `NULL`, or all
+are set (a JSON object payload **with an `explanation` key**, a 64-char lower-case hex hash, a
+non-blank model and a timestamp). Not mapped in the `JobMatch` entity.
+
+- **Staleness:** the same rule as V3, with the seeker hash: fresh iff
+  `seeker_explanation_input_hash` equals the hash of the seeker prompt the API would send now.
+  The seeker prompt contains the job's title, company and description, the score and skill
+  breakdown (with years) and the candidate's summary (for the owner: profile headline +
+  summary). It never contains the candidate's name or email, so a name or email change, or a
+  profile save that changes nothing the model sees, keeps it fresh; a summary, skill, years,
+  job or score change makes it `STALE`. Editing the seeker system prompt makes every seeker
+  explanation stale; a model change does not. The recruiter hash is unchanged by Phase 6.
+- **Guarded write:** `MatchJdbcRepository.saveExplanation(SEEKER, …)` uses the same `WHERE` as
+  V3 (`c.updated_at`, `j.updated_at`, `m.score` equal to the values read with the page) and sets
+  only the four seeker columns; the recruiter write sets only the V3 columns.
 
 ### Master profile (V4)
 
@@ -537,8 +581,35 @@ the database, they catch both writers: the API and the ETL.
 computed_at < GREATEST(candidate.updated_at, job.updated_at)
 ```
 
-and a missing row counts as stale. The API recomputes stale rows on read
-(`GET /jobs/{id}/matches`) or in batch (`POST /matches/recompute`).
+and a missing row counts as stale. The API recomputes stale rows on read from either side
+(`GET /jobs/{id}/matches`, and since Phase 6 `GET /candidates/{id}/matches` /
+`GET /profile/matches`) or in batch (`POST /matches/recompute`); the feed processor scores the
+owner's row for each processed feed job. Every writer takes the per-job advisory lock (below), so
+a score is never written from skills another transaction is replacing.
+
+**Owner profile saves (Phase 6 finding).** `PUT /api/profile` syncs the owner's candidate with
+Hibernate dirty checking and the V2 link triggers, so `candidate.updated_at` is bumped **only**
+when the name, email, headline/summary, skills or years really change. An identical save marks
+nothing stale (no rescoring), and the owner's seeker explanations stay `READY`.
+
+### Advisory locks on matches
+
+Transaction-scoped advisory locks (`pg_advisory_xact_lock(hashtextextended(key, 0))`), each wait
+bounded by `SET LOCAL lock_timeout = '10s'`:
+
+| Key | Taken by | Purpose |
+|---|---|---|
+| `job_match:{jobId}` | `GET /jobs/{id}/matches` scoring, `POST /matches/recompute` (per job), the feed processor (before it changes `job_skill`) and `FeedScorer`, `PUT /jobs/{id}` (first statement, Phase 6), and candidate-side scoring chunks (one lock per job in the chunk) | serializes every score write and skill change for one job, so a row's `computed_at` never vouches for old skills |
+| `candidate_match:{candidateId}` (Phase 6) | `PUT /candidates/{id}`, the owner sync in `PUT /profile` (later saves), and every candidate-side scoring chunk | serializes candidate edits with candidate-side scoring |
+
+**Lock order:** the candidate lock first, then job locks in ascending PostgreSQL uuid order
+(candidate-side chunks of up to `talentmatch.matches.rescore-chunk` = 200 jobs, one transaction
+each, well under `max_locks_per_transaction`). Every other locker holds a single job lock at a
+time, so no cycle can form. A timeout or a deadlock (backstop) surfaces as
+`PessimisticLockingFailureException`: `503 MATCHES_BUSY` on the matches endpoints,
+`503 SERVICE_BUSY` on the `PUT`s (nothing saved). Known gaps (PRODUCTION_READINESS §5): the
+job-side GET doesn't take the candidate lock, and candidate and skill deletes take no advisory
+lock.
 
 ## Match Scoring Rule
 

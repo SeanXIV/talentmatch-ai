@@ -170,7 +170,11 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Now (Phase 3):** `GET /jobs/{id}/matches` waits for the page's explanations up to a
     request budget (`talentmatch.ai.request-budget`, 8s default) on a bounded in-process
     executor (`aiExecutor`); unfinished generations keep running in the background, persist
-    themselves, and the item is reported `PENDING` ("reload in a few seconds").
+    themselves, and the item is reported `PENDING` ("reload in a few seconds"). Since Phase 6
+    two audiences share that one executor (2 threads, queue 20), circuit and `LocalModelGate`:
+    recruiter explanations (`/jobs/{id}/matches`) and seeker explanations
+    (`/candidates/{id}/matches`, `/profile/matches`) compete for it; a full queue gives the
+    `AI_BUSY` template.
   - **Production:** a real queue/worker with persisted job state, and polling or SSE so the
     frontend refreshes without a full reload.
   - **Why:** LLM latency must not block or time out the match endpoint, and background work
@@ -199,8 +203,8 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **When:** before first prod deploy.
 
 - [ ] **Cost caps and quotas**
-  - **Now (dev):** only the per-job regenerate rate limit, top-N and the executor size bound
-    spend.
+  - **Now (dev):** only the per-job and (Phase 6) per-candidate regenerate rate limits, top-N
+    and the executor size bound spend.
   - **Production:** monthly cost caps and per-tenant quotas with alerts.
   - **When:** before enabling a paid provider in production.
 
@@ -214,7 +218,9 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Now (dev):** hosted profiles send the candidate's name and summary (never the email)
     to OpenAI/Anthropic; data is synthetic. Ollama keeps everything local. From Phase 4 this
     is the owner's own CV: sending it to a hosted provider is the owner's choice (decide per
-    feature: CV extraction and tailoring send far more than a name and summary).
+    feature: CV extraction and tailoring send far more than a name and summary). Phase 6 seeker
+    explanations send the owner's profile headline and summary (no name, no email) when a
+    hosted provider is configured.
   - **Production:** DPA with the provider, candidate consent, data-residency review, or
     pseudonymize names before sending.
   - **When:** before using real candidate data with a hosted provider.
@@ -270,6 +276,43 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     update or delete (API and ETL alike; no-op ETL reruns bump nothing). A row is stale
     when `computed_at < GREATEST(candidate.updated_at, job.updated_at)` (`DATA_MODEL.md`).
   - **Why:** without it, persisted matches silently go out of date.
+
+- [x] **Manual job edits race with match scoring** (fixed in Phase 6)
+  - **Was:** `PUT /api/jobs/{id}` replaced `job_skill` without the job's match lock, so a
+    concurrent scorer could read the old skills and then write a score whose `computed_at` made
+    it look fresh.
+  - **Now:** `JobService.update` takes `job_match:{id}` as its first statement (the lock every
+    match writer uses); a 10 s wait ends in `503 SERVICE_BUSY` with nothing saved. Candidate
+    edits (`PUT /api/candidates/{id}`, the owner sync in `PUT /api/profile`) take the new
+    `candidate_match:{id}` lock, which candidate-side scoring takes before its job locks
+    (`DATA_MODEL.md`, "Advisory locks on matches"). Job create and delete don't lock (nothing
+    stale can be written for a job that doesn't exist yet; delete cascades the rows).
+
+- [ ] **Job-side GET is not serialized with candidate edits** (known gap, Phase 6)
+  - **Now:** `GET /api/jobs/{id}/matches` holds only the job lock, not the candidates' locks, so
+    a candidate edit committing while it scores can leave that candidate's row scored from the
+    old skills but with a `computed_at` that looks fresh (the V2 triggers stamp transaction start).
+    `?regenerate=true` repairs it; the candidate side is not affected (it takes the candidate lock).
+  - **Production:** switch the V2 triggers to `clock_timestamp()`, or re-check
+    `candidate.updated_at` under the lock before the upsert.
+  - **When:** with the trigger follow-up migration.
+
+- [ ] **Candidate and skill deletes take no advisory lock** (known gap, Phase 6)
+  - **Now:** `DELETE /api/candidates/{id}` and skill deletes (which cascade to `candidate_skill`,
+    `job_skill` and `job_match`) take row locks only. Racing a scoring transaction they can
+    deadlock; PostgreSQL aborts one side, which surfaces as `503 MATCHES_BUSY` (matches) or
+    `503 SERVICE_BUSY` (the delete). Retrying succeeds; no data is wrong.
+  - **Production:** take `candidate_match:{id}` (and, for skills, the affected job locks in uuid
+    order) first in those deletes.
+  - **When:** before concurrent multi-user editing.
+
+- [ ] **Explanation validator doesn't reject closing tags** (known gap, Phase 6)
+  - **Now:** `MatchExplanationValidator` rejects echoes of opening tags (`<job_description`,
+    `<candidate_summary`, `<profile_summary`) and section names, but not closing tags
+    (`</profile_summary>`, `</candidate_summary>`, `</job_description>`). Output is plain JSON
+    text and never rendered as HTML by the API, so the risk is a cosmetic leak of a tag.
+  - **Production:** reject `</…>` forms too (with the prompt-injection review, section 4).
+  - **When:** before first prod deploy.
 
 ## 6. API, security & UX
 
@@ -540,6 +583,38 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     curated name → board mapping if lookups miss often.
   - **Why:** a wrong guess either misses a company or watches the wrong one.
   - **When:** if missed or wrong boards show up in practice.
+
+- [ ] **Candidate-side rescoring cost**
+  - **Now (Phase 6):** `GET /api/candidates/{id}/matches` scores the stale in-scope jobs on read,
+    in chunks of 200 (`talentmatch.matches.rescore-chunk`), one transaction each with the
+    candidate lock plus one advisory lock per job. A first read for a new candidate over
+    thousands of feed jobs takes many lock round trips; above 10 000 targets one WARN is logged.
+    Feed jobs already scored for the owner by the processor are reused.
+  - **Production:** score feed jobs for all candidates in the background, or paginate in SQL
+    over a materialized ranking.
+  - **Why:** the first request for a candidate must not take seconds or hold hundreds of locks.
+  - **When:** before more than one real candidate uses the feed.
+
+- [ ] **Seeker explanation grounding is heuristic**
+  - **Now (Phase 6):** `SeekerGroundingCheck` rejects the whole seeker explanation when it names
+    a vocabulary skill that isn't on the job, a number not in the match facts, or claims a
+    missing skill ("you have …") without a negation. Skills outside the vocabulary, spelled-out
+    numbers and subtler polarity can't be detected. A reject shows the template
+    (`GENERATION_FAILED`). Recruiter explanations still get only the Phase 3 checks.
+  - **Production:** the golden set (section 4, "Offline model evaluation") covering both
+    audiences; stricter free-text grounding for recruiter explanations.
+  - **Why:** "never invent" is the product promise.
+  - **When:** before relying on seeker explanations day to day.
+
+- [ ] **`listedAt` is approximate**
+  - **Now (Phase 6):** `listedAt` (for `postedSince` and `sort=newest`) is the earlier of the
+    provider's posting date and the first-seen time, or the first-seen time when the provider
+    gives no date, or `created_at` for MANUAL jobs. Baseline feed jobs (already open when their
+    source was added) without a provider date are undated: excluded by `postedSince`, last in
+    `newest`.
+  - **Production:** good enough; revisit if providers' dates prove unreliable.
+  - **Why:** "new jobs" is only as good as the dates behind it.
+  - **When:** if the newest list looks wrong in practice.
 
 - [ ] **Uploaded CV files**
   - **Now (Phase 4):** built. PDF only, at most 5 MB (`talentmatch.profile.max-resume-bytes`;

@@ -8,7 +8,7 @@ ISO-8601 UTC (`2026-10-01T10:00:00Z`). Ids are UUIDs.
 Items marked **(extension)** were added in Phase 2 on top of the Phase 0 draft, and items
 marked **(extension, Phase 3)** were added with the AI explanation layer; they are all
 additive, so clients written against the draft keep working. The **Profile** endpoints
-(Phase 4) are new.
+(Phase 4) are new. **(Phase 5)** and **(Phase 6)** items are new in those phases.
 
 > **Personal data, no auth.** `/api/profile/**` returns the owner's CV and contact details
 > (PII) to anyone who can reach the port. The server listens on `127.0.0.1` by default
@@ -112,7 +112,12 @@ identical `PUT` writes nothing (and does not make matches stale). Last write win
 
 **Response `200`** candidate detail. **Errors:** `400`, `404 CANDIDATE_NOT_FOUND`, `409 EMAIL_ALREADY_EXISTS`,
 `409 DATA_CONFLICT` for the owner's own candidate (`"This candidate is your profile; edit it with
-PUT /api/profile."`, Phase 4).
+PUT /api/profile."`, Phase 4), `503 SERVICE_BUSY` (+ `Retry-After: 2`) **(Phase 6)**.
+
+**Phase 6:** the update first takes the candidate's match lock (`candidate_match:{id}`), so it
+serializes with candidate-side scoring (`GET /candidates/{id}/matches`). If the lock can't be taken
+within 10 s, nothing is saved and the answer is `503 SERVICE_BUSY` (`"The server is busy with a
+conflicting update. Please try again in a few seconds."`); retry.
 
 ### `DELETE /candidates/{id}` **(extension)**
 **Response `204`**. Also deletes the candidate's skills and match rows.
@@ -181,7 +186,15 @@ Full replace, links diffed like candidates. **Response `200`**.
 **Errors:** `400`, `404 JOB_NOT_FOUND`, `409 JOB_ALREADY_EXISTS`, `409 DATA_CONFLICT` for a FEED
 job (checked before the body is validated): `"This job comes from the job feed (source
 greenhouse:acme) and is kept up to date automatically. It can't be edited or deleted here."`
-(the source part is omitted when the job has no posting).
+(the source part is omitted when the job has no posting), `503 SERVICE_BUSY` (+ `Retry-After: 2`)
+**(Phase 6)**.
+
+**Phase 6:** the update first takes the job's match lock (`job_match:{id}`, the lock every match
+writer uses), so a score is never computed from skills that are being replaced. If the lock can't
+be taken within 10 s (for example while `GET /jobs/{id}/matches` or a candidate's matches request
+is scoring this job), nothing is saved and the answer is `503 SERVICE_BUSY` (`"The server is busy
+with a conflicting update. Please try again in a few seconds."`); retry. `POST` and `DELETE` don't
+take the lock.
 
 ### `DELETE /jobs/{id}` **(extension)**
 **Response `204`** (also deletes the job's skills and match rows). **Errors:** `400`, `404`,
@@ -832,6 +845,181 @@ Only one run at a time.
 **Errors:** `400 INVALID_ID`, `404 RECOMPUTE_RUN_NOT_FOUND` (`"No recompute run with id …. Run
 status is kept in memory (last 20 runs) and is lost when the server restarts."`)
 
+### Jobs for a candidate (Phase 6)
+
+#### `GET /candidates/{id}/matches` and `GET /profile/matches`
+
+Ranked, explained jobs for one candidate: the reverse of `GET /jobs/{id}/matches`, using the same
+`job_match` score cache and staleness rule. `GET /profile/matches` is the owner's shortcut: the
+same list as `/candidates/{ownerCandidateId}/matches`, with the same parameters
+(`404 PROFILE_NOT_FOUND` before a profile is saved).
+
+Missing or stale scores for the in-scope jobs (older than the latest change of the candidate or
+the job) are computed first, in chunks of `talentmatch.matches.rescore-chunk` (200) jobs, each
+under the candidate's match lock and the jobs' match locks (see DATA_MODEL, "Advisory locks").
+Feed jobs the feed processor already scored for the owner are reused, not rescored.
+
+| Param | Default | Allowed | Notes |
+|---|---|---|---|
+| `limit` | `10` | `1..100` (`talentmatch.matches.default-limit` / `max-limit`) | page size |
+| `page` | `0` | `>= 0`, and `page * limit` must fit in an int | zero-based |
+| `minScore` | `0` | `0..1` | only jobs with `score >= minScore`; 0-score jobs are listed at the default |
+| `sort` | `score` | `score`, `newest` (case-insensitive) | `score`: score desc, then `listedAt` desc (undated last), then job id. `newest`: `listedAt` desc (undated last), then score desc, then job id. Stable across pages and ties |
+| `postedSince` | none | an ISO-8601 instant (`2026-10-16T00:00:00Z`, an offset is accepted) **or** a positive ISO-8601 duration of at most `P366D` (`P2D`, `PT6H`), meaning now minus the duration | compared with `listedAt`; undated jobs (`listedAtSource: UNKNOWN`) are excluded |
+| `country` | none | ISO 3166 alpha-2 codes, comma-separated and/or repeated (`country=za,GB&country=NA`), at most 20; upper-cased, duplicates dropped | a non-remote feed job must list one of the countries. A feed job with **no** country data passes (flag `LOCATION_UNKNOWN`); MANUAL jobs pass; with `remote=include` (or `only`) a REMOTE job passes whatever its countries |
+| `remote` | `include` | `include`, `only`, `exclude` (case-insensitive) | `only`: REMOTE feed jobs only (MANUAL jobs drop out). `exclude`: no REMOTE jobs |
+| `location` | none | 2..100 characters after NFKC, trim and whitespace collapse | case-insensitive substring of the feed job's location text (`%` and `_` are literal); MANUAL jobs and jobs without location text drop out |
+| `origin` | `all` | `all`, `feed`, `manual` (case-insensitive) | `feed` hides MANUAL (incl. ETL) jobs |
+| `includeClosed` | `false` | `true` / `false` only | closed feed jobs are hidden by default, for every candidate |
+| `includeFiltered` | `false` | `true` / `false` only | **owner only**: jobs the owner's preferences FILTERED are hidden (and not scored or counted) unless `true`. Ignored for other candidates, who see them anyway |
+| `regenerate` | `false` | `true` / `false` only | rescores **every** in-scope job and, with AI enabled, forces new seeker explanations for the page's top-N rows. Rate-limited per candidate (below) |
+
+A blank text parameter means "use the default". Only jobs with at least one skill are ranked
+(`unmatchableJobs` counts the in-scope jobs without skills).
+
+**`listedAt`** (when the job was listed) and `listedAtSource`:
+
+| `listedAtSource` | Job | `listedAt` |
+|---|---|---|
+| `POSTED` | feed job with a provider date | the earlier of `postedAt` and `firstSeenAt` (guards against provider clock skew) |
+| `FIRST_SEEN` | feed job without a provider date, found after its source was added | `firstSeenAt` |
+| `CREATED` | MANUAL job | the job's `createdAt` |
+| `UNKNOWN` | baseline feed job (already open when its source was added) without a provider date | `null`: excluded by `postedSince`, last in `sort=newest`, otherwise listed |
+
+**Response `200`**
+```json
+{
+  "candidateId": "6c1e…", "owner": true, "profileVersion": 4,
+  "sort": "NEWEST", "page": 0, "limit": 10, "totalPages": 2, "totalElements": 14,
+  "recomputedJobs": 3, "explanationsGenerated": 1, "unmatchableJobs": 2,
+  "reason": null, "message": null,
+  "matches": [
+    {
+      "rank": 1,
+      "jobId": "a71f…", "title": "Backend Engineer", "company": "Acme", "origin": "FEED",
+      "listedAt": "2026-10-18T07:12:00Z", "listedAtSource": "POSTED",
+      "postedAt": "2026-10-18T07:12:00Z", "firstSeenAt": "2026-10-18T07:16:41Z", "closedAt": null,
+      "baseline": false, "primaryUrl": "https://jobs.lever.co/acme/…",
+      "workplace": "HYBRID", "locationText": "Cape Town", "countryCodes": ["ZA"], "seniority": "SENIOR",
+      "salary": { "min": 600000, "max": 800000, "currency": "ZAR", "period": "YEAR", "estimated": false },
+      "enrichmentStatus": "SUCCEEDED",
+      "preferenceVerdict": "PASS", "filterReasons": [], "flags": [],
+      "score": 0.8, "scorePercent": 80,
+      "summary": "Matches 2 of 2 required skills; 0 of 1 nice-to-have.",
+      "breakdown": {
+        "earnedPoints": 20, "maxPoints": 25,
+        "matchedRequired":   [ { "skillId": "…", "name": "Java", "yearsExperience": 5 },
+                               { "skillId": "…", "name": "SQL", "yearsExperience": null } ],
+        "matchedNiceToHave": [],
+        "missingRequired":   [],
+        "missingNiceToHave": [ { "skillId": "…", "name": "Kubernetes", "yearsExperience": null } ]
+      },
+      "aiExplanation": "You have both required skills, Java with 5 years of experience and SQL. The one thing missing is Kubernetes, which the role lists as nice-to-have.",
+      "explanationStatus": "READY",
+      "explanation": {
+        "source": "AI", "headline": "You cover every required skill",
+        "text": "You have both required skills, Java with 5 years of experience and SQL. The one thing missing is Kubernetes, which the role lists as nice-to-have.",
+        "strengths": ["Java with 5 years", "SQL"], "gaps": ["Kubernetes (nice-to-have)"],
+        "model": "ollama/qwen2.5:7b-instruct", "generatedAt": "2026-10-18T07:20:03Z",
+        "reason": null, "note": null
+      },
+      "computedAt": "2026-10-18T07:16:45Z"
+    }
+  ]
+}
+```
+
+Field notes:
+- `owner`: the candidate is the owner's (the profile's) candidate. `profileVersion` is the owner's
+  current profile version, `null` for other candidates. `sort` is `SCORE` or `NEWEST`.
+- `rank` = `page * limit + index + 1`.
+- **Feed-only fields** (`primaryUrl`, `firstSeenAt`, `postedAt`, `closedAt`, `baseline`,
+  `workplace`, `locationText`, `seniority`, `salary`, `enrichmentStatus`) are `null` for MANUAL
+  jobs, and `countryCodes` is `[]`. `salary` is `null` when the posting states none.
+- **Preference fields:** `preferenceVerdict` (`PASS`, `FILTERED` or `null`), `filterReasons` and
+  the stored preference `flags` (as on `/feed/jobs`) are **owner only**: `null` / `[]` for any
+  other candidate.
+- **`LOCATION_UNKNOWN` (computed):** for **any** caller who passes `country`, `flags` also gets
+  `LOCATION_UNKNOWN` on a feed job that has no country data and isn't REMOTE, so you can see it
+  passed the country filter unchecked. REMOTE and MANUAL jobs never get it. Without `country`, a
+  non-owner's `flags` is always `[]`. No duplicates (the owner's stored flags may already have it).
+- `score`, `scorePercent`, `summary`, `breakdown`, `computedAt`: as on `/jobs/{id}/matches`
+  (score rounded to 4 decimals; years never change the score; `yearsExperience: null` means
+  unknown).
+- `recomputedJobs` = scores written by this request (0 when everything was fresh);
+  `explanationsGenerated` = AI explanations generated by this request; `unmatchableJobs` =
+  in-scope jobs without skills (not ranked).
+- `aiExplanation`, `explanationStatus`, `explanation`: the Phase 3 contract and invariant
+  (`aiExplanation != null` ⇔ `READY` ⇔ `source == "AI"`), written to the job seeker (below).
+
+**Reasons** (`200`, with `message`):
+- `NO_MATCHABLE_JOBS` (no ranked job and no in-scope job with skills): "No job with listed skills
+  matches these filters. Jobs without skills can't be ranked; widen the filters or wait for the
+  feed to find skills."
+- `CANDIDATE_HAS_NO_SKILLS` (otherwise, when the candidate has no skills): "This candidate has no
+  skills yet, so every job scores 0%. Add skills (or confirm your profile with PUT /api/profile)
+  to see real matches." Jobs are still listed, all at 0, when `minScore` is 0.
+
+**Validation messages** (`400 INVALID_PARAMETER`, `field` = the parameter; the first invalid
+parameter is reported):
+
+| Param | Message |
+|---|---|
+| `limit` | "limit must be between 1 and 100." |
+| `page` | "page must be 0 or greater." / "page is too large for this page size." |
+| `minScore` | "minScore must be between 0 and 1." |
+| `sort` | "sort must be score or newest." |
+| `postedSince` | "postedSince must be an ISO-8601 instant like 2026-10-16T00:00:00Z or a duration like P2D (at most P366D)." (also for `P0D` and negative durations) |
+| `country` | "'XX' is not an ISO country code." / "Use at most 20 country codes." |
+| `remote` | "remote must be include, only or exclude." |
+| `location` | "location must be 2 to 100 characters." |
+| `origin` | "origin must be all, feed or manual." |
+| `includeClosed`, `includeFiltered`, `regenerate` | "Parameter 'includeClosed' must be true or false." (strict binding) |
+
+**Rate limit:** with AI enabled, `regenerate=true` is allowed **once per candidate per
+`regenerate-window`** (default 60 s). `/profile/matches` and `/candidates/{ownerId}/matches`
+share the owner's slot; the candidate slot never collides with a job's slot on
+`/jobs/{id}/matches`, even for the same UUID. A repeat gets `429 REGENERATE_RATE_LIMITED` with
+`Retry-After: n` and the message "Matches for this candidate were regenerated recently. You can
+regenerate again in n seconds; reload without regenerate=true to see the current results." The
+check runs after parameter validation (and, on `/profile/matches`, after the profile lookup) and
+before any other database work; a request that then fails (404, 503, …) releases the slot. With
+AI disabled, `regenerate` only rescores and is never rate-limited.
+
+**Errors:** `400 INVALID_ID`, `400 INVALID_PARAMETER`, `404 CANDIDATE_NOT_FOUND` ("No candidate
+with id ….") on `/candidates/{id}/matches`, `404 PROFILE_NOT_FOUND` ("You have not saved a profile
+yet. …") on `/profile/matches`, `429 REGENERATE_RATE_LIMITED` (+ `Retry-After: n`),
+`503 MATCHES_BUSY` (+ `Retry-After: 2`) when a match lock of the candidate or of one of its jobs is
+held for more than 10 s (or on a deadlock): "Matches for this candidate are being recalculated by
+another request. Please try again in a few seconds." (score chunks already committed stay; a retry
+has less to do), `503 DATABASE_UNAVAILABLE` (+ `Retry-After: 5`).
+
+#### Seeker explanations (Phase 6)
+
+- **Voice:** written to the job seeker in the second person ("you have Java…"), the same shape as
+  the recruiter explanation (`headline`, `text`, `strengths`, `gaps`), so a client can reuse one
+  component. The template (`source: TEMPLATE`) is in the second person too, e.g. headline
+  "Strong match: you have 2 of 2 required skills", text "You have all 2 required skills: Java
+  (5 years), SQL. Nice-to-have skills: you're missing Kubernetes."
+- **What the model sees:** the job's title, company and description, the score and skill
+  breakdown, and the candidate's summary (for the owner: profile headline + summary). The
+  candidate's **name and email are never sent**, nor preferences, salary, the CV or experience
+  entries.
+- **Storage and freshness:** stored separately from the recruiter explanation (both can be
+  `READY` for the same pair). A stored seeker explanation is reused until anything the model sees
+  changes (the summary, skills or years, the job's title, company, description or skills, the
+  score); a profile save that changes none of these keeps it `READY`.
+- **Top N, budget, PENDING, notes:** as in Phase 3, over this list's ranks. For `STALE` items the
+  note is prefixed with "The previous AI explanation is out of date because your profile or the
+  job changed. ".
+- **Grounding (stricter than Phase 3):** besides the Phase 3 checks on `strengths` and `gaps`, the
+  whole output is rejected (template with `reason: GENERATION_FAILED`, nothing stored) if any
+  field names a known skill that isn't one of this job's skills, if the headline or text contains
+  a number that isn't in the match facts (score percent, points, a matched skill's years, the
+  skill counts, a number in the job title or company), or if a sentence says "you have/bring/know"
+  a missing skill without a negation. Skills outside the skill vocabulary and spelled-out numbers
+  can't be checked.
+
 ---
 
 ## Profile (Phase 4)
@@ -979,7 +1167,12 @@ Save the reviewed profile as the master profile (creates it on the first call).
 
 The owner's candidate is created or updated in the same transaction: `fullName`, `email`,
 `summary` = headline + summary, skills with years. Skill changes mark the owner's cached
-matches stale, as for any candidate.
+matches stale, as for any candidate. **(Phase 6)** Only a visible change (name, email,
+headline/summary, skills or years) bumps the candidate's `updatedAt`; an identical save rescores
+nothing and keeps the owner's seeker explanations (`GET /profile/matches`) current. On later saves
+the candidate update first takes the candidate's match lock (`candidate_match:{id}`, as
+`PUT /candidates/{id}`); if it can't be taken within 10 s, nothing is saved and the answer is
+`503 SERVICE_BUSY` (+ `Retry-After: 2`).
 
 **Response `200`**:
 ```json
@@ -995,7 +1188,8 @@ flags new skills that look like existing ones.
 `resumeId`), `400 MALFORMED_REQUEST`, `409 EMAIL_ALREADY_EXISTS` on the first save when another
 candidate already uses this email (field `profile.email`: `"Candidate <id> already uses this
 email. Delete it or change its email, then save your profile again."`; the existing candidate is
-never adopted or merged).
+never adopted or merged), `503 SERVICE_BUSY` (+ `Retry-After: 2`, `"The server is busy with a
+conflicting update. Please try again in a few seconds."`) **(Phase 6)**.
 
 ### `GET /profile`
 The saved master profile (same body as the `PUT` response, `warnings: []`).
@@ -1057,14 +1251,14 @@ exception class names or SQL.
 | 409 | `RESUME_EXTRACTION_IN_PROGRESS` | the CV is queued or being read **(Phase 4)** |
 | 409 | `FEED_POLL_IN_PROGRESS` | the feed source is being polled right now **(Phase 5)** |
 | 409 | `FEED_DISABLED` | the job feed is switched off (`FEED_ENABLED=false`) **(Phase 5)** |
-| 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job within the regenerate window (`Retry-After: n`) **(extension, Phase 3)** |
+| 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job (`/jobs/{id}/matches`) or, **(Phase 6)**, for a candidate (`/candidates/{id}/matches`, `/profile/matches`) within the regenerate window (`Retry-After: n`); the message names the job or the candidate **(extension, Phase 3)** |
 | 409 | `NOTIFICATION_NOT_CONFIGURED` | `POST /notifications/test` while email isn't configured **(Phase 5)** |
 | 429 | `FEED_POLL_RATE_LIMITED` | a poll on request within 60 s of the source's last poll (`Retry-After: n`) **(Phase 5)** |
 | 429 | `FEED_LOOKUP_RATE_LIMITED` | a company lookup while another runs, or within 10 s of the last one (`Retry-After: n`) **(Phase 5)** |
 | 429 | `NOTIFICATION_TEST_RATE_LIMITED` | a test email within 30 s of the last attempt, failed attempts included (`Retry-After: n`) **(Phase 5)** |
 | 502 | `NOTIFICATION_DELIVERY_FAILED` | the test email couldn't be delivered; the message names the cause, host:port and the SMTP code, never the server's reply text or a credential. The only 502 in the API; a container-level 502 on `/error` still reports `INTERNAL_ERROR` **(Phase 5)** |
-| 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`); `/jobs/{id}/matches` and `/matches/**` only |
-| 503 | `SERVICE_BUSY` | any other endpoint lost a lock conflict with a concurrent update; nothing was saved, retry (`Retry-After: 2`) **(Phase 5)** |
+| 503 | `MATCHES_BUSY` | another request is recomputing these matches (`Retry-After: 2`); `/jobs/{id}/matches`, `/matches/**` and, **(Phase 6)**, `/candidates/{id}/matches` and `/profile/matches` (with the candidate message "Matches for this candidate are being recalculated by another request. Please try again in a few seconds.") only |
+| 503 | `SERVICE_BUSY` | any other endpoint lost a lock conflict with a concurrent update; nothing was saved, retry (`Retry-After: 2`) **(Phase 5)**. Phase 6: also `PUT /jobs/{id}`, `PUT /candidates/{id}` and `PUT /profile` after a 10 s wait for a match lock |
 | 503 | `DATABASE_UNAVAILABLE` | database unreachable (`Retry-After: 5`) |
 | 503 | `UPLOAD_BUSY` | every PDF reader is busy; retry the upload in a minute **(Phase 4)** |
 | 500 | `INTERNAL_ERROR` | unexpected; message includes the request id to quote |
