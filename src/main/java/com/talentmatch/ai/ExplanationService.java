@@ -8,9 +8,11 @@ import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
@@ -27,12 +29,12 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 /**
- * Attaches an explanation to every match on a page. Never throws and never blocks longer than
- * {@code request-budget} (plus small overhead).
+ * Attaches an explanation to every match on a page, written for one {@link Audience}. Never throws
+ * for AI or database faults and never blocks longer than {@code request-budget} (plus small overhead).
  *
  * <p>Per row: a fresh stored explanation (same prompt hash) is returned as READY; rows ranked
  * within the top N with no fresh explanation get one generated on the AI executor (single-flight
- * per (job, candidate, prompt hash)); everything else gets a deterministic template with a reason.
+ * per (audience, job, candidate, prompt hash)); everything else gets a deterministic template with a reason.
  * Generations that miss the budget keep running and persist themselves (PENDING). Failed
  * (pair, inputs) are not retried for {@code failure-backoff}; an open circuit skips the model.
  * {@code regenerate} bypasses both and ignores fresh/recent results for the top N.
@@ -88,21 +90,30 @@ public class ExplanationService {
     }
 
     /**
-     * Explanations for one page of matches (rank order). Never throws.
+     * Recruiter explanations for one page of a job's matches (rank order). Never throws. Same as
+     * {@link #explainAll} with {@link Audience#RECRUITER} and one request per row, keyed by candidate.
      *
      * @param regenerate force new AI explanations for rows within the top N
      */
     public ExplanationBatch explain(JobContext job, List<MatchContext> rows, boolean regenerate) {
         try {
+            Map<UUID, ExplanationResult> out = new LinkedHashMap<>();
             if (!aiActive()) {
-                Map<UUID, ExplanationResult> out = new LinkedHashMap<>();
                 for (MatchContext row : rows) {
-                    out.put(row.candidateId(), template(row, ExplanationStatus.UNAVAILABLE,
+                    out.put(row.candidateId(), template(Audience.RECRUITER, row, ExplanationStatus.UNAVAILABLE,
                             ExplanationReason.AI_DISABLED, false));
                 }
                 return new ExplanationBatch(out, 0);
             }
-            return explainWithAi(job, rows, regenerate);
+            List<ExplanationRequest> requests = new ArrayList<>(rows.size());
+            for (MatchContext row : rows) {
+                requests.add(new ExplanationRequest(job, row));
+            }
+            ExplanationResults results = explainWithAi(Audience.RECRUITER, requests, regenerate);
+            for (int i = 0; i < rows.size(); i++) {
+                out.put(rows.get(i).candidateId(), results.results().get(i));
+            }
+            return new ExplanationBatch(out, results.generated());
         } catch (RuntimeException e) {
             log.error("Unexpected error while preparing explanations for job {}; using templates",
                     job == null ? null : job.jobId(), e);
@@ -110,49 +121,83 @@ public class ExplanationService {
         }
     }
 
-    private ExplanationBatch explainWithAi(JobContext job, List<MatchContext> rows, boolean regenerate) {
+    /**
+     * Explanations for a list of ranked (job, candidate) pairs written for one audience. The requests
+     * may span many jobs and many candidates; each row's {@code rank} decides top-N eligibility.
+     * AI, executor and database faults never throw: they yield templates with a reason.
+     *
+     * @param regenerate force new AI explanations for rows within the top N
+     * @return one result per request, in input order
+     * @throws IllegalStateException for SEEKER until its prompt and template are wired (Phase 6 step 3)
+     */
+    public ExplanationResults explainAll(Audience audience, List<ExplanationRequest> requests, boolean regenerate) {
+        requireWired(Objects.requireNonNull(audience, "audience"));
+        Objects.requireNonNull(requests, "requests");
+        try {
+            if (!aiActive()) {
+                List<ExplanationResult> out = new ArrayList<>(requests.size());
+                for (ExplanationRequest request : requests) {
+                    out.add(template(audience, request.row(), ExplanationStatus.UNAVAILABLE,
+                            ExplanationReason.AI_DISABLED, false));
+                }
+                return new ExplanationResults(out, 0);
+            }
+            return explainWithAi(audience, requests, regenerate);
+        } catch (RuntimeException e) {
+            log.error("Unexpected error while preparing {} {} explanations; using templates",
+                    requests.size(), audience.tag(), e);
+            return allFailed(audience, requests);
+        }
+    }
+
+    private ExplanationResults explainWithAi(Audience audience, List<ExplanationRequest> requests,
+                                             boolean regenerate) {
         long deadline = System.nanoTime() + properties.requestBudget().toNanos();
         int topN = properties.topN();
         evictExpiredFlights();
 
-        Map<UUID, ExplanationResult> out = new LinkedHashMap<>();
+        ExplanationResult[] out = new ExplanationResult[requests.size()];
         List<Waiting> waiting = new ArrayList<>();
-        for (MatchContext row : rows) {
-            String prompt = promptBuilder.build(job, row);
-            String hash = ExplanationInputHasher.hash(prompt);
+        for (int i = 0; i < requests.size(); i++) {
+            ExplanationRequest request = requests.get(i);
+            JobContext job = request.job();
+            MatchContext row = request.row();
+            String prompt = prompt(audience, job, row);
+            String hash = ExplanationInputHasher.hash(audience, prompt);
             ExplanationView stored = storedView(row);
             boolean hasStored = stored != null;
             boolean fresh = hasStored && hash.equals(row.stored().inputHash());
             boolean eligible = row.rank() <= topN;
 
             if (fresh && !(regenerate && eligible)) {
-                out.put(row.candidateId(), ExplanationResult.ready(stored));
+                out[i] = ExplanationResult.ready(stored);
                 continue;
             }
             if (!eligible) {
-                out.put(row.candidateId(), templateFor(row, hasStored, ExplanationReason.NOT_IN_TOP_N));
+                out[i] = templateFor(audience, row, hasStored, ExplanationReason.NOT_IN_TOP_N);
                 continue;
             }
-            FlightKey key = new FlightKey(job.jobId(), row.candidateId(), hash);
+            FlightKey key = new FlightKey(audience, job.jobId(), row.candidateId(), hash);
             if (!regenerate) {
                 Backoff backoff = activeBackoff(key);
                 if (backoff != null) {
-                    out.put(row.candidateId(), templateFor(row, hasStored, backoff.reason()));
+                    out[i] = templateFor(audience, row, hasStored, backoff.reason());
                     continue;
                 }
                 if (!circuit.allowRequest()) {
-                    out.put(row.candidateId(), templateFor(row, hasStored, ExplanationReason.PROVIDER_UNAVAILABLE));
+                    out[i] = templateFor(audience, row, hasStored, ExplanationReason.PROVIDER_UNAVAILABLE);
                     continue;
                 }
             }
             if (generator.localModelBusy()) {
                 // A CV extraction holds the local model for many minutes: don't queue behind it.
-                out.put(row.candidateId(), fresh ? ExplanationResult.ready(stored)
-                        : templateFor(row, hasStored, ExplanationReason.AI_BUSY));
+                out[i] = fresh ? ExplanationResult.ready(stored)
+                        : templateFor(audience, row, hasStored, ExplanationReason.AI_BUSY);
                 continue;
             }
-            Joined joined = join(key, new ExplanationGenerator.GenerationTask(job, row, prompt, hash), regenerate);
-            waiting.add(new Waiting(row, joined, fresh, hasStored, stored));
+            Joined joined = join(key,
+                    new ExplanationGenerator.GenerationTask(job, row, prompt, hash, audience), regenerate);
+            waiting.add(new Waiting(i, row, joined, fresh, hasStored, stored));
         }
 
         int generated = 0;
@@ -171,15 +216,32 @@ public class ExplanationService {
             } else if (outcome instanceof GenerationOutcome.Failure f) {
                 ExplanationReason reason = f.kind().providerFault()
                         ? ExplanationReason.PROVIDER_UNAVAILABLE : ExplanationReason.GENERATION_FAILED;
-                result = templateFor(row, w.hasStored(), reason);
+                result = templateFor(audience, row, w.hasStored(), reason);
             } else if (outcome instanceof GenerationOutcome.Rejected) {
-                result = templateFor(row, w.hasStored(), ExplanationReason.AI_BUSY);
+                result = templateFor(audience, row, w.hasStored(), ExplanationReason.AI_BUSY);
             } else {
-                result = template(row, ExplanationStatus.PENDING, ExplanationReason.GENERATING, false);
+                result = template(audience, row, ExplanationStatus.PENDING, ExplanationReason.GENERATING, false);
             }
-            out.put(row.candidateId(), result);
+            out[w.index()] = result;
         }
-        return new ExplanationBatch(out, generated);
+        return new ExplanationResults(Arrays.asList(out), generated);
+    }
+
+    // ------------------------------------------------------------------ audience dispatch
+
+    /** Fails fast for an audience whose prompt and template are not wired yet. */
+    private static void requireWired(Audience audience) {
+        if (audience == Audience.SEEKER) {
+            throw new IllegalStateException("SEEKER is wired in step 3");
+        }
+    }
+
+    /** The exact user message for the audience. */
+    private String prompt(Audience audience, JobContext job, MatchContext row) {
+        return switch (audience) {
+            case RECRUITER -> promptBuilder.build(job, row);
+            case SEEKER -> throw new IllegalStateException("SEEKER is wired in step 3");
+        };
     }
 
     // ------------------------------------------------------------------ single-flight
@@ -347,24 +409,30 @@ public class ExplanationService {
     }
 
     /** STALE if an older AI explanation exists, else UNAVAILABLE. */
-    private ExplanationResult templateFor(MatchContext row, boolean hasStored, ExplanationReason reason) {
-        return template(row, hasStored ? ExplanationStatus.STALE : ExplanationStatus.UNAVAILABLE, reason, hasStored);
+    private ExplanationResult templateFor(Audience audience, MatchContext row, boolean hasStored,
+                                          ExplanationReason reason) {
+        return template(audience, row, hasStored ? ExplanationStatus.STALE : ExplanationStatus.UNAVAILABLE,
+                reason, hasStored);
     }
 
-    private ExplanationResult template(MatchContext row, ExplanationStatus status, ExplanationReason reason,
-                                       boolean stale) {
-        countFallback(reason);
-        ExplanationView view = ExplanationFallbackRenderer.render(row.candidateName(), row.scorePercent(),
-                row.evaluation(), reason, stale, properties.topN());
+    private ExplanationResult template(Audience audience, MatchContext row, ExplanationStatus status,
+                                       ExplanationReason reason, boolean stale) {
+        countFallback(audience, reason);
+        ExplanationView view = switch (audience) {
+            case RECRUITER -> ExplanationFallbackRenderer.render(row.candidateName(), row.scorePercent(),
+                    row.evaluation(), reason, stale, properties.topN());
+            case SEEKER -> throw new IllegalStateException("SEEKER is wired in step 3");
+        };
         return ExplanationResult.template(status, view);
     }
 
+    /** Recruiter wrapper fallback: one template per row that can be rendered (Phase 3 behaviour). */
     private ExplanationBatch allFailed(List<MatchContext> rows) {
         Map<UUID, ExplanationResult> out = new LinkedHashMap<>();
         if (rows != null) {
             for (MatchContext row : rows) {
                 try {
-                    out.put(row.candidateId(), templateFor(row, row.stored() != null,
+                    out.put(row.candidateId(), templateFor(Audience.RECRUITER, row, row.stored() != null,
                             ExplanationReason.GENERATION_FAILED));
                 } catch (RuntimeException e) {
                     log.error("Could not render a template explanation for candidate {}", row.candidateId(), e);
@@ -374,10 +442,25 @@ public class ExplanationService {
         return new ExplanationBatch(out, 0);
     }
 
-    private void countFallback(ExplanationReason reason) {
+    /**
+     * {@link #explainAll} fallback: one GENERATION_FAILED template per request, in input order. Template
+     * rendering is pure; if it fails for a row, that programming error propagates rather than
+     * breaking the one-result-per-request contract.
+     */
+    private ExplanationResults allFailed(Audience audience, List<ExplanationRequest> requests) {
+        List<ExplanationResult> out = new ArrayList<>(requests.size());
+        for (ExplanationRequest request : requests) {
+            MatchContext row = request.row();
+            out.add(templateFor(audience, row, row.stored() != null, ExplanationReason.GENERATION_FAILED));
+        }
+        return new ExplanationResults(out, 0);
+    }
+
+    private void countFallback(Audience audience, ExplanationReason reason) {
         try {
             Counter.builder(FALLBACK_COUNTER)
                     .description("Matches served with a template explanation")
+                    .tag("audience", audience.tag())
                     .tag("reason", reason.name())
                     .register(meterRegistry)
                     .increment();
@@ -388,7 +471,8 @@ public class ExplanationService {
 
     // ------------------------------------------------------------------ types
 
-    private record FlightKey(UUID jobId, UUID candidateId, String inputHash) {
+    /** Single-flight and backoff key: the same pair explained for two audiences is two flights. */
+    private record FlightKey(Audience audience, UUID jobId, UUID candidateId, String inputHash) {
     }
 
     private static final class Flight {
@@ -403,6 +487,7 @@ public class ExplanationService {
     private record Backoff(Instant retryAt, ExplanationReason reason) {
     }
 
-    private record Waiting(MatchContext row, Joined joined, boolean fresh, boolean hasStored, ExplanationView stored) {
+    private record Waiting(int index, MatchContext row, Joined joined, boolean fresh, boolean hasStored,
+                           ExplanationView stored) {
     }
 }

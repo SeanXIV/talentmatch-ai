@@ -17,6 +17,7 @@ import static org.mockito.Mockito.when;
 
 import com.fasterxml.jackson.core.JsonParseException;
 import com.talentmatch.ai.config.ModelInfo;
+import com.talentmatch.repository.ExplanationTarget;
 import com.talentmatch.repository.MatchJdbcRepository;
 import com.talentmatch.support.MutableClock;
 import dev.langchain4j.model.output.FinishReason;
@@ -67,8 +68,8 @@ class ExplanationGeneratorTest {
     }
 
     private void persistReturns(int rows) {
-        when(repo.saveExplanation(any(), any(), anyDouble(), any(), any(), anyString(), anyString(), anyString(),
-                anyString(), any())).thenReturn(rows);
+        when(repo.saveExplanation(eq(ExplanationTarget.RECRUITER), any(), any(), anyDouble(), any(), any(),
+                anyString(), anyString(), anyString(), anyString(), any())).thenReturn(rows);
     }
 
     private double timerCount(String outcome) {
@@ -90,7 +91,7 @@ class ExplanationGeneratorTest {
         assertThat(s.model()).isEqualTo("ollama/qwen2.5:7b-instruct");
         assertThat(s.generatedAt()).isEqualTo(AiFixtures.T0);
         assertThat(s.value()).isEqualTo(validExplanation());
-        verify(repo).saveExplanation(eq(job.jobId()), eq(row.candidateId()), eq(row.storedScore()),
+        verify(repo).saveExplanation(eq(ExplanationTarget.RECRUITER), eq(job.jobId()), eq(row.candidateId()), eq(row.storedScore()),
                 eq(row.candidateUpdatedAt()), eq(job.updatedAt()), eq(validExplanation().explanation()),
                 org.mockito.ArgumentMatchers.argThat(json -> json.contains("\"headline\":\"Strong fit with every required skill\"")
                         && json.contains("\"strengths\":[") && json.contains("\"gaps\":[")),
@@ -114,7 +115,8 @@ class ExplanationGeneratorTest {
         assertThat(((GenerationOutcome.Success) generator().run(task)).persisted()).isFalse();
 
         org.mockito.Mockito.doThrow(new DataAccessResourceFailureException("db down")).when(repo).saveExplanation(
-                any(), any(), anyDouble(), any(), any(), anyString(), anyString(), anyString(), anyString(), any());
+                any(ExplanationTarget.class), any(), any(), anyDouble(), any(), any(), anyString(), anyString(),
+                anyString(), anyString(), any());
         GenerationOutcome o = generator().run(task);
         assertThat(o).isInstanceOf(GenerationOutcome.Success.class);
         assertThat(((GenerationOutcome.Success) o).persisted()).isFalse();
@@ -145,8 +147,7 @@ class ExplanationGeneratorTest {
         assertThat(((GenerationOutcome.Failure) generator().run(task)).kind()).isEqualTo(FailureKind.INVALID_OUTPUT);
         org.mockito.Mockito.doReturn(null).when(assistant).explain(any());
         assertThat(((GenerationOutcome.Failure) generator().run(task)).kind()).isEqualTo(FailureKind.INVALID_OUTPUT);
-        verify(repo, never()).saveExplanation(any(), any(), anyDouble(), any(), any(), any(), any(), any(), any(),
-                any());
+        verifyNoInteractions(repo);
     }
 
     @Test
@@ -228,6 +229,113 @@ class ExplanationGeneratorTest {
         org.assertj.core.api.Assertions.assertThatNullPointerException()
                 .isThrownBy(() -> new ExplanationGenerator.GenerationTask(job, row, null, "h"));
         assertThat(Instant.EPOCH).isNotNull();
+    }
+
+    // ------------------------------------------------------------------ Phase 6 step 2: audience
+
+    private ExplanationGenerator.GenerationTask seekerTask() {
+        return new ExplanationGenerator.GenerationTask(job, row, task.prompt(), task.inputHash(), Audience.SEEKER);
+    }
+
+    @Test
+    void fourArgTaskDefaultsToRecruiterAndAudienceIsRequired() {
+        assertThat(task.audience()).isEqualTo(Audience.RECRUITER);
+        assertThat(new ExplanationGenerator.GenerationTask(job, row, "p", "h", Audience.RECRUITER))
+                .isEqualTo(new ExplanationGenerator.GenerationTask(job, row, "p", "h"));
+        org.assertj.core.api.Assertions.assertThatNullPointerException()
+                .isThrownBy(() -> new ExplanationGenerator.GenerationTask(job, row, "p", "h", null));
+    }
+
+    @Test
+    void recruiterPersistsOnlyThroughTheRecruiterTarget() {
+        persistReturns(1);
+        org.mockito.Mockito.doReturn(result(validExplanation(), FinishReason.STOP)).when(assistant).explain(any());
+        assertThat(((GenerationOutcome.Success) generator().run(task)).persisted()).isTrue();
+        verify(repo).saveExplanation(eq(ExplanationTarget.RECRUITER), any(), any(), anyDouble(), any(), any(),
+                any(), any(), any(), any(), any());
+        verify(repo, never()).saveExplanation(eq(ExplanationTarget.SEEKER), any(), any(), anyDouble(), any(), any(),
+                any(), any(), any(), any(), any());
+        // the legacy 10-arg overload is no longer used by the generator
+        verify(repo, never()).saveExplanation(any(java.util.UUID.class), any(), anyDouble(), any(), any(), any(),
+                any(), any(), any(), any());
+    }
+
+    @Test
+    void seekerFailsFastBeforeTouchingModelGateCircuitExecutorOrMetrics() {
+        LocalModelGate gate = mock(LocalModelGate.class);
+        java.util.concurrent.atomic.AtomicInteger executed = new java.util.concurrent.atomic.AtomicInteger();
+        Executor counting = r -> {
+            executed.incrementAndGet();
+            r.run();
+        };
+        ExplanationGenerator g = new ExplanationGenerator(assistant, new MatchExplanationValidator(), repo, circuit,
+                model, counting, clock, meters, gate);
+
+        org.assertj.core.api.Assertions.assertThatIllegalStateException()
+                .isThrownBy(() -> g.submit(seekerTask())).withMessage("SEEKER is wired in step 3");
+        org.assertj.core.api.Assertions.assertThatIllegalStateException()
+                .isThrownBy(() -> g.run(seekerTask())).withMessage("SEEKER is wired in step 3");
+
+        assertThat(executed.get()).as("nothing submitted to the executor").isZero();
+        verifyNoInteractions(assistant, repo, gate);
+        assertThat(circuit.consecutiveFailures()).isZero();
+        assertThat(circuit.lastSuccessAt()).as("no circuit bookkeeping").isNull();
+        assertThat(meters.find("talentmatch.ai.explanations").timers()).isEmpty();
+    }
+
+    @Test
+    void timerCarriesTheAudienceTagForEveryOutcome() {
+        persistReturns(1);
+        org.mockito.Mockito.doReturn(result(validExplanation(), FinishReason.STOP)).when(assistant).explain(any());
+        generator().run(task);
+        org.mockito.Mockito.doThrow(new IllegalStateException("down")).when(assistant).explain(any());
+        generator().run(task);
+        generator(r -> { throw new java.util.concurrent.RejectedExecutionException("full"); }).submit(task);
+
+        var timers = meters.find("talentmatch.ai.explanations").timers();
+        assertThat(timers).hasSize(3).allSatisfy(t -> {
+            assertThat(t.getId().getTag("audience")).isEqualTo("recruiter");
+            assertThat(t.getId().getTag("provider")).isEqualTo("ollama");
+            assertThat(t.getId().getTag("model")).isEqualTo("qwen2.5:7b-instruct");
+        });
+        assertThat(meters.find("talentmatch.ai.explanations").tag("audience", "recruiter").tag("outcome", "success")
+                .timer().count()).isEqualTo(1);
+        assertThat(meters.find("talentmatch.ai.explanations").tag("audience", "recruiter")
+                .tag("outcome", "provider_error").timer().count()).isEqualTo(1);
+        assertThat(meters.find("talentmatch.ai.explanations").tag("audience", "recruiter").tag("outcome", "rejected")
+                .timer().count()).isEqualTo(1);
+    }
+
+    @Test
+    void localModelBusyRejectionIsTaggedAndLogged(CapturedOutput out) {
+        LocalModelGate gate = mock(LocalModelGate.class);
+        when(gate.tryAcquireShared()).thenReturn(false);
+        ExplanationGenerator g = new ExplanationGenerator(assistant, new MatchExplanationValidator(), repo, circuit,
+                model, Runnable::run, clock, meters, gate);
+        assertThat(g.run(task)).isInstanceOf(GenerationOutcome.Rejected.class);
+        verifyNoInteractions(assistant, repo);
+        verify(gate, never()).releaseShared();
+        assertThat(meters.find("talentmatch.ai.explanations").tag("audience", "recruiter").tag("outcome", "rejected")
+                .timer().count()).isEqualTo(1);
+        assertThat(out.getAll()).contains("audience=recruiter outcome=local_model_busy");
+    }
+
+    @Test
+    void infoLogLineCarriesTheRecruiterAudience(CapturedOutput out) {
+        persistReturns(1);
+        org.mockito.Mockito.doReturn(result(validExplanation(), FinishReason.STOP)).when(assistant).explain(any());
+        generator().run(task);
+        String line = out.getAll().lines().filter(l -> l.contains("AI explanation job=")).findFirst().orElseThrow();
+        assertThat(line).contains("candidate=" + row.candidateId() + " audience=recruiter provider=ollama");
+    }
+
+    @Test
+    void guardMissLogNamesTheAudienceButNoText(CapturedOutput out) {
+        persistReturns(0);
+        org.mockito.Mockito.doReturn(result(validExplanation(), FinishReason.STOP)).when(assistant).explain(any());
+        generator().run(task);
+        assertThat(out.getAll()).contains("AI recruiter explanation for candidate " + row.candidateId())
+                .doesNotContain(validExplanation().explanation());
     }
 
     static class ModelTimeoutThing extends RuntimeException {

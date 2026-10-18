@@ -3,7 +3,6 @@ package com.talentmatch.repository;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
-import com.talentmatch.ai.Audience;
 import com.talentmatch.support.AbstractApiIT;
 import java.sql.Connection;
 import java.sql.SQLException;
@@ -43,7 +42,7 @@ class MatchJdbcRepositoryV6IT extends AbstractApiIT {
     private static final String RECRUITER_PAYLOAD = "{\"headline\":\"Recruiter view\"}";
     private static final Instant GENERATED = Instant.parse("2026-10-18T10:00:00Z");
 
-    /** Test-local audience; mapped in {@link #save} only, so the step-2 ExplanationTarget switch is one line. */
+    /** Test-local audience; mapped in {@link #save} only, the only place that names ExplanationTarget. */
     enum Side { RECRUITER, SEEKER }
 
     @Autowired
@@ -64,10 +63,10 @@ class MatchJdbcRepositoryV6IT extends AbstractApiIT {
 
     // ------------------------------------------------------------------ helpers
 
-    /** The only call site of the audience overload of saveExplanation. */
+    /** The only call site of the target overload of saveExplanation. */
     private int save(Side side, UUID job, UUID cand, double expectedScore, Instant candUpdated, Instant jobUpdated,
                      String text, String payload, String hash, String model) {
-        return repo.saveExplanation(Audience.valueOf(side.name()), job, cand, expectedScore, candUpdated, jobUpdated,
+        return repo.saveExplanation(ExplanationTarget.valueOf(side.name()), job, cand, expectedScore, candUpdated, jobUpdated,
                 text, payload, hash, model, GENERATED);
     }
 

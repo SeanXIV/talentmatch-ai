@@ -8,7 +8,7 @@ import java.util.Objects;
 
 /**
  * Staleness hash of an explanation's inputs: lower-case sha256 hex of
- * {@code SYSTEM + "\n\u001e\n" + userMessage}. Anything the model sees is covered; anything it
+ * {@code SYSTEM + "\n\u001e\n" + userMessage}, where SYSTEM is the audience's system prompt. Anything the model sees is covered; anything it
  * does not see (email, text beyond the truncation point, computed_at, the model) is not.
  */
 public final class ExplanationInputHasher {
@@ -16,8 +16,22 @@ public final class ExplanationInputHasher {
     private ExplanationInputHasher() {
     }
 
+    /** The RECRUITER hash; same bytes as before Phase 6. */
     public static String hash(String userMessage) {
         return hash(ExplanationPrompts.SYSTEM, userMessage);
+    }
+
+    /**
+     * The hash for one audience: its own system prompt plus the user message.
+     *
+     * @throws IllegalStateException for SEEKER until its system prompt is wired (Phase 6 step 3)
+     */
+    public static String hash(Audience audience, String userMessage) {
+        Objects.requireNonNull(audience, "audience");
+        return switch (audience) {
+            case RECRUITER -> hash(userMessage);
+            case SEEKER -> throw new IllegalStateException("SEEKER is wired in step 3");
+        };
     }
 
     /** Visible for tests: the same hash with an explicit system prompt. */

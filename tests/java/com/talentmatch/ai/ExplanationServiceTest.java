@@ -457,4 +457,275 @@ class ExplanationServiceTest {
         assertThat(b.byCandidate().get(UUID.randomUUID())).isNull();
         assertThat(ada()).isNotNull();
     }
+    // ------------------------------------------------------------------ Phase 6 step 2: explainAll
+
+    private static List<ExplanationRequest> requests(JobContext j, List<MatchContext> rows) {
+        return rows.stream().map(r -> new ExplanationRequest(j, r)).toList();
+    }
+
+    private static JobContext otherJob() {
+        return new JobContext(UUID.fromString("00000000-0000-0000-0000-00000000000b"), "Data Engineer", "Beta",
+                "Pipelines.", AiFixtures.T0);
+    }
+
+    @Test
+    void explainAllRejectsSeekerBeforeTouchingAnything() {
+        List<ExplanationRequest> reqs = requests(job, rows(2));
+        for (boolean enabled : List.of(true, false)) {
+            ExplanationService s = service(props(enabled, 3, Duration.ofSeconds(1), Duration.ofSeconds(60)));
+            org.assertj.core.api.Assertions.assertThatIllegalStateException()
+                    .isThrownBy(() -> s.explainAll(Audience.SEEKER, reqs, false))
+                    .withMessage("SEEKER is wired in step 3");
+            org.assertj.core.api.Assertions.assertThatIllegalStateException()
+                    .isThrownBy(() -> s.explainAll(Audience.SEEKER, List.of(), true));
+        }
+        verifyNoInteractions(generator);
+        assertThat(circuit.consecutiveFailures()).isZero();
+        assertThat(meters.find("talentmatch.ai.fallbacks").counters()).as("no seeker template rendered").isEmpty();
+        org.assertj.core.api.Assertions.assertThatNullPointerException()
+                .isThrownBy(() -> service().explainAll(null, reqs, false));
+        org.assertj.core.api.Assertions.assertThatNullPointerException()
+                .isThrownBy(() -> service().explainAll(Audience.RECRUITER, null, false));
+    }
+
+    @Test
+    void explainAllReturnsResultsInInputOrderAndPicksTopNByRank() {
+        when(generator.submit(any())).thenAnswer(inv -> {
+            GenerationTask t = inv.getArgument(0);
+            return done(success("Generated for " + t.match().candidateName() + " about Java."));
+        });
+        // input order deliberately differs from rank order
+        List<MatchContext> rows = List.of(match(5, "E"), match(1, "A"), match(4, "D"), match(2, "B"), match(3, "C"));
+        ExplanationResults r = service().explainAll(Audience.RECRUITER, requests(job, rows), false);
+
+        assertThat(r.results()).hasSize(5);
+        assertThat(r.generated()).isEqualTo(3);
+        verify(generator, times(3)).submit(any());
+        for (int i = 0; i < rows.size(); i++) {
+            MatchContext row = rows.get(i);
+            ExplanationResult res = r.results().get(i);
+            if (row.rank() <= 3) {
+                assertThat(res.status()).as("rank %d", row.rank()).isEqualTo(ExplanationStatus.READY);
+                assertThat(res.aiExplanation()).isEqualTo("Generated for " + row.candidateName() + " about Java.");
+            } else {
+                assertThat(res.status()).as("rank %d", row.rank()).isEqualTo(ExplanationStatus.UNAVAILABLE);
+                assertThat(res.explanation().reason()).isEqualTo(ExplanationReason.NOT_IN_TOP_N);
+                assertThat(res.explanation().text()).contains(row.candidateName());
+            }
+        }
+        ArgumentCaptor<GenerationTask> tasks = ArgumentCaptor.forClass(GenerationTask.class);
+        verify(generator, times(3)).submit(tasks.capture());
+        assertThat(tasks.getAllValues()).allSatisfy(t -> assertThat(t.audience()).isEqualTo(Audience.RECRUITER));
+        assertThat(tasks.getAllValues()).extracting(t -> t.match().rank()).containsExactly(1, 2, 3);
+    }
+
+    @Test
+    void explainAllResultsListIsImmutableAndEmptyInputIsEmpty() {
+        ExplanationResults r = service().explainAll(Audience.RECRUITER, List.of(), false);
+        assertThat(r.results()).isEmpty();
+        assertThat(r.generated()).isZero();
+        org.assertj.core.api.Assertions.assertThatThrownBy(() -> r.results().add(null))
+                .isInstanceOf(UnsupportedOperationException.class);
+        verifyNoInteractions(generator);
+    }
+
+    @Test
+    void explainAllSpansJobsWithOneFlightPerPairAndTheRightJobInEachTask() {
+        when(generator.submit(any())).thenAnswer(inv -> {
+            GenerationTask t = inv.getArgument(0);
+            return done(success("Generated for job " + t.job().title() + " about Java."));
+        });
+        MatchContext same = match(1, "Ada");
+        JobContext other = otherJob();
+        // the same candidate on two jobs (candidate side) plus a duplicate of the first pair
+        List<ExplanationRequest> reqs = List.of(new ExplanationRequest(job, same),
+                new ExplanationRequest(other, new MatchContext(2, same.candidateId(), same.candidateName(),
+                        same.candidateSummary(), same.candidateUpdatedAt(), same.storedScore(), same.scorePercent(),
+                        same.evaluation(), null)),
+                new ExplanationRequest(job, same));
+        ExplanationResults r = service().explainAll(Audience.RECRUITER, reqs, false);
+
+        ArgumentCaptor<GenerationTask> tasks = ArgumentCaptor.forClass(GenerationTask.class);
+        verify(generator, times(2)).submit(tasks.capture());
+        assertThat(tasks.getAllValues()).extracting(t -> t.job().jobId())
+                .containsExactly(job.jobId(), other.jobId());
+        assertThat(tasks.getAllValues().get(1).prompt()).contains("Data Engineer").doesNotContain("Backend Engineer");
+        assertThat(r.generated()).as("the duplicate joins the first flight").isEqualTo(2);
+        assertThat(r.results()).extracting(ExplanationResult::aiExplanation).containsExactly(
+                "Generated for job Backend Engineer about Java.",
+                "Generated for job Data Engineer about Java.",
+                "Generated for job Backend Engineer about Java.");
+    }
+
+    @Test
+    void explainAllDisabledGivesAiDisabledTemplatesInOrderTaggedRecruiter() {
+        List<MatchContext> rows = List.of(match(3, "C"), match(1, "A"), match(2, "B"));
+        ExplanationService s = service(props(false, 3, Duration.ofSeconds(1), Duration.ofSeconds(60)));
+        ExplanationResults r = s.explainAll(Audience.RECRUITER, requests(job, rows), true);
+        verifyNoInteractions(generator);
+        assertThat(r.generated()).isZero();
+        for (int i = 0; i < rows.size(); i++) {
+            assertThat(r.results().get(i).status()).isEqualTo(ExplanationStatus.UNAVAILABLE);
+            assertThat(r.results().get(i).explanation().reason()).isEqualTo(ExplanationReason.AI_DISABLED);
+            assertThat(r.results().get(i).explanation().text()).contains(rows.get(i).candidateName());
+        }
+        assertThat(meters.get("talentmatch.ai.fallbacks").tag("audience", "recruiter").tag("reason", "AI_DISABLED")
+                .counter().count()).isEqualTo(3.0);
+    }
+
+    @Test
+    void explainAllBudgetElapsedGivesPendingGenerating() {
+        org.mockito.Mockito.doReturn(new CompletableFuture<>()).when(generator).submit(any());
+        ExplanationService s = service(props(true, 3, Duration.ofMillis(200), Duration.ofSeconds(60)));
+        ExplanationResults r = s.explainAll(Audience.RECRUITER, requests(job, rows(2)), false);
+        assertThat(r.results()).allSatisfy(res -> {
+            assertThat(res.status()).isEqualTo(ExplanationStatus.PENDING);
+            assertThat(res.explanation().reason()).isEqualTo(ExplanationReason.GENERATING);
+        });
+        assertThat(r.generated()).isZero();
+    }
+
+    @Test
+    void explainAllUnexpectedErrorGivesGenerationFailedTemplatesInInputOrder() {
+        when(generator.localModelBusy()).thenThrow(new IllegalStateException("boom"));
+        List<MatchContext> rows = List.of(match(2, "B"), withStored(match(1, "A"), false, STORED_PAYLOAD));
+        ExplanationResults r = service().explainAll(Audience.RECRUITER, requests(job, rows), false);
+        assertThat(r.results()).hasSize(2);
+        assertThat(r.results().get(0).status()).isEqualTo(ExplanationStatus.UNAVAILABLE);
+        assertThat(r.results().get(0).explanation().text()).contains("B");
+        assertThat(r.results().get(1).status()).isEqualTo(ExplanationStatus.STALE);
+        assertThat(r.results()).allSatisfy(res ->
+                assertThat(res.explanation().reason()).isEqualTo(ExplanationReason.GENERATION_FAILED));
+        assertThat(r.generated()).isZero();
+    }
+
+    @Test
+    void explainAllPreviousFlightOnTheSamePairIsJoinedAcrossCalls() {
+        CompletableFuture<GenerationOutcome> slow = new CompletableFuture<>();
+        org.mockito.Mockito.doReturn(slow).when(generator).submit(any());
+        ExplanationService s = service(props(true, 3, Duration.ZERO, Duration.ofSeconds(60)));
+        MatchContext row = match(1, "Ada");
+        s.explainAll(Audience.RECRUITER, requests(job, List.of(row)), false);
+        s.explain(job, List.of(row), false); // the wrapper shares the RECRUITER flight
+        verify(generator, times(1)).submit(any());
+        slow.complete(success("Shared text about Java."));
+        assertThat(s.explainAll(Audience.RECRUITER, requests(job, List.of(row)), false).results().get(0)
+                .aiExplanation()).isEqualTo("Shared text about Java.");
+        verify(generator, times(1)).submit(any());
+    }
+
+    @Test
+    void backoffIsPerPairNotPerCandidate() {
+        org.mockito.Mockito.doReturn(done(new GenerationOutcome.Failure(FailureKind.TIMEOUT, 1)))
+                .when(generator).submit(any());
+        ExplanationService s = service();
+        MatchContext row = match(1, "Ada");
+        s.explainAll(Audience.RECRUITER, requests(job, List.of(row)), false);
+        s.explainAll(Audience.RECRUITER, requests(job, List.of(row)), false); // backing off
+        verify(generator, times(1)).submit(any());
+        s.explainAll(Audience.RECRUITER, requests(otherJob(), List.of(row)), false); // other job: own key
+        verify(generator, times(2)).submit(any());
+    }
+
+    @Test
+    void flightKeyIncludesTheAudience() throws Exception {
+        // Behaviour (two flights for RECRUITER and SEEKER on one pair, backoff per audience) is only
+        // reachable once SEEKER is wired in step 3; until then pin the key's shape.
+        Class<?> key = Class.forName("com.talentmatch.ai.ExplanationService$FlightKey");
+        assertThat(key.isRecord()).isTrue();
+        assertThat(java.util.Arrays.stream(key.getRecordComponents()).map(c -> c.getName() + ":"
+                + c.getType().getSimpleName()).toList())
+                .containsExactly("audience:Audience", "jobId:UUID", "candidateId:UUID", "inputHash:String");
+    }
+
+    @Test
+    void fallbackCounterCarriesTheAudienceTag() {
+        org.mockito.Mockito.doReturn(done(new GenerationOutcome.Rejected())).when(generator).submit(any());
+        service().explain(job, rows(4), false);
+        assertThat(meters.find("talentmatch.ai.fallbacks").counters()).isNotEmpty().allSatisfy(c ->
+                assertThat(c.getId().getTag("audience")).isEqualTo("recruiter"));
+        assertThat(meters.get("talentmatch.ai.fallbacks").tag("audience", "recruiter").tag("reason", "AI_BUSY")
+                .counter().count()).isEqualTo(3.0);
+        assertThat(meters.get("talentmatch.ai.fallbacks").tag("audience", "recruiter").tag("reason", "NOT_IN_TOP_N")
+                .counter().count()).isEqualTo(1.0);
+    }
+
+    // ------------------------------------------------------------------ explain == explainAll(RECRUITER)
+
+    /** One scenario: page rows, stub, budget, regenerate. Two fresh services see identical inputs. */
+    private void assertWrapperEquivalent(String name, List<MatchContext> rows, Runnable stub, Duration budget,
+                                         boolean regenerate, boolean enabled) {
+        org.mockito.Mockito.reset(generator);
+        stub.run();
+        AiProperties p = props(enabled, 3, budget, Duration.ofSeconds(60));
+        ExplanationBatch viaExplain = service(p).explain(job, rows, regenerate);
+        org.mockito.Mockito.reset(generator);
+        stub.run();
+        ExplanationResults viaAll = service(p).explainAll(Audience.RECRUITER, requests(job, rows), regenerate);
+
+        assertThat(viaExplain.generated()).as(name + " generated").isEqualTo(viaAll.generated());
+        assertThat(viaExplain.byCandidate()).as(name + " size").hasSize(rows.size());
+        for (int i = 0; i < rows.size(); i++) {
+            assertThat(viaExplain.byCandidate().get(rows.get(i).candidateId())).as(name + " row " + i)
+                    .isEqualTo(viaAll.results().get(i));
+        }
+    }
+
+    @Test
+    void explainIsExactlyExplainAllWithRecruiterAcrossScenarios() {
+        List<MatchContext> mixed = new ArrayList<>(rows(5));
+        mixed.set(0, withStored(mixed.get(0), true, STORED_PAYLOAD));
+        mixed.set(1, withStored(mixed.get(1), false, STORED_PAYLOAD));
+        mixed.set(4, withStored(mixed.get(4), false, STORED_PAYLOAD));
+        Duration b = Duration.ofSeconds(1);
+
+        assertWrapperEquivalent("disabled", mixed, () -> { }, b, false, false);
+        assertWrapperEquivalent("success", mixed, () -> when(generator.submit(any()))
+                .thenAnswer(inv -> done(success("Generated text about Java skills here."))), b, false, true);
+        assertWrapperEquivalent("success+regenerate", mixed, () -> when(generator.submit(any()))
+                .thenAnswer(inv -> done(success("Generated text about Java skills here."))), b, true, true);
+        assertWrapperEquivalent("provider failure", mixed, () -> org.mockito.Mockito
+                .doReturn(done(new GenerationOutcome.Failure(FailureKind.PROVIDER_ERROR, 1)))
+                .when(generator).submit(any()), b, false, true);
+        assertWrapperEquivalent("invalid output", mixed, () -> org.mockito.Mockito
+                .doReturn(done(new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, 1)))
+                .when(generator).submit(any()), b, true, true);
+        assertWrapperEquivalent("rejected", mixed, () -> org.mockito.Mockito
+                .doReturn(done(new GenerationOutcome.Rejected())).when(generator).submit(any()), b, false, true);
+        assertWrapperEquivalent("pending", mixed, () -> org.mockito.Mockito
+                .doReturn(new CompletableFuture<>()).when(generator).submit(any()), Duration.ZERO, false, true);
+        assertWrapperEquivalent("local model busy", mixed, () -> when(generator.localModelBusy()).thenReturn(true),
+                b, false, true);
+    }
+
+    @Test
+    void explainGoldenResultsAreUnchangedFromPhase3() {
+        // A fixed page whose expected results are spelled out from the Phase 3 algorithm (spec §9.1 7).
+        org.mockito.Mockito.doReturn(done(success("Generated text about Java skills here."))).when(generator)
+                .submit(any());
+        List<MatchContext> rows = new ArrayList<>(rows(5));
+        rows.set(0, withStored(rows.get(0), true, STORED_PAYLOAD));  // fresh, top N   -> READY stored, no call
+        rows.set(1, withStored(rows.get(1), false, STORED_PAYLOAD)); // stale, top N   -> READY generated
+        rows.set(4, withStored(rows.get(4), false, STORED_PAYLOAD)); // stale, rank 5  -> STALE NOT_IN_TOP_N
+        ExplanationBatch b = service().explain(job, rows, false);
+
+        assertThat(b.generated()).isEqualTo(2);
+        verify(generator, times(2)).submit(any());
+        ExplanationResult r1 = of(b, rows.get(0));
+        assertThat(r1).isEqualTo(ExplanationResult.ready(new ExplanationView(ExplanationSource.AI, "Stored headline",
+                "Stored AI text about Ada and Java.", List.of("Java"), List.of("Kubernetes"),
+                "ollama/qwen2.5:7b-instruct", AiFixtures.T0, null, null)));
+        ExplanationResult generated = ExplanationResult.ready(new ExplanationView(ExplanationSource.AI, "New headline",
+                "Generated text about Java skills here.", List.of("Java"), List.of(), "ollama/qwen2.5:7b-instruct",
+                AiFixtures.T0.plusSeconds(5), null, null));
+        assertThat(of(b, rows.get(1))).isEqualTo(generated);
+        assertThat(of(b, rows.get(2))).isEqualTo(generated);
+        assertThat(of(b, rows.get(3))).isEqualTo(ExplanationResult.template(ExplanationStatus.UNAVAILABLE,
+                ExplanationFallbackRenderer.render("Cand 4", rows.get(3).scorePercent(), rows.get(3).evaluation(),
+                        ExplanationReason.NOT_IN_TOP_N, false, 3)));
+        assertThat(of(b, rows.get(4))).isEqualTo(ExplanationResult.template(ExplanationStatus.STALE,
+                ExplanationFallbackRenderer.render("Cand 5", rows.get(4).scorePercent(), rows.get(4).evaluation(),
+                        ExplanationReason.NOT_IN_TOP_N, true, 3)));
+        assertInvariant(b);
+    }
 }

@@ -1,6 +1,5 @@
 package com.talentmatch.repository;
 
-import com.talentmatch.ai.Audience;
 import com.talentmatch.domain.scoring.CandidateSkillFact;
 import com.talentmatch.domain.scoring.JobRequirement;
 import java.sql.Connection;
@@ -283,6 +282,11 @@ public class MatchJdbcRepository {
      * @param jobIds distinct job ids (a duplicate would hit the same row twice and fail the statement)
      * @param scores one score per job id, same order
      * @return number of rows written
+     * @throws org.springframework.dao.InvalidDataAccessApiUsageException if {@code jobIds} and
+     *         {@code scores} differ in length. The method throws an {@link IllegalArgumentException};
+     *         called through the Spring {@code @Repository} bean, the persistence exception translation
+     *         wraps it in {@code InvalidDataAccessApiUsageException} (with the IAE as its cause). A
+     *         direct call on an unproxied instance sees the IAE itself.
      */
     public int upsertCandidateScores(UUID candidateId, List<UUID> jobIds, double[] scores) {
         if (jobIds.size() != scores.length) {
@@ -332,27 +336,28 @@ public class MatchJdbcRepository {
 
     /**
      * Stores a generated recruiter explanation (V3 columns). Same as
-     * {@link #saveExplanation(Audience, UUID, UUID, double, Instant, Instant, String, String, String, String, Instant)}
-     * with {@link Audience#RECRUITER}.
+     * {@link #saveExplanation(ExplanationTarget, UUID, UUID, double, Instant, Instant, String, String, String, String, Instant)}
+     * with {@link ExplanationTarget#RECRUITER}.
      */
     public int saveExplanation(UUID jobId, UUID candidateId, double expectedScore, Instant candidateUpdatedAt,
                                Instant jobUpdatedAt, String text, String payloadJson, String inputHash,
                                String model, Instant generatedAt) {
-        return saveExplanation(Audience.RECRUITER, jobId, candidateId, expectedScore, candidateUpdatedAt,
+        return saveExplanation(ExplanationTarget.RECRUITER, jobId, candidateId, expectedScore, candidateUpdatedAt,
                 jobUpdatedAt, text, payloadJson, inputHash, model, generatedAt);
     }
 
     /**
-     * Stores a generated explanation for one audience if nothing it was based on has changed. Call
-     * outside any transaction: it autocommits and is one short statement. RECRUITER writes only the
-     * V3 columns, SEEKER only the V6 {@code seeker_explanation_*} columns.
+     * Stores a generated explanation in one target's columns if nothing it was based on has changed.
+     * Call outside any transaction: it autocommits and is one short statement. RECRUITER writes only
+     * the V3 columns, SEEKER only the V6 {@code seeker_explanation_*} columns.
      *
+     * @param target        which column set to write
      * @param expectedScore the raw job_match.score read with the page (not the rounded value)
      * @param text          the explanation text; stored in {@code ai_explanation} for RECRUITER, unused
      *                      for SEEKER (the payload's {@code explanation} key is the text)
      * @return 1 if saved, 0 if the candidate, job or score changed since they were read (result discarded)
      */
-    public int saveExplanation(Audience audience, UUID jobId, UUID candidateId, double expectedScore,
+    public int saveExplanation(ExplanationTarget target, UUID jobId, UUID candidateId, double expectedScore,
                                Instant candidateUpdatedAt, Instant jobUpdatedAt, String text, String payloadJson,
                                String inputHash, String model, Instant generatedAt) {
         MapSqlParameterSource params = new MapSqlParameterSource()
@@ -365,7 +370,7 @@ public class MatchJdbcRepository {
                 .addValue("inputHash", inputHash)
                 .addValue("model", model)
                 .addValue("generatedAt", toOffset(generatedAt), Types.TIMESTAMP_WITH_TIMEZONE);
-        String sql = switch (audience) {
+        String sql = switch (target) {
             case RECRUITER -> {
                 params.addValue("text", text);
                 yield SQL_SAVE_EXPLANATION;
@@ -404,7 +409,11 @@ public class MatchJdbcRepository {
      * multi-job locker uses that order, and single-job lockers hold one lock at a time, so no lock
      * cycle can form.
      *
-     * @throws IllegalArgumentException   if the ids are not strictly ascending in uuid order
+     * @throws org.springframework.dao.InvalidDataAccessApiUsageException if the ids are not strictly
+     *         ascending in uuid order. The method throws an {@link IllegalArgumentException}; called
+     *         through the Spring {@code @Repository} bean, the persistence exception translation wraps
+     *         it in {@code InvalidDataAccessApiUsageException} (with the IAE as its cause). A direct call
+     *         on an unproxied instance sees the IAE itself.
      * @throws CannotAcquireLockException if a lock could not be acquired in time
      * @throws PessimisticLockingFailureException on a deadlock (backstop; should not happen)
      */

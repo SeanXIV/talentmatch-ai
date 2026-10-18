@@ -420,7 +420,8 @@ class AiExplanationIT extends AbstractAiApiIT {
         String logs = output.getAll().substring(before);
         List<String> lines = logs.lines().filter(l -> l.contains("AI explanation job=" + job)).toList();
         assertThat(lines).hasSize(3);
-        assertThat(lines).allSatisfy(l -> assertThat(l).contains(" INFO ").contains("provider=ollama")
+        assertThat(lines).allSatisfy(l -> assertThat(l).contains(" INFO ").contains(" audience=recruiter ")
+                .contains("provider=ollama")
                 .contains("model=qwen2.5:7b-instruct").contains("outcome=success").containsPattern("latencyMs=\\d+")
                 .contains("inputTokens=100").contains("outputTokens=40"));
         for (String secret : List.of("Ada Lovelace", "Bob Builder", "Cy Young", "Ada summary", "Bob summary",
