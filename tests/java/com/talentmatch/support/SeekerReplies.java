@@ -33,6 +33,29 @@ public final class SeekerReplies {
         install(fake, SeekerReplies::grounded);
     }
 
+    /**
+     * Like {@link #install(FakeChatModel)}, but every call first waits (up to 30s) for the returned
+     * latch. {@link FakeChatModel#block()} answers with the default JSON, whose "#n" the seeker
+     * grounding check rejects as an invented number, so seeker tests that block need this one.
+     * Count the latch down in a finally block.
+     */
+    public static java.util.concurrent.CountDownLatch installBlocking(FakeChatModel fake) {
+        java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+        fake.respond(req -> {
+            try {
+                latch.await(30, java.util.concurrent.TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            String prompt = FakeChatModel.userText(req);
+            if (!prompt.startsWith(SeekerExplanationPrompts.INTRO)) {
+                return FakeChatModel.response(fake.defaultJson(req), FinishReason.STOP);
+            }
+            return FakeChatModel.response(json(prompt, SeekerReplies::grounded), FinishReason.STOP);
+        });
+        return latch;
+    }
+
     public static String grounded(String skill) {
         return "You bring " + skill + ", which this role requires.";
     }

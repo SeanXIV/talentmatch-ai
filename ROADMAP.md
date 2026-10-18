@@ -154,7 +154,7 @@ Principles for everything below:
       newest-first sort (plus `GET /api/profile/matches` for the owner)
 - [x] Explanations written for the job seeker: why you fit and what you're missing
       (stored separately from the recruiter's, with free-text grounding)
-- [ ] Tests: unit tests for parameters, seeker prompt, hasher, template and grounding check;
+- [x] Tests: unit tests for parameters, seeker prompt, hasher, template and grounding check;
       Testcontainers ITs for V6, ranking, two-way staleness, filters, dates, locks, seeker
       explanations, invalidation, regenerate and errors (no real network or model in CI)
 
