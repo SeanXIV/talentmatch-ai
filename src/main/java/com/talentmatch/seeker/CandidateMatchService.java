@@ -2,6 +2,7 @@ package com.talentmatch.seeker;
 
 import com.talentmatch.ai.AiProperties;
 import com.talentmatch.ai.Audience;
+import com.talentmatch.ai.ExplanationRateLimiter;
 import com.talentmatch.ai.ExplanationReason;
 import com.talentmatch.ai.ExplanationRequest;
 import com.talentmatch.ai.ExplanationResult;
@@ -16,6 +17,7 @@ import com.talentmatch.domain.scoring.CandidateSkillFact;
 import com.talentmatch.domain.scoring.JobRequirement;
 import com.talentmatch.domain.scoring.MatchEvaluation;
 import com.talentmatch.domain.scoring.ScoringEngine;
+import com.talentmatch.preferences.Workplace;
 import com.talentmatch.profile.OwnerProfileRepository;
 import com.talentmatch.repository.MatchJdbcRepository;
 import com.talentmatch.repository.UuidOrder;
@@ -26,6 +28,7 @@ import com.talentmatch.service.MatchBreakdownView;
 import com.talentmatch.service.MatchReason;
 import com.talentmatch.service.exception.MatchesBusyException;
 import com.talentmatch.service.exception.NotFoundException;
+import com.talentmatch.service.exception.RegenerateRateLimitedException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -47,7 +50,9 @@ import org.springframework.transaction.support.TransactionTemplate;
  * {@code MatchService}. Uses the same {@code job_match} cache and staleness rule
  * ({@code computed_at < GREATEST(candidate.updated_at, job.updated_at)}).
  *
- * <ol>
+ * <ol start="0">
+ *   <li>With {@code regenerate} and AI enabled: the candidate's regenerate slot (429 before any DB work;
+ *       released if the request then fails).</li>
  *   <li>Read (no locks): the candidate (404), whether it is the owner, and the in-scope matchable jobs
  *       to score (stale, or all with {@code regenerate}).</li>
  *   <li>Score them in chunks of {@code talentmatch.matches.rescore-chunk} jobs, one transaction each:
@@ -70,11 +75,19 @@ public class CandidateMatchService {
     static final int LARGE_TARGET_WARN = 10_000;
     private static final double SCORE_TOLERANCE = 1e-9;
 
+    /**
+     * The computed flag for a feed job that passed a {@code country} filter only for lack of country data
+     * (decision e). Same name as {@code preferences.PreferenceFilter.Flag.LOCATION_UNKNOWN}; a literal so
+     * {@code seeker} depends on the preference enums only (§1.1).
+     */
+    static final String LOCATION_UNKNOWN = "LOCATION_UNKNOWN";
+
     private final CandidateMatchRepository repository;
     private final MatchJdbcRepository matchRepository;
     private final OwnerProfileRepository ownerProfiles;
     private final ScoringEngine scoringEngine;
     private final ExplanationService explanationService;
+    private final ExplanationRateLimiter rateLimiter;
     private final AiProperties aiProperties;
     private final MatchProperties matchProperties;
     private final TransactionTemplate writeTx;
@@ -83,13 +96,15 @@ public class CandidateMatchService {
 
     public CandidateMatchService(CandidateMatchRepository repository, MatchJdbcRepository matchRepository,
                                  OwnerProfileRepository ownerProfiles, ScoringEngine scoringEngine,
-                                 ExplanationService explanationService, AiProperties aiProperties,
-                                 MatchProperties matchProperties, PlatformTransactionManager transactionManager) {
+                                 ExplanationService explanationService, ExplanationRateLimiter rateLimiter,
+                                 AiProperties aiProperties, MatchProperties matchProperties,
+                                 PlatformTransactionManager transactionManager) {
         this.repository = repository;
         this.matchRepository = matchRepository;
         this.ownerProfiles = ownerProfiles;
         this.scoringEngine = scoringEngine;
         this.explanationService = explanationService;
+        this.rateLimiter = rateLimiter;
         this.aiProperties = aiProperties;
         this.matchProperties = matchProperties;
         // Scoring chunks: READ COMMITTED, so the re-check after waiting for the locks sees what the
@@ -111,13 +126,44 @@ public class CandidateMatchService {
      *
      * @param page  0-based page; {@code page * limit} must fit in an int (validated by the caller)
      * @param limit page size (validated by the caller)
+     * @throws RegenerateRateLimitedException (candidate message) if {@code regenerate} is repeated for this
+     *         candidate within the regenerate window while AI is enabled; a request that fails afterwards
+     *         releases its slot
      * @throws NotFoundException    if the candidate does not exist
      * @throws MatchesBusyException if a job's or the candidate's match lock is held too long, or on a deadlock
+     *                              (candidate message)
      */
     public CandidateMatchPageView getMatches(UUID candidateId, CandidateMatchQuery query, int page, int limit,
                                              boolean regenerate) {
         Objects.requireNonNull(candidateId, "candidateId");
         Objects.requireNonNull(query, "query");
+        // 0. The candidate's regenerate slot, before any DB work (no slot and no 429 with AI disabled:
+        //    regenerate then only rescores).
+        ExplanationRateLimiter.Lease lease = regenerate && aiProperties.enabled()
+                ? rateLimiter.acquireForCandidate(candidateId) : null;
+        try {
+            return run(candidateId, query, page, limit, regenerate);
+        } catch (RuntimeException | Error e) {
+            // A failed request does not consume the candidate's regenerate slot.
+            rateLimiter.release(lease);
+            throw e;
+        }
+    }
+
+    /**
+     * {@code GET /api/profile/matches} (decision a): {@link #getMatches} for the owner's candidate.
+     *
+     * @throws NotFoundException    PROFILE_NOT_FOUND if no profile was saved (checked before the rate limit)
+     * @throws MatchesBusyException as {@link #getMatches}
+     */
+    public CandidateMatchPageView getOwnerMatches(CandidateMatchQuery query, int page, int limit,
+                                                  boolean regenerate) {
+        UUID ownerId = ownerProfiles.findCandidateId().orElseThrow(NotFoundException::profile);
+        return getMatches(ownerId, query, page, limit, regenerate);
+    }
+
+    private CandidateMatchPageView run(UUID candidateId, CandidateMatchQuery query, int page, int limit,
+                                       boolean regenerate) {
         long started = System.nanoTime();
 
         // 1. Who, and what to score (no locks).
@@ -155,7 +201,7 @@ public class CandidateMatchService {
                             SeekerFallbackRenderer.render(percent(s.row().score()), s.eval(),
                                     ExplanationReason.GENERATION_FAILED, false, aiProperties.topN()));
                 }
-                matches.add(toView(s, result));
+                matches.add(toView(s, result, targeting.owner(), query));
             }
         }
 
@@ -184,12 +230,12 @@ public class CandidateMatchService {
     }
 
     /**
-     * The request's scope. Owner preference verdicts (hiding FILTERED jobs unless
-     * {@code includeFiltered}) are not applied here yet; {@link Scope#of}'s {@code hideFiltered} is the
-     * switch for them.
+     * The request's scope (decision f): for the owner, jobs the owner's preferences FILTERED are hidden
+     * unless {@code includeFiltered}; for any other candidate the preference verdicts don't apply and
+     * {@code includeFiltered} is ignored.
      */
     static Scope scopeFor(CandidateMatchQuery query, boolean owner) {
-        return Scope.of(query, false);
+        return Scope.of(query, owner && !query.includeFiltered());
     }
 
     // ------------------------------------------------------------------ 2. scoring
@@ -208,7 +254,7 @@ public class CandidateMatchService {
                 written += n == null ? 0 : n;
             } catch (PessimisticLockingFailureException e) {
                 // Lock timeout or deadlock; the chunks committed so far stay (a retry has fewer targets).
-                throw new MatchesBusyException(e);
+                throw MatchesBusyException.forCandidate(e);
             }
         }
         return written;
@@ -309,7 +355,8 @@ public class CandidateMatchService {
                 row.score(), percent(row.score()), s.eval(), row.stored());
     }
 
-    private static CandidateMatchView toView(ScoredRow s, ExplanationResult explanation) {
+    private static CandidateMatchView toView(ScoredRow s, ExplanationResult explanation, boolean owner,
+                                             CandidateMatchQuery query) {
         RankedJobRow row = s.row();
         MatchEvaluation eval = s.eval();
         double score = Math.round(row.score() * 10_000d) / 10_000d;
@@ -318,13 +365,38 @@ public class CandidateMatchService {
         CandidateMatchView.Salary salary = row.salaryMin() == null && row.salaryMax() == null ? null
                 : new CandidateMatchView.Salary(row.salaryMin(), row.salaryMax(), row.salaryCurrency(),
                         row.salaryPeriod(), Boolean.TRUE.equals(row.salaryEstimated()));
-        // Owner-only preference fields (verdict, reasons, flags) are not filled in yet: null / empty.
+        // Owner-only preference fields (decision f): null / empty for anyone else; flags() adds the computed
+        // LOCATION_UNKNOWN for every caller (decision e).
+        String verdict = owner ? row.preferenceVerdict() : null;
+        List<String> reasons = owner ? row.filterReasons() : List.of();
         return new CandidateMatchView(s.rank(), row.jobId(), row.title(), row.company(), row.origin(),
                 row.listedAt(), row.listedAtSource(), row.postedAt(), row.firstSeenAt(), row.closedAt(),
                 row.baseline(), row.primaryUrl(), row.workplace(), row.locationText(), row.countryCodes(),
-                row.seniority(), salary, row.enrichmentStatus(), null, List.of(), List.of(), score,
+                row.seniority(), salary, row.enrichmentStatus(), verdict, reasons, flags(row, owner, query), score,
                 percent(row.score()), eval.summary(), breakdown, explanation.aiExplanation(), explanation.status(),
                 explanation.explanation(), row.computedAt());
+    }
+
+    /**
+     * The job's flags. The stored preference flags ({@code feed_job.filter_flags}) are owner only
+     * (decision f, §5.1). The computed {@link #LOCATION_UNKNOWN} comes from the caller's own
+     * {@code country} filter, not from the owner's preferences, so it is added for every caller (decision e,
+     * §4.3) when a {@code country} filter is set and a non-remote feed job has no country data (it passed
+     * the filter unchecked). A REMOTE job passed through the remote rule, and a MANUAL job has no location
+     * data at all, so neither gets it. A non-owner without a {@code country} filter gets {@code []}.
+     * Stored order first; no duplicates.
+     */
+    static List<String> flags(RankedJobRow row, boolean owner, CandidateMatchQuery query) {
+        List<String> stored = owner ? row.filterFlags() : List.of();
+        boolean locationUnknown = !query.countries().isEmpty() && row.feed() && row.countryCodes().isEmpty()
+                && row.workplace() != Workplace.REMOTE;
+        if (!locationUnknown || stored.contains(LOCATION_UNKNOWN)) {
+            return stored;
+        }
+        List<String> out = new ArrayList<>(stored.size() + 1);
+        out.addAll(stored);
+        out.add(LOCATION_UNKNOWN);
+        return List.copyOf(out);
     }
 
     private static int percent(double score) {

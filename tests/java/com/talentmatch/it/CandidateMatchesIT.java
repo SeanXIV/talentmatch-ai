@@ -395,7 +395,13 @@ class CandidateMatchesIT extends AbstractApiIT {
         assertThat(zaItem.get("workplace").asText()).isEqualTo("ONSITE");
         assertThat(zaItem.get("locationText").asText()).isEqualTo("Cape Town");
         assertThat(item(ok(null), multi).get("countryCodes").toString()).isEqualTo("[\"DE\",\"ZA\"]");
-        // LOCATION_UNKNOWN for the job with no country data is owner-only (step 5)
+        // step 5 (§12.5): the computed LOCATION_UNKNOWN is shown to any caller who passes country
+        JsonNode zaPage = ok("country=ZA");
+        assertThat(item(zaPage, nowhere).get("flags").toString()).isEqualTo("[\"LOCATION_UNKNOWN\"]");
+        for (UUID other : List.of(za, gbRemote, multi, manual)) {
+            assertThat(item(zaPage, other).get("flags")).as("no computed flag").isEmpty();
+        }
+        assertThat(item(ok(null), nowhere).get("flags")).as("no country filter").isEmpty();
     }
 
     @Test

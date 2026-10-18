@@ -60,7 +60,10 @@ public class CandidateMatchRepository {
             + "f.job_id AS feed_job_id, f.primary_url, f.first_seen_at, f.posted_at, f.closed_at, f.baseline, "
             + "f.workplace, f.location_text, array_to_string(f.country_codes, ',') AS country_codes, f.seniority, "
             + "f.salary_min, f.salary_max, f.salary_currency, f.salary_period, f.salary_estimated, "
-            + "f.enrichment_status, m.score, m.computed_at, "
+            + "f.enrichment_status, f.preference_verdict, "
+            + jsonNames("f.filter_reasons") + " AS filter_reasons, "
+            + jsonNames("f.filter_flags") + " AS filter_flags, "
+            + "m.score, m.computed_at, "
             + "m.seeker_explanation_payload ->> 'explanation' AS seeker_text, "
             + "CAST(m.seeker_explanation_payload AS text) AS seeker_payload, "
             + "m.seeker_explanation_input_hash, m.seeker_explanation_model, m.seeker_explanation_generated_at, "
@@ -92,6 +95,10 @@ public class CandidateMatchRepository {
      *
      * @param jobUpdatedAt job.updated_at (guards the explanation write)
      * @param feed         true when the job has a feed_job row
+     * @param preferenceVerdict the stored owner verdict (PASS, FILTERED or null); the service exposes it
+     *                          to the owner only
+     * @param filterReasons     the stored owner filter reasons (enum names, stored order); never null
+     * @param filterFlags       the stored owner flags (enum names, stored order); never null
      * @param score        raw job_match.score (not rounded)
      * @param stored       the persisted seeker explanation (V6 columns), or null when there is none
      */
@@ -101,6 +108,7 @@ public class CandidateMatchRepository {
                                String locationText, List<String> countryCodes, Seniority seniority,
                                BigDecimal salaryMin, BigDecimal salaryMax, String salaryCurrency,
                                SalaryPeriod salaryPeriod, Boolean salaryEstimated, String enrichmentStatus,
+                               String preferenceVerdict, List<String> filterReasons, List<String> filterFlags,
                                double score, Instant computedAt, Instant listedAt, ListedAtSource listedAtSource,
                                StoredExplanation stored) {
     }
@@ -295,6 +303,15 @@ public class CandidateMatchRepository {
 
     // ------------------------------------------------------------------ helpers
 
+    /**
+     * A jsonb array of enum names ({@code feed_job.filter_reasons}/{@code filter_flags}) as one
+     * comma-separated string in array order; NULL for an empty array or a missing feed row.
+     */
+    private static String jsonNames(String column) {
+        return "(SELECT string_agg(e.v, ',' ORDER BY e.o) FROM jsonb_array_elements_text(" + column
+                + ") WITH ORDINALITY AS e(v, o))";
+    }
+
     /** Escapes LIKE wildcards ({@code \ % _}) for {@code ESCAPE '\'}. */
     static String escapeLike(String value) {
         StringBuilder sb = new StringBuilder(value.length() + 8);
@@ -341,6 +358,9 @@ public class CandidateMatchRepository {
                 period(rs.getString("salary_period")),
                 feed ? rs.getBoolean("salary_estimated") : null,
                 rs.getString("enrichment_status"),
+                trimmed(rs.getString("preference_verdict")),
+                codes(rs.getString("filter_reasons")),
+                codes(rs.getString("filter_flags")),
                 rs.getDouble("score"),
                 instant(rs, "computed_at"),
                 instant(rs, "listed_at"),

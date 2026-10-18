@@ -30,6 +30,7 @@ public final class SeekerFixtures {
         String verdict;
         String description = "From the feed";
         String filterReasons = "[]";
+        String filterFlags = "[]";
 
         public Feed posted(Instant v) {
             postedAt = v;
@@ -72,6 +73,12 @@ public final class SeekerFixtures {
             return this;
         }
 
+        /** Stored owner flags ({@code feed_job.filter_flags}), a JSON array of enum names. */
+        public Feed flags(String json) {
+            filterFlags = json;
+            return this;
+        }
+
         public Feed description(String v) {
             description = v;
             return this;
@@ -98,11 +105,30 @@ public final class SeekerFixtures {
             }
         }
         jdbc.update("INSERT INTO feed_job (job_id, dedup_key, primary_url, first_seen_at, posted_at, closed_at, baseline, "
-                        + "location_text, country_codes, workplace, preference_verdict, filter_reasons, process_after) "
-                        + "VALUES (?, ?, 'https://jobs.example/' || ?, ?, ?, ?, ?, ?, CAST(? AS varchar(2)[]), ?, ?, "
-                        + "CAST(? AS jsonb), NULL)",
+                        + "location_text, country_codes, workplace, preference_verdict, filter_reasons, filter_flags, "
+                        + "process_after) VALUES (?, ?, 'https://jobs.example/' || ?, ?, ?, ?, ?, ?, "
+                        + "CAST(? AS varchar(2)[]), ?, ?, CAST(? AS jsonb), CAST(? AS jsonb), NULL)",
                 id, "dedup:" + id, id.toString(), ts(f.firstSeenAt), ts(f.postedAt), ts(f.closedAt), f.baseline,
-                f.location, "{" + String.join(",", f.countries) + "}", f.workplace, f.verdict, f.filterReasons);
+                f.location, "{" + String.join(",", f.countries) + "}", f.workplace, f.verdict, f.filterReasons,
+                f.filterFlags);
+        return id;
+    }
+
+    /**
+     * Inserts a candidate with a chosen id (e.g. a job's id, to show the regenerate scopes don't collide);
+     * skills as "Name" or "Name:years" (the skills must exist).
+     */
+    public static UUID candidateWithId(JdbcTemplate jdbc, UUID id, String name, String email, String... skills) {
+        jdbc.update("INSERT INTO candidate (id, full_name, email) VALUES (?, ?, ?)", id, name, email);
+        for (String s : skills) {
+            String[] parts = s.split(":");
+            Integer years = parts.length > 1 ? Integer.valueOf(parts[1]) : null;
+            int n = jdbc.update("INSERT INTO candidate_skill (candidate_id, skill_id, years_experience) "
+                    + "SELECT ?, id, ? FROM skill WHERE lower(name) = lower(?)", id, years, parts[0]);
+            if (n != 1) {
+                throw new IllegalStateException("unknown skill " + s);
+            }
+        }
         return id;
     }
 

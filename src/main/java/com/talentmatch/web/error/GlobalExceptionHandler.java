@@ -92,6 +92,8 @@ public class GlobalExceptionHandler {
     static final int SERVICE_BUSY_RETRY_AFTER_SECONDS = 2;
     private static final Pattern MATCHES_PATH = Pattern.compile(
             "^/api/(jobs/[^/]+/matches|candidates/[^/]+/matches|profile/matches|matches)(/.*)?$");
+    private static final Pattern CANDIDATE_MATCHES_PATH = Pattern.compile(
+            "^/api/(candidates/[^/]+/matches|profile/matches)(/.*)?$");
     private static final String EXAMPLE_ID = "3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6";
     private static final Pattern CONSTRAINT_IN_MESSAGE = Pattern.compile("constraint \"([^\"]+)\"");
     private static final int MAX_ECHO = 64;
@@ -168,7 +170,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(MatchesBusyException.class)
     ResponseEntity<ApiError> matchesBusy(MatchesBusyException ex, HttpServletRequest req) {
         log.info("Match lock busy for {}", req.getRequestURI());
-        return busy(req);
+        return busy(req, ex.getMessage());
     }
 
     @ExceptionHandler(ApiException.class)
@@ -360,7 +362,8 @@ public class GlobalExceptionHandler {
     ResponseEntity<ApiError> lockFailure(PessimisticLockingFailureException ex, HttpServletRequest req) {
         log.info("Lock failure on {}: {}", req.getRequestURI(), ex.getClass().getSimpleName());
         if (isMatchesEndpoint(req)) {
-            return busy(req);
+            return busy(req, isCandidateMatchesEndpoint(req)
+                    ? MatchesBusyException.CANDIDATE_MESSAGE : MatchesBusyException.MESSAGE);
         }
         HttpHeaders headers = new HttpHeaders();
         headers.set(HttpHeaders.RETRY_AFTER, String.valueOf(SERVICE_BUSY_RETRY_AFTER_SECONDS));
@@ -375,6 +378,12 @@ public class GlobalExceptionHandler {
     static boolean isMatchesEndpoint(HttpServletRequest req) {
         String uri = req.getRequestURI();
         return uri != null && MATCHES_PATH.matcher(uri).matches();
+    }
+
+    /** {@code /api/candidates/{id}/matches} and {@code /api/profile/matches} (candidate busy message). */
+    static boolean isCandidateMatchesEndpoint(HttpServletRequest req) {
+        String uri = req.getRequestURI();
+        return uri != null && CANDIDATE_MATCHES_PATH.matcher(uri).matches();
     }
 
     @ExceptionHandler({DataAccessResourceFailureException.class, CannotCreateTransactionException.class,
@@ -440,11 +449,10 @@ public class GlobalExceptionHandler {
 
     // ------------------------------------------------------------------ helpers
 
-    private ResponseEntity<ApiError> busy(HttpServletRequest req) {
+    private ResponseEntity<ApiError> busy(HttpServletRequest req, String message) {
         HttpHeaders headers = new HttpHeaders();
         headers.set(HttpHeaders.RETRY_AFTER, String.valueOf(MatchesBusyException.RETRY_AFTER_SECONDS));
-        return respond(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.MATCHES_BUSY, MatchesBusyException.MESSAGE,
-                List.of(), req, headers);
+        return respond(HttpStatus.SERVICE_UNAVAILABLE, ErrorCode.MATCHES_BUSY, message, List.of(), req, headers);
     }
 
     private ResponseEntity<ApiError> databaseUnavailable(HttpServletRequest req) {
