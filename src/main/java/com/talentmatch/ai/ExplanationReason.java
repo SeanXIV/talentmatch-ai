@@ -35,8 +35,24 @@ public enum ExplanationReason {
         };
     }
 
-    /** {@link #note(int)}, prefixed with {@link #STALE_PREFIX} when {@code stale}. */
+    /** Seeker-facing stale prefix (Phase 6): addressed to the job seeker. */
+    public static final String SEEKER_STALE_PREFIX =
+            "The previous AI explanation is out of date because your profile or the job changed. ";
+
+    /** {@link #note(int)}, prefixed with {@link #STALE_PREFIX} when {@code stale} (recruiter wording). */
     public String note(int topN, boolean stale) {
         return stale ? STALE_PREFIX + note(topN) : note(topN);
+    }
+
+    /**
+     * {@link #note(int)}, prefixed with the audience's stale prefix when {@code stale}: {@link #STALE_PREFIX}
+     * for RECRUITER (same text as {@link #note(int, boolean)}), {@link #SEEKER_STALE_PREFIX} for SEEKER.
+     */
+    public String note(int topN, boolean stale, Audience audience) {
+        if (!stale) {
+            return note(topN);
+        }
+        String prefix = audience == Audience.SEEKER ? SEEKER_STALE_PREFIX : STALE_PREFIX;
+        return prefix + note(topN);
     }
 }

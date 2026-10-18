@@ -128,10 +128,9 @@ public class ExplanationService {
      *
      * @param regenerate force new AI explanations for rows within the top N
      * @return one result per request, in input order
-     * @throws IllegalStateException for SEEKER until its prompt and template are wired (Phase 6 step 3)
      */
     public ExplanationResults explainAll(Audience audience, List<ExplanationRequest> requests, boolean regenerate) {
-        requireWired(Objects.requireNonNull(audience, "audience"));
+        Objects.requireNonNull(audience, "audience");
         Objects.requireNonNull(requests, "requests");
         try {
             if (!aiActive()) {
@@ -229,18 +228,11 @@ public class ExplanationService {
 
     // ------------------------------------------------------------------ audience dispatch
 
-    /** Fails fast for an audience whose prompt and template are not wired yet. */
-    private static void requireWired(Audience audience) {
-        if (audience == Audience.SEEKER) {
-            throw new IllegalStateException("SEEKER is wired in step 3");
-        }
-    }
-
     /** The exact user message for the audience. */
     private String prompt(Audience audience, JobContext job, MatchContext row) {
         return switch (audience) {
             case RECRUITER -> promptBuilder.build(job, row);
-            case SEEKER -> throw new IllegalStateException("SEEKER is wired in step 3");
+            case SEEKER -> promptBuilder.buildSeeker(job, row);
         };
     }
 
@@ -421,7 +413,8 @@ public class ExplanationService {
         ExplanationView view = switch (audience) {
             case RECRUITER -> ExplanationFallbackRenderer.render(row.candidateName(), row.scorePercent(),
                     row.evaluation(), reason, stale, properties.topN());
-            case SEEKER -> throw new IllegalStateException("SEEKER is wired in step 3");
+            case SEEKER -> SeekerFallbackRenderer.render(row.scorePercent(), row.evaluation(), reason, stale,
+                    properties.topN());
         };
         return ExplanationResult.template(status, view);
     }

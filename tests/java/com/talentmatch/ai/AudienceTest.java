@@ -23,4 +23,19 @@ class AudienceTest {
         }
         assertThat(ExplanationTarget.values()).hasSameSizeAs(Audience.values());
     }
+
+    @Test
+    void eachAudienceHasItsOwnSystemPrompt() {
+        assertThat(Audience.RECRUITER.systemPrompt()).isSameAs(ExplanationPrompts.SYSTEM);
+        assertThat(Audience.SEEKER.systemPrompt()).isSameAs(SeekerExplanationPrompts.SYSTEM);
+        assertThat(Audience.SEEKER.systemPrompt()).isNotEqualTo(Audience.RECRUITER.systemPrompt());
+    }
+
+    @Test
+    void theSeekerAssistantSendsTheSeekerSystemPrompt() throws Exception {
+        var m = SeekerExplanationAssistant.class.getMethod("explain", String.class);
+        assertThat(m.getAnnotation(dev.langchain4j.service.SystemMessage.class).value())
+                .containsExactly(SeekerExplanationPrompts.SYSTEM);
+        assertThat(m.getParameters()[0].isAnnotationPresent(dev.langchain4j.service.UserMessage.class)).isTrue();
+    }
 }

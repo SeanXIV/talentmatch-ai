@@ -18,7 +18,8 @@ import java.util.stream.Stream;
  * characters, drop blank and duplicate items (case-insensitive). Ground: keep a strength only if
  * it names a matched skill and a gap only if it names a missing skill, then cap each list at 3.
  * Reject the whole record if it is null, a field is blank or out of bounds, or any field
- * contains an email address, a URL, or an echo of the prompt's tags/sections.
+ * contains an email address, a URL, or an echo of either audience's prompt tags/sections
+ * ({@code <job_description}, {@code <candidate_summary}, {@code <profile_summary}, {@code MATCH FACTS}).
  */
 public class MatchExplanationValidator {
 
@@ -86,6 +87,7 @@ public class MatchExplanationValidator {
                 || lower.contains("https://")
                 || lower.contains("<job_description")
                 || lower.contains("<candidate_summary")
+                || lower.contains("<profile_summary")
                 || field.contains("MATCH FACTS");
     }
 

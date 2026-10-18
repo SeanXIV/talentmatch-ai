@@ -32,4 +32,12 @@ public enum Audience {
     public ExplanationTarget target() {
         return target;
     }
+
+    /** The audience's system prompt (sent first; part of its staleness hash). */
+    public String systemPrompt() {
+        return switch (this) {
+            case RECRUITER -> ExplanationPrompts.SYSTEM;
+            case SEEKER -> SeekerExplanationPrompts.SYSTEM;
+        };
+    }
 }

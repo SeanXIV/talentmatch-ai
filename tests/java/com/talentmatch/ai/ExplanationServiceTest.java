@@ -469,23 +469,15 @@ class ExplanationServiceTest {
     }
 
     @Test
-    void explainAllRejectsSeekerBeforeTouchingAnything() {
+    void explainAllRejectsNullAudienceOrRequests() {
         List<ExplanationRequest> reqs = requests(job, rows(2));
-        for (boolean enabled : List.of(true, false)) {
-            ExplanationService s = service(props(enabled, 3, Duration.ofSeconds(1), Duration.ofSeconds(60)));
-            org.assertj.core.api.Assertions.assertThatIllegalStateException()
-                    .isThrownBy(() -> s.explainAll(Audience.SEEKER, reqs, false))
-                    .withMessage("SEEKER is wired in step 3");
-            org.assertj.core.api.Assertions.assertThatIllegalStateException()
-                    .isThrownBy(() -> s.explainAll(Audience.SEEKER, List.of(), true));
-        }
-        verifyNoInteractions(generator);
-        assertThat(circuit.consecutiveFailures()).isZero();
-        assertThat(meters.find("talentmatch.ai.fallbacks").counters()).as("no seeker template rendered").isEmpty();
         org.assertj.core.api.Assertions.assertThatNullPointerException()
                 .isThrownBy(() -> service().explainAll(null, reqs, false));
         org.assertj.core.api.Assertions.assertThatNullPointerException()
                 .isThrownBy(() -> service().explainAll(Audience.RECRUITER, null, false));
+        org.assertj.core.api.Assertions.assertThatNullPointerException()
+                .isThrownBy(() -> service().explainAll(Audience.SEEKER, null, false));
+        verifyNoInteractions(generator);
     }
 
     @Test
@@ -628,14 +620,58 @@ class ExplanationServiceTest {
     }
 
     @Test
-    void flightKeyIncludesTheAudience() throws Exception {
-        // Behaviour (two flights for RECRUITER and SEEKER on one pair, backoff per audience) is only
-        // reachable once SEEKER is wired in step 3; until then pin the key's shape.
-        Class<?> key = Class.forName("com.talentmatch.ai.ExplanationService$FlightKey");
-        assertThat(key.isRecord()).isTrue();
-        assertThat(java.util.Arrays.stream(key.getRecordComponents()).map(c -> c.getName() + ":"
-                + c.getType().getSimpleName()).toList())
-                .containsExactly("audience:Audience", "jobId:UUID", "candidateId:UUID", "inputHash:String");
+    void samePairForRecruiterAndSeekerIsTwoFlights() {
+        CompletableFuture<GenerationOutcome> recruiterFlight = new CompletableFuture<>();
+        CompletableFuture<GenerationOutcome> seekerFlight = new CompletableFuture<>();
+        when(generator.submit(any())).thenAnswer(inv -> ((GenerationTask) inv.getArgument(0)).audience()
+                == Audience.SEEKER ? seekerFlight : recruiterFlight);
+        ExplanationService s = service(props(true, 3, Duration.ZERO, Duration.ofSeconds(60)));
+        MatchContext row = match(1, "Ada");
+        s.explainAll(Audience.RECRUITER, requests(job, List.of(row)), false);
+        s.explainAll(Audience.SEEKER, requests(job, List.of(row)), false);
+        s.explainAll(Audience.SEEKER, requests(job, List.of(row)), false); // joins the seeker flight
+        s.explain(job, List.of(row), false);                              // joins the recruiter flight
+
+        ArgumentCaptor<GenerationTask> tasks = ArgumentCaptor.forClass(GenerationTask.class);
+        verify(generator, times(2)).submit(tasks.capture());
+        assertThat(tasks.getAllValues()).extracting(GenerationTask::audience)
+                .containsExactly(Audience.RECRUITER, Audience.SEEKER);
+
+        recruiterFlight.complete(success("Recruiter text about Ada and Java."));
+        seekerFlight.complete(success("Seeker text about your Java skills."));
+        assertThat(s.explainAll(Audience.SEEKER, requests(job, List.of(row)), false).results().get(0)
+                .aiExplanation()).isEqualTo("Seeker text about your Java skills.");
+        assertThat(s.explainAll(Audience.RECRUITER, requests(job, List.of(row)), false).results().get(0)
+                .aiExplanation()).isEqualTo("Recruiter text about Ada and Java.");
+        verify(generator, times(2)).submit(any());
+    }
+
+    @Test
+    void backoffIsPerAudience() {
+        when(generator.submit(any())).thenAnswer(inv -> ((GenerationTask) inv.getArgument(0)).audience()
+                == Audience.RECRUITER ? done(new GenerationOutcome.Failure(FailureKind.TIMEOUT, 1))
+                : done(new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, 1)));
+        ExplanationService s = service();
+        MatchContext row = match(1, "Ada");
+        s.explainAll(Audience.RECRUITER, requests(job, List.of(row)), false);
+        verify(generator, times(1)).submit(any());
+
+        // the recruiter backoff does not hold back the seeker generation for the same pair
+        ExplanationResult seeker = s.explainAll(Audience.SEEKER, requests(job, List.of(row)), false).results().get(0);
+        verify(generator, times(2)).submit(any());
+        assertThat(seeker.explanation().reason()).isEqualTo(ExplanationReason.GENERATION_FAILED);
+
+        // each audience now backs off on its own, with its own reason
+        ExplanationResult r2 = s.explainAll(Audience.RECRUITER, requests(job, List.of(row)), false).results().get(0);
+        ExplanationResult s2 = s.explainAll(Audience.SEEKER, requests(job, List.of(row)), false).results().get(0);
+        verify(generator, times(2)).submit(any());
+        assertThat(r2.explanation().reason()).isEqualTo(ExplanationReason.PROVIDER_UNAVAILABLE);
+        assertThat(s2.explanation().reason()).isEqualTo(ExplanationReason.GENERATION_FAILED);
+        assertThat(s2.explanation().text()).startsWith("You have").doesNotContain("Ada");
+
+        // regenerate bypasses the seeker backoff
+        s.explainAll(Audience.SEEKER, requests(job, List.of(row)), true);
+        verify(generator, times(3)).submit(any());
     }
 
     @Test
@@ -727,5 +763,156 @@ class ExplanationServiceTest {
                 ExplanationFallbackRenderer.render("Cand 5", rows.get(4).scorePercent(), rows.get(4).evaluation(),
                         ExplanationReason.NOT_IN_TOP_N, true, 3)));
         assertInvariant(b);
+    }
+
+    // ------------------------------------------------------------------ Phase 6 step 3: explainAll(SEEKER)
+
+    private static final ExplanationPromptBuilder BUILDER = new ExplanationPromptBuilder(2000);
+
+    private MatchContext withSeekerStored(MatchContext row, boolean fresh) {
+        String hash = fresh ? ExplanationInputHasher.hash(Audience.SEEKER, BUILDER.buildSeeker(job, row))
+                : ExplanationInputHasher.hash(Audience.RECRUITER, BUILDER.build(job, row)); // e.g. a wrong-audience hash
+        StoredExplanation s = new StoredExplanation("Stored seeker text about your Java.", STORED_PAYLOAD, hash,
+                "ollama/qwen2.5:7b-instruct", AiFixtures.T0);
+        return new MatchContext(row.rank(), row.candidateId(), row.candidateName(), row.candidateSummary(),
+                row.candidateUpdatedAt(), row.storedScore(), row.scorePercent(), row.evaluation(), s);
+    }
+
+    @Test
+    void seekerTasksCarryTheSeekerPromptHashAndAudience() {
+        when(generator.submit(any())).thenAnswer(inv -> done(success("Generated for you about Java.")));
+        List<MatchContext> rows = List.of(match(2, "Bo Unique"), match(1, "Ada Unique"));
+        ExplanationResults r = service().explainAll(Audience.SEEKER, requests(job, rows), false);
+
+        ArgumentCaptor<GenerationTask> tasks = ArgumentCaptor.forClass(GenerationTask.class);
+        verify(generator, times(2)).submit(tasks.capture());
+        for (GenerationTask t : tasks.getAllValues()) {
+            assertThat(t.audience()).isEqualTo(Audience.SEEKER);
+            assertThat(t.prompt()).isEqualTo(BUILDER.buildSeeker(t.job(), t.match()))
+                    .startsWith("Explain how well this job fits you.\n")
+                    .doesNotContain("Unique").doesNotContain("Candidate:");
+            assertThat(t.inputHash()).isEqualTo(ExplanationInputHasher.hash(Audience.SEEKER, t.prompt()))
+                    .isNotEqualTo(ExplanationInputHasher.hash(Audience.RECRUITER, BUILDER.build(t.job(), t.match())));
+        }
+        assertThat(r.generated()).isEqualTo(2);
+        assertThat(r.results()).extracting(ExplanationResult::status)
+                .containsExactly(ExplanationStatus.READY, ExplanationStatus.READY);
+    }
+
+    @Test
+    void seekerDisabledGivesSeekerTemplatesTaggedSeeker() {
+        List<MatchContext> rows = List.of(match(2, "Bo"), withSeekerStored(match(1, "Ada"), true));
+        ExplanationService s = service(props(false, 3, Duration.ofSeconds(1), Duration.ofSeconds(60)));
+        ExplanationResults r = s.explainAll(Audience.SEEKER, requests(job, rows), true);
+        verifyNoInteractions(generator);
+        assertThat(r.generated()).isZero();
+        for (int i = 0; i < rows.size(); i++) {
+            ExplanationResult res = r.results().get(i);
+            MatchContext row = rows.get(i);
+            assertThat(res).isEqualTo(ExplanationResult.template(ExplanationStatus.UNAVAILABLE,
+                    SeekerFallbackRenderer.render(row.scorePercent(), row.evaluation(), ExplanationReason.AI_DISABLED,
+                            false, 3)));
+            assertThat(res.explanation().text()).startsWith("You have").doesNotContain(row.candidateName());
+        }
+        assertThat(meters.get("talentmatch.ai.fallbacks").tag("audience", "seeker").tag("reason", "AI_DISABLED")
+                .counter().count()).isEqualTo(2.0);
+        assertThat(meters.find("talentmatch.ai.fallbacks").tag("audience", "recruiter").counters()).isEmpty();
+    }
+
+    @Test
+    void seekerFreshStoredIsReadyAndAnOtherHashIsStaleWithTheSeekerPrefix() {
+        org.mockito.Mockito.doReturn(done(new GenerationOutcome.Rejected())).when(generator).submit(any());
+        MatchContext fresh = withSeekerStored(match(1, "Ada"), true);
+        MatchContext staleTop = withSeekerStored(match(2, "Bo"), false);
+        MatchContext staleLow = withSeekerStored(match(5, "Cy"), false);
+        ExplanationResults r = service().explainAll(Audience.SEEKER, requests(job, List.of(fresh, staleTop, staleLow)),
+                false);
+
+        verify(generator, times(1)).submit(any()); // only the stale top-N row
+        assertThat(r.results().get(0)).isEqualTo(ExplanationResult.ready(new ExplanationView(ExplanationSource.AI,
+                "Stored headline", "Stored seeker text about your Java.", List.of("Java"), List.of("Kubernetes"),
+                "ollama/qwen2.5:7b-instruct", AiFixtures.T0, null, null)));
+        assertThat(r.results().get(1)).isEqualTo(ExplanationResult.template(ExplanationStatus.STALE,
+                SeekerFallbackRenderer.render(staleTop.scorePercent(), staleTop.evaluation(), ExplanationReason.AI_BUSY,
+                        true, 3)));
+        assertThat(r.results().get(2)).isEqualTo(ExplanationResult.template(ExplanationStatus.STALE,
+                SeekerFallbackRenderer.render(staleLow.scorePercent(), staleLow.evaluation(),
+                        ExplanationReason.NOT_IN_TOP_N, true, 3)));
+        assertThat(r.results().get(2).explanation().note()).startsWith(ExplanationReason.SEEKER_STALE_PREFIX);
+        // a recruiter-fresh hash is not seeker-fresh, and vice versa
+        MatchContext recruiterFresh = withStored(match(1, "Ada"), true, STORED_PAYLOAD);
+        org.mockito.Mockito.reset(generator);
+        org.mockito.Mockito.doReturn(done(new GenerationOutcome.Rejected())).when(generator).submit(any());
+        assertThat(service().explainAll(Audience.SEEKER, requests(job, List.of(recruiterFresh)), false).results().get(0)
+                .status()).isEqualTo(ExplanationStatus.STALE);
+        assertThat(service().explainAll(Audience.RECRUITER, requests(job, List.of(fresh)), false).results().get(0)
+                .status()).isEqualTo(ExplanationStatus.STALE);
+    }
+
+    @Test
+    void seekerBudgetElapsedGivesPendingGeneratingSeekerTemplates() {
+        org.mockito.Mockito.doReturn(new CompletableFuture<>()).when(generator).submit(any());
+        ExplanationService s = service(props(true, 3, Duration.ofMillis(100), Duration.ofSeconds(60)));
+        List<MatchContext> rows = rows(2);
+        ExplanationResults r = s.explainAll(Audience.SEEKER, requests(job, rows), false);
+        for (int i = 0; i < rows.size(); i++) {
+            assertThat(r.results().get(i)).isEqualTo(ExplanationResult.template(ExplanationStatus.PENDING,
+                    SeekerFallbackRenderer.render(rows.get(i).scorePercent(), rows.get(i).evaluation(),
+                            ExplanationReason.GENERATING, false, 3)));
+        }
+        assertThat(r.generated()).isZero();
+    }
+
+    @Test
+    void seekerInvalidOutputGivesGenerationFailedAndKeepsAFreshStoredOneOnRegenerate() {
+        org.mockito.Mockito.doReturn(done(new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, 1)))
+                .when(generator).submit(any());
+        MatchContext plain = match(1, "Ada");
+        MatchContext fresh = withSeekerStored(match(2, "Bo"), true);
+        ExplanationResults r = service().explainAll(Audience.SEEKER, requests(job, List.of(plain, fresh)), true);
+        verify(generator, times(2)).submit(any());
+        assertThat(r.results().get(0)).isEqualTo(ExplanationResult.template(ExplanationStatus.UNAVAILABLE,
+                SeekerFallbackRenderer.render(plain.scorePercent(), plain.evaluation(),
+                        ExplanationReason.GENERATION_FAILED, false, 3)));
+        assertThat(r.results().get(1).status()).as("a failed regeneration keeps the valid one")
+                .isEqualTo(ExplanationStatus.READY);
+        assertThat(r.results().get(1).aiExplanation()).isEqualTo("Stored seeker text about your Java.");
+    }
+
+    @Test
+    void seekerTopNIsByRankAcrossJobsAndResultsAreInInputOrder() {
+        when(generator.submit(any())).thenAnswer(inv -> {
+            GenerationTask t = inv.getArgument(0);
+            return done(success("For you at " + t.job().title() + " rank " + t.match().rank() + "."));
+        });
+        MatchContext a = match(1, "Ada");
+        // one candidate, many jobs: the candidate side of the seeker list
+        List<ExplanationRequest> reqs = List.of(
+                new ExplanationRequest(otherJob(), new MatchContext(4, a.candidateId(), a.candidateName(),
+                        a.candidateSummary(), a.candidateUpdatedAt(), a.storedScore(), a.scorePercent(),
+                        a.evaluation(), null)),
+                new ExplanationRequest(job, a),
+                new ExplanationRequest(otherJob(), new MatchContext(2, a.candidateId(), a.candidateName(),
+                        a.candidateSummary(), a.candidateUpdatedAt(), a.storedScore(), a.scorePercent(),
+                        a.evaluation(), null)));
+        ExplanationResults r = service().explainAll(Audience.SEEKER, reqs, false);
+        assertThat(r.results().get(0).explanation().reason()).isEqualTo(ExplanationReason.NOT_IN_TOP_N);
+        assertThat(r.results().get(0).explanation().text()).startsWith("You have");
+        assertThat(r.results().get(1).aiExplanation()).isEqualTo("For you at Backend Engineer rank 1.");
+        assertThat(r.results().get(2).aiExplanation()).isEqualTo("For you at Data Engineer rank 2.");
+        assertThat(r.generated()).isEqualTo(2);
+    }
+
+    @Test
+    void seekerUnexpectedErrorGivesSeekerGenerationFailedTemplates() {
+        when(generator.localModelBusy()).thenThrow(new IllegalStateException("boom"));
+        List<MatchContext> rows = List.of(match(2, "Bo"), withSeekerStored(match(1, "Ada"), false));
+        ExplanationResults r = service().explainAll(Audience.SEEKER, requests(job, rows), false);
+        assertThat(r.results().get(0)).isEqualTo(ExplanationResult.template(ExplanationStatus.UNAVAILABLE,
+                SeekerFallbackRenderer.render(rows.get(0).scorePercent(), rows.get(0).evaluation(),
+                        ExplanationReason.GENERATION_FAILED, false, 3)));
+        assertThat(r.results().get(1)).isEqualTo(ExplanationResult.template(ExplanationStatus.STALE,
+                SeekerFallbackRenderer.render(rows.get(1).scorePercent(), rows.get(1).evaluation(),
+                        ExplanationReason.GENERATION_FAILED, true, 3)));
     }
 }

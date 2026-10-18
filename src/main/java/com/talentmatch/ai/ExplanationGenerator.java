@@ -26,7 +26,13 @@ import org.springframework.dao.DataAccessException;
  * validation, guarded persist (autocommit, outside any request transaction), circuit-breaker
  * bookkeeping, metrics and one INFO log line. Never logs prompt contents, names or keys at INFO.
  * The task's {@link Audience} picks the assistant and the storage columns, and tags the timer
- * ({@code audience}) and the log line. Only RECRUITER is wired until Phase 6 step 3.
+ * ({@code audience}) and the log line.
+ *
+ * <p>SEEKER outputs pass one more gate after validation: the {@link ExplanationGroundingCheck}
+ * (Phase 6 §4.5). A rejection is {@link FailureKind#INVALID_OUTPUT} (template, nothing stored, the
+ * circuit records a success). The check fails closed: without a check, or if it throws, every
+ * SEEKER output is rejected. Without a {@link SeekerExplanationAssistant} (the Phase 3 constructors),
+ * SEEKER tasks fail with INVALID_OUTPUT without calling a model or touching the circuit.
  *
  * <p>Only created when AI is enabled (see {@code AiConfiguration}).
  */
@@ -60,6 +66,8 @@ public class ExplanationGenerator {
     }
 
     private final ExplanationAssistant assistant;
+    private final SeekerExplanationAssistant seekerAssistant; // null: SEEKER tasks fail closed
+    private final ExplanationGroundingCheck groundingCheck;   // null: SEEKER outputs are rejected
     private final MatchExplanationValidator validator;
     private final MatchJdbcRepository repository;
     private final AiCircuitBreaker circuit;
@@ -75,11 +83,32 @@ public class ExplanationGenerator {
         this(assistant, validator, repository, circuit, modelInfo, executor, clock, meterRegistry, null);
     }
 
-    /** @param gate shared with CV extraction when the model is local (Ollama); null otherwise */
+    /**
+     * Recruiter-only generator (Phase 3 shape): SEEKER tasks fail closed.
+     *
+     * @param gate shared with CV extraction when the model is local (Ollama); null otherwise
+     */
     public ExplanationGenerator(ExplanationAssistant assistant, MatchExplanationValidator validator,
                                 MatchJdbcRepository repository, AiCircuitBreaker circuit, ModelInfo modelInfo,
                                 Executor executor, Clock clock, MeterRegistry meterRegistry, LocalModelGate gate) {
+        this(assistant, null, null, validator, repository, circuit, modelInfo, executor, clock, meterRegistry, gate);
+    }
+
+    /**
+     * Both audiences.
+     *
+     * @param seekerAssistant the seeker AI service; null makes every SEEKER task fail closed
+     * @param groundingCheck  the seeker free-text check; null makes every SEEKER output rejected
+     * @param meterRegistry   null to use {@link Metrics#globalRegistry}
+     * @param gate            shared with CV extraction when the model is local (Ollama); null otherwise
+     */
+    public ExplanationGenerator(ExplanationAssistant assistant, SeekerExplanationAssistant seekerAssistant,
+                                ExplanationGroundingCheck groundingCheck, MatchExplanationValidator validator,
+                                MatchJdbcRepository repository, AiCircuitBreaker circuit, ModelInfo modelInfo,
+                                Executor executor, Clock clock, MeterRegistry meterRegistry, LocalModelGate gate) {
         this.gate = gate;
+        this.seekerAssistant = seekerAssistant;
+        this.groundingCheck = groundingCheck;
         this.assistant = Objects.requireNonNull(assistant, "assistant");
         this.validator = Objects.requireNonNull(validator, "validator");
         this.repository = Objects.requireNonNull(repository, "repository");
@@ -102,11 +131,11 @@ public class ExplanationGenerator {
     /**
      * Submits the task to the AI executor. Never throws for a full executor: the returned future
      * is then already completed with {@link GenerationOutcome.Rejected}.
-     *
-     * @throws IllegalStateException for a SEEKER task until the seeker assistant is wired (Phase 6 step 3)
      */
     public CompletableFuture<GenerationOutcome> submit(GenerationTask task) {
-        requireWired(task.audience());
+        if (!wired(task.audience())) {
+            return CompletableFuture.completedFuture(notWired(task));
+        }
         try {
             return CompletableFuture.supplyAsync(() -> run(task), executor);
         } catch (RejectedExecutionException e) { // includes Spring's TaskRejectedException
@@ -117,13 +146,11 @@ public class ExplanationGenerator {
         }
     }
 
-    /**
-     * Runs the task on the calling thread. Never throws for a wired audience.
-     *
-     * @throws IllegalStateException for a SEEKER task until the seeker assistant is wired (Phase 6 step 3)
-     */
+    /** Runs the task on the calling thread. Never throws (except {@link Error}s). */
     GenerationOutcome run(GenerationTask task) {
-        requireWired(task.audience());
+        if (!wired(task.audience())) {
+            return notWired(task);
+        }
         if (gate != null && !gate.tryAcquireShared()) {
             log.info("AI explanation job={} candidate={} audience={} outcome=local_model_busy (a CV is being read)",
                     task.job().jobId(), task.match().candidateId(), task.audience().tag());
@@ -165,19 +192,59 @@ public class ExplanationGenerator {
         return outcome;
     }
 
-    /** The audience's assistant. Only RECRUITER is reachable until Phase 6 step 3 (see {@link #requireWired}). */
+    /** The audience's assistant (SEEKER is only reached when {@link #wired} is true). */
     private Result<MatchExplanation> callAssistant(GenerationTask task) {
         return switch (task.audience()) {
             case RECRUITER -> assistant.explain(task.prompt());
-            case SEEKER -> throw new IllegalStateException("SEEKER is wired in step 3");
+            case SEEKER -> seekerAssistant.explain(task.prompt());
         };
     }
 
-    /** Fails fast for an audience whose assistant is not wired yet, before any model, gate or circuit work. */
-    private static void requireWired(Audience audience) {
-        if (audience == Audience.SEEKER) {
-            throw new IllegalStateException("SEEKER is wired in step 3");
+    /** True if this generator has an assistant for the audience. */
+    private boolean wired(Audience audience) {
+        return audience != Audience.SEEKER || seekerAssistant != null;
+    }
+
+    /**
+     * Fail-closed outcome for an audience without an assistant: INVALID_OUTPUT (template
+     * GENERATION_FAILED), with no model call, no executor slot and no circuit-breaker bookkeeping.
+     */
+    private GenerationOutcome notWired(GenerationTask task) {
+        log.warn("AI explanation job={} candidate={} audience={} outcome=invalid_output (no assistant configured)",
+                task.job().jobId(), task.match().candidateId(), task.audience().tag());
+        try {
+            recordTimer(task.audience(), FailureKind.INVALID_OUTPUT.tag(), 0L);
+        } catch (RuntimeException e) {
+            log.debug("Could not record AI metrics", e);
         }
+        return new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, 0L);
+    }
+
+    /**
+     * The SEEKER free-text gate (Phase 6 §4.5). Fails closed: no check, or a check that throws,
+     * rejects. Logs never contain the output text.
+     */
+    private boolean grounded(GenerationTask task, MatchExplanation value) {
+        if (groundingCheck == null) {
+            log.warn("AI {} explanation for candidate {} / job {} rejected: no grounding check is configured",
+                    task.audience().tag(), task.match().candidateId(), task.job().jobId());
+            return false;
+        }
+        boolean accepted;
+        try {
+            accepted = groundingCheck.accept(value, task.match().evaluation(), task.job().title(),
+                    task.job().company());
+        } catch (RuntimeException e) {
+            log.warn("AI {} explanation for candidate {} / job {} rejected: the grounding check failed ({})",
+                    task.audience().tag(), task.match().candidateId(), task.job().jobId(),
+                    e.getClass().getSimpleName());
+            return false;
+        }
+        if (!accepted) {
+            log.info("AI {} explanation for candidate {} / job {} rejected by the grounding check",
+                    task.audience().tag(), task.match().candidateId(), task.job().jobId());
+        }
+        return accepted;
     }
 
     private GenerationOutcome evaluate(GenerationTask task, Result<MatchExplanation> result, long latencyMs) {
@@ -196,6 +263,9 @@ public class ExplanationGenerator {
             return new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, latencyMs);
         }
         MatchExplanation value = valid.get();
+        if (task.audience() == Audience.SEEKER && !grounded(task, value)) {
+            return new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, latencyMs);
+        }
         // PostgreSQL timestamptz keeps microseconds; truncate so this response and later reads agree
         Instant generatedAt = clock.instant().truncatedTo(ChronoUnit.MICROS);
         boolean persisted = persist(task, value, generatedAt);

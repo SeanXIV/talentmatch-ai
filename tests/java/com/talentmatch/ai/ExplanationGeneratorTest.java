@@ -260,27 +260,230 @@ class ExplanationGeneratorTest {
                 any(), any(), any(), any());
     }
 
+    // ------------------------------------------------------------------ Phase 6 step 3: SEEKER
+
+    private final SeekerExplanationAssistant seekerAssistant = mock(SeekerExplanationAssistant.class);
+    private final ExplanationGroundingCheck groundingCheck = mock(ExplanationGroundingCheck.class);
+
+    private ExplanationGenerator seekerGenerator(ExplanationGroundingCheck check, LocalModelGate gate) {
+        return new ExplanationGenerator(assistant, seekerAssistant, check, new MatchExplanationValidator(), repo,
+                circuit, model, Runnable::run, clock, meters, gate);
+    }
+
+    private ExplanationGenerator seekerGenerator() {
+        return seekerGenerator(groundingCheck, null);
+    }
+
+    /** Grounded for the ada() breakdown: second person, matched and missing skills only. */
+    private static MatchExplanation seekerExplanation() {
+        return new MatchExplanation("A strong fit for your Java and SQL",
+                "You have both required skills, Java with 5 years and SQL. You're missing Kubernetes, a nice-to-have.",
+                List.of("Java (5 years)", "SQL"), List.of("Kubernetes (nice-to-have)"));
+    }
+
+    private void seekerPersistReturns(int rows) {
+        when(repo.saveExplanation(eq(ExplanationTarget.SEEKER), any(), any(), anyDouble(), any(), any(),
+                anyString(), anyString(), anyString(), anyString(), any())).thenReturn(rows);
+    }
+
+    private double seekerTimer(String outcome) {
+        var t = meters.find("talentmatch.ai.explanations").tag("audience", "seeker").tag("outcome", outcome).timer();
+        return t == null ? 0 : t.count();
+    }
+
     @Test
-    void seekerFailsFastBeforeTouchingModelGateCircuitExecutorOrMetrics() {
+    void seekerUsesTheSeekerAssistantAndPersistsToTheSeekerColumns() throws Exception {
+        seekerPersistReturns(1);
+        when(groundingCheck.accept(any(), any(), any(), any())).thenReturn(true);
+        when(seekerAssistant.explain(task.prompt())).thenReturn(result(seekerExplanation(), FinishReason.STOP));
+
+        GenerationOutcome o = seekerGenerator().submit(seekerTask()).get(5, TimeUnit.SECONDS);
+
+        assertThat(o).isInstanceOf(GenerationOutcome.Success.class);
+        GenerationOutcome.Success s = (GenerationOutcome.Success) o;
+        assertThat(s.persisted()).isTrue();
+        assertThat(s.value()).isEqualTo(seekerExplanation());
+        verifyNoInteractions(assistant);
+        verify(groundingCheck).accept(seekerExplanation(), row.evaluation(), job.title(), job.company());
+        verify(repo).saveExplanation(eq(ExplanationTarget.SEEKER), eq(job.jobId()), eq(row.candidateId()),
+                eq(row.storedScore()), eq(row.candidateUpdatedAt()), eq(job.updatedAt()),
+                eq(seekerExplanation().explanation()),
+                org.mockito.ArgumentMatchers.argThat(json -> json.contains("\"headline\":\"A strong fit for your Java and SQL\"")),
+                eq("a".repeat(64)), eq("ollama/qwen2.5:7b-instruct"), eq(AiFixtures.T0));
+        verify(repo, never()).saveExplanation(eq(ExplanationTarget.RECRUITER), any(), any(), anyDouble(), any(),
+                any(), any(), any(), any(), any(), any());
+        assertThat(seekerTimer("success")).isEqualTo(1);
+        assertThat(circuit.lastSuccessAt()).isEqualTo(AiFixtures.T0);
+    }
+
+    @Test
+    void recruiterNeverUsesTheSeekerAssistantOrTheGroundingCheck() {
+        persistReturns(1);
+        org.mockito.Mockito.doReturn(result(validExplanation(), FinishReason.STOP)).when(assistant).explain(any());
+        GenerationOutcome o = seekerGenerator().run(task);
+        assertThat(((GenerationOutcome.Success) o).persisted()).isTrue();
+        verifyNoInteractions(seekerAssistant, groundingCheck);
+        verify(repo).saveExplanation(eq(ExplanationTarget.RECRUITER), any(), any(), anyDouble(), any(), any(),
+                any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void groundingRejectionIsInvalidOutputWithACircuitSuccessAndNothingStored(CapturedOutput out) {
+        circuit.recordFailure(FailureKind.TIMEOUT);
+        when(groundingCheck.accept(any(), any(), any(), any())).thenReturn(false);
+        when(seekerAssistant.explain(any())).thenReturn(result(seekerExplanation(), FinishReason.STOP));
+
+        GenerationOutcome o = seekerGenerator().run(seekerTask());
+
+        assertThat(o).isInstanceOf(GenerationOutcome.Failure.class);
+        assertThat(((GenerationOutcome.Failure) o).kind()).isEqualTo(FailureKind.INVALID_OUTPUT);
+        verifyNoInteractions(repo);
+        assertThat(circuit.consecutiveFailures()).as("not a provider fault").isZero();
+        assertThat(circuit.lastSuccessAt()).isEqualTo(AiFixtures.T0);
+        assertThat(seekerTimer("invalid_output")).isEqualTo(1);
+        assertThat(out.getAll()).contains("AI seeker explanation for candidate " + row.candidateId())
+                .contains("rejected by the grounding check")
+                .contains("audience=seeker").contains("outcome=invalid_output")
+                .doesNotContain(seekerExplanation().explanation()).doesNotContain(seekerExplanation().headline())
+                .doesNotContain("Zelda").doesNotContain("Secret").doesNotContain("PROMPT ");
+    }
+
+    @Test
+    void groundingCheckThatThrowsRejects(CapturedOutput out) {
+        when(groundingCheck.accept(any(), any(), any(), any())).thenThrow(new IllegalStateException("boom secret"));
+        when(seekerAssistant.explain(any())).thenReturn(result(seekerExplanation(), FinishReason.STOP));
+        GenerationOutcome o = seekerGenerator().run(seekerTask());
+        assertThat(((GenerationOutcome.Failure) o).kind()).isEqualTo(FailureKind.INVALID_OUTPUT);
+        verifyNoInteractions(repo);
+        assertThat(circuit.consecutiveFailures()).isZero();
+        assertThat(out.getAll()).contains("the grounding check failed (IllegalStateException)")
+                .doesNotContain("boom secret").doesNotContain(seekerExplanation().explanation());
+    }
+
+    @Test
+    void noGroundingCheckRejectsEverySeekerOutput(CapturedOutput out) {
+        when(seekerAssistant.explain(any())).thenReturn(result(seekerExplanation(), FinishReason.STOP));
+        GenerationOutcome o = seekerGenerator(null, null).run(seekerTask());
+        assertThat(((GenerationOutcome.Failure) o).kind()).isEqualTo(FailureKind.INVALID_OUTPUT);
+        verifyNoInteractions(repo);
+        verify(seekerAssistant).explain(task.prompt());
+        assertThat(circuit.lastSuccessAt()).as("the provider answered").isEqualTo(AiFixtures.T0);
+        assertThat(out.getAll()).contains("no grounding check is configured");
+
+        // recruiter output does not need a check
+        persistReturns(1);
+        org.mockito.Mockito.doReturn(result(validExplanation(), FinishReason.STOP)).when(assistant).explain(any());
+        assertThat(seekerGenerator(null, null).run(task)).isInstanceOf(GenerationOutcome.Success.class);
+    }
+
+    @Test
+    void validatorRunsBeforeTheGroundingCheck() {
+        when(seekerAssistant.explain(any())).thenReturn(result(new MatchExplanation("H",
+                "You have Java and SQL. See https://evil.example for more.", null, null), FinishReason.STOP));
+        assertThat(((GenerationOutcome.Failure) seekerGenerator().run(seekerTask())).kind())
+                .isEqualTo(FailureKind.INVALID_OUTPUT);
+        verifyNoInteractions(groundingCheck, repo);
+
+        // the check sees the normalized value
+        when(groundingCheck.accept(any(), any(), any(), any())).thenReturn(true);
+        seekerPersistReturns(1);
+        when(seekerAssistant.explain(any())).thenReturn(result(new MatchExplanation("  A strong\n fit ",
+                "You have Java and SQL,   the required skills.", List.of("- Java", "Python"), null), FinishReason.STOP));
+        assertThat(seekerGenerator().run(seekerTask())).isInstanceOf(GenerationOutcome.Success.class);
+        verify(groundingCheck).accept(new MatchExplanation("A strong fit", "You have Java and SQL, the required skills.",
+                List.of("Java"), List.of()), row.evaluation(), job.title(), job.company());
+    }
+
+    @Test
+    void seekerFinishReasonAndProviderFailuresBehaveLikeRecruiter() {
+        org.mockito.Mockito.doReturn(result(seekerExplanation(), FinishReason.CONTENT_FILTER)).when(seekerAssistant)
+                .explain(any());
+        assertThat(((GenerationOutcome.Failure) seekerGenerator().run(seekerTask())).kind())
+                .isEqualTo(FailureKind.REFUSED);
+        org.mockito.Mockito.doReturn(result(seekerExplanation(), FinishReason.LENGTH)).when(seekerAssistant)
+                .explain(any());
+        assertThat(((GenerationOutcome.Failure) seekerGenerator().run(seekerTask())).kind())
+                .isEqualTo(FailureKind.INVALID_OUTPUT);
+        verifyNoInteractions(groundingCheck, repo);
+        assertThat(circuit.consecutiveFailures()).isZero();
+
+        org.mockito.Mockito.doThrow(new RuntimeException(new HttpTimeoutException("slow"))).when(seekerAssistant)
+                .explain(any());
+        assertThat(((GenerationOutcome.Failure) seekerGenerator().run(seekerTask())).kind())
+                .isEqualTo(FailureKind.TIMEOUT);
+        assertThat(circuit.consecutiveFailures()).as("seeker provider faults feed the shared circuit").isEqualTo(1);
+        assertThat(seekerTimer("timeout")).isEqualTo(1);
+        assertThat(seekerTimer("refused")).isEqualTo(1);
+    }
+
+    @Test
+    void seekerTasksShareTheLocalModelGate() {
+        LocalModelGate gate = mock(LocalModelGate.class);
+        when(gate.tryAcquireShared()).thenReturn(false);
+        assertThat(seekerGenerator(groundingCheck, gate).run(seekerTask())).isInstanceOf(GenerationOutcome.Rejected.class);
+        verifyNoInteractions(seekerAssistant, groundingCheck, repo);
+        assertThat(seekerTimer("rejected")).isEqualTo(1);
+
+        LocalModelGate open = mock(LocalModelGate.class);
+        when(open.tryAcquireShared()).thenReturn(true);
+        when(groundingCheck.accept(any(), any(), any(), any())).thenReturn(true);
+        seekerPersistReturns(1);
+        when(seekerAssistant.explain(any())).thenReturn(result(seekerExplanation(), FinishReason.STOP));
+        assertThat(seekerGenerator(groundingCheck, open).run(seekerTask())).isInstanceOf(GenerationOutcome.Success.class);
+        verify(open).releaseShared();
+    }
+
+    @Test
+    void seekerWithoutASeekerAssistantFailsClosedWithoutModelGateCircuitOrExecutor() {
         LocalModelGate gate = mock(LocalModelGate.class);
         java.util.concurrent.atomic.AtomicInteger executed = new java.util.concurrent.atomic.AtomicInteger();
         Executor counting = r -> {
             executed.incrementAndGet();
             r.run();
         };
-        ExplanationGenerator g = new ExplanationGenerator(assistant, new MatchExplanationValidator(), repo, circuit,
-                model, counting, clock, meters, gate);
-
-        org.assertj.core.api.Assertions.assertThatIllegalStateException()
-                .isThrownBy(() -> g.submit(seekerTask())).withMessage("SEEKER is wired in step 3");
-        org.assertj.core.api.Assertions.assertThatIllegalStateException()
-                .isThrownBy(() -> g.run(seekerTask())).withMessage("SEEKER is wired in step 3");
-
+        // the Phase 3 (9-arg) constructor and the 11-arg one with a null seeker assistant
+        List<ExplanationGenerator> generators = List.of(
+                new ExplanationGenerator(assistant, new MatchExplanationValidator(), repo, circuit, model, counting,
+                        clock, meters, gate),
+                new ExplanationGenerator(assistant, null, groundingCheck, new MatchExplanationValidator(), repo,
+                        circuit, model, counting, clock, meters, gate));
+        for (ExplanationGenerator g : generators) {
+            var f = g.submit(seekerTask());
+            assertThat(f).isDone();
+            assertThat(f.join()).isEqualTo(new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, 0L));
+            assertThat(g.run(seekerTask())).isEqualTo(new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, 0L));
+        }
         assertThat(executed.get()).as("nothing submitted to the executor").isZero();
-        verifyNoInteractions(assistant, repo, gate);
+        verifyNoInteractions(assistant, repo, gate, groundingCheck);
         assertThat(circuit.consecutiveFailures()).isZero();
         assertThat(circuit.lastSuccessAt()).as("no circuit bookkeeping").isNull();
-        assertThat(meters.find("talentmatch.ai.explanations").timers()).isEmpty();
+        assertThat(seekerTimer("invalid_output")).isEqualTo(4);
+        assertThat(meters.find("talentmatch.ai.explanations").tag("audience", "recruiter").timers()).isEmpty();
+    }
+
+    @Test
+    void seekerInfoLogLineCarriesTheSeekerAudienceAndNoText(CapturedOutput out) {
+        seekerPersistReturns(1);
+        when(groundingCheck.accept(any(), any(), any(), any())).thenReturn(true);
+        when(seekerAssistant.explain(any())).thenReturn(result(seekerExplanation(), FinishReason.STOP));
+        seekerGenerator().run(seekerTask());
+        String line = out.getAll().lines().filter(l -> l.contains("AI explanation job=")).findFirst().orElseThrow();
+        assertThat(line).contains("INFO").contains("candidate=" + row.candidateId() + " audience=seeker provider=ollama")
+                .contains("outcome=success").contains("inputTokens=123");
+        assertThat(out.getAll()).doesNotContain(seekerExplanation().explanation())
+                .doesNotContain(seekerExplanation().headline()).doesNotContain("Zelda")
+                .doesNotContain("Secret candidate summary").doesNotContain("PROMPT ");
+    }
+
+    @Test
+    void seekerGuardMissIsLoggedWithTheAudience(CapturedOutput out) {
+        seekerPersistReturns(0);
+        when(groundingCheck.accept(any(), any(), any(), any())).thenReturn(true);
+        when(seekerAssistant.explain(any())).thenReturn(result(seekerExplanation(), FinishReason.STOP));
+        GenerationOutcome o = seekerGenerator().run(seekerTask());
+        assertThat(((GenerationOutcome.Success) o).persisted()).isFalse();
+        assertThat(out.getAll()).contains("AI seeker explanation for candidate " + row.candidateId() + " / job "
+                + job.jobId() + " not stored").doesNotContain(seekerExplanation().explanation());
     }
 
     @Test

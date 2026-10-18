@@ -7,7 +7,6 @@ import static com.talentmatch.ai.AiFixtures.job;
 import static com.talentmatch.ai.AiFixtures.match;
 import static com.talentmatch.ai.AiFixtures.miss;
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
 import static org.assertj.core.api.Assertions.assertThatNullPointerException;
 
 import com.talentmatch.domain.scoring.MatchEvaluation;
@@ -102,11 +101,68 @@ class ExplanationInputHasherTest {
         }
     }
 
+    // ------------------------------------------------------------------ Phase 6 step 3: SEEKER
+
+    /** Computed independently (Python) from the spec §4.4 prompt text and the §4.4 message layout. */
+    private static final String SEEKER_GOLDEN_HELLO = "9c5f75deba4330ebce24e16e886b90f6bc9ecea3f22f2e5c34a9c78cdca00f08";
+    private static final String SEEKER_GOLDEN_FIXTURE = "7d2802b851b5b6e83ac14fc920deba0df9d08032c77a84b544c0f8860bf4226a";
+
+    private static String seekerFixturePrompt() {
+        return new ExplanationPromptBuilder(2000).buildSeeker(job("Build APIs."), match(1, "Ada Lovelace"));
+    }
+
     @Test
-    void seekerFailsFastUntilStep3AndNullsAreRejected() {
-        assertThatIllegalStateException().isThrownBy(() -> ExplanationInputHasher.hash(Audience.SEEKER, "hello"))
-                .withMessage("SEEKER is wired in step 3");
+    void seekerHashIsSha256OfTheSeekerSystemPromptSeparatorAndMessage() throws Exception {
+        for (String msg : List.of("hello", "", seekerFixturePrompt())) {
+            byte[] expected = MessageDigest.getInstance("SHA-256").digest(
+                    (SeekerExplanationPrompts.SYSTEM + "\n\u001e\n" + msg).getBytes(StandardCharsets.UTF_8));
+            assertThat(ExplanationInputHasher.hash(Audience.SEEKER, msg)).matches("^[0-9a-f]{64}$")
+                    .isEqualTo(HexFormat.of().formatHex(expected))
+                    .isEqualTo(ExplanationInputHasher.hash(SeekerExplanationPrompts.SYSTEM, msg));
+        }
+    }
+
+    @Test
+    void seekerHashMatchesTheStep3GoldenValue() {
+        // A change here invalidates every stored seeker explanation (by design only when the prompt changes).
+        assertThat(ExplanationInputHasher.hash(Audience.SEEKER, "hello")).isEqualTo(SEEKER_GOLDEN_HELLO);
+        assertThat(ExplanationInputHasher.hash(Audience.SEEKER, seekerFixturePrompt()))
+                .isEqualTo(SEEKER_GOLDEN_FIXTURE);
+    }
+
+    @Test
+    void seekerDiffersFromRecruiterForTheSameUserMessage() {
+        for (String msg : List.of("", "hello", fixturePrompt(), seekerFixturePrompt())) {
+            assertThat(ExplanationInputHasher.hash(Audience.SEEKER, msg)).as(msg)
+                    .isNotEqualTo(ExplanationInputHasher.hash(Audience.RECRUITER, msg));
+        }
+        // the recruiter golden values are untouched by the seeker branch
+        assertThat(ExplanationInputHasher.hash(Audience.RECRUITER, "hello")).isEqualTo(GOLDEN_HELLO);
+        assertThat(ExplanationInputHasher.hash(Audience.RECRUITER, fixturePrompt())).isEqualTo(GOLDEN_FIXTURE);
+    }
+
+    @Test
+    void seekerHashChangesWithWhatTheModelSeesButNotWithTheName() {
+        ExplanationPromptBuilder b = new ExplanationPromptBuilder(2000);
+        String base = ExplanationInputHasher.hash(Audience.SEEKER, b.buildSeeker(job("Build APIs."),
+                match(1, "Ada Lovelace", "Engineer.", ada(), null)));
+        MatchContext m = match(1, "Ada Lovelace", "Engineer.", ada(), null);
+        MatchContext renamed = new MatchContext(1, m.candidateId(), "Someone Else", m.candidateSummary(),
+                m.candidateUpdatedAt(), m.storedScore(), m.scorePercent(), m.evaluation(), null);
+        assertThat(ExplanationInputHasher.hash(Audience.SEEKER, b.buildSeeker(job("Build APIs."), renamed)))
+                .as("the name is never sent to the seeker model").isEqualTo(base);
+        assertThat(ExplanationInputHasher.hash(Audience.SEEKER, b.buildSeeker(job("Build APIs."),
+                match(1, "Ada Lovelace", "Engineer!", ada(), null)))).as("summary").isNotEqualTo(base);
+        MatchContext otherPercent = new MatchContext(1, m.candidateId(), m.candidateName(), m.candidateSummary(),
+                m.candidateUpdatedAt(), m.storedScore(), 84, m.evaluation(), null);
+        assertThat(ExplanationInputHasher.hash(Audience.SEEKER, b.buildSeeker(job("Build APIs."), otherPercent)))
+                .as("score").isNotEqualTo(base);
+    }
+
+    @Test
+    void nullsAreRejected() {
         assertThatNullPointerException().isThrownBy(() -> ExplanationInputHasher.hash((Audience) null, "hello"));
         assertThatNullPointerException().isThrownBy(() -> ExplanationInputHasher.hash(Audience.RECRUITER, null));
+        assertThatNullPointerException().isThrownBy(() -> ExplanationInputHasher.hash(Audience.SEEKER, null));
     }
 }

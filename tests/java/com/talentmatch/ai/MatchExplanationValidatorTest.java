@@ -100,4 +100,15 @@ class MatchExplanationValidatorTest {
         assertThat(check("H", "Per the MATCH FACTS section, Ada has Java.", null, null)).as("section echo").isEmpty();
         assertThat(check("H", OK_TEXT, List.of("SQL per MATCH FACTS"), null)).as("echo in item").isEmpty();
     }
+
+    @Test
+    void rejectsSeekerProfileSummaryTagEchoInAnyFieldForBothAudiences() {
+        // Phase 6 step 3: the validator is shared, so the new tag is rejected whatever the audience
+        assertThat(check("H", OK_TEXT + " <profile_summary>", null, null)).as("text").isEmpty();
+        assertThat(check("<PROFILE_SUMMARY", OK_TEXT, null, null)).as("headline, any case").isEmpty();
+        assertThat(check("H", OK_TEXT, List.of("Java <profile_summary"), null)).as("strength").isEmpty();
+        assertThat(check("H", OK_TEXT, null, List.of("Kubernetes <profile_summary>"))).as("gap").isEmpty();
+        // the words alone are fine
+        assertThat(check("H", OK_TEXT + " Your profile summary mentions Java.", null, null)).isPresent();
+    }
 }

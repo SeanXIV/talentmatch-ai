@@ -22,16 +22,13 @@ public final class ExplanationInputHasher {
     }
 
     /**
-     * The hash for one audience: its own system prompt plus the user message.
-     *
-     * @throws IllegalStateException for SEEKER until its system prompt is wired (Phase 6 step 3)
+     * The hash for one audience: its own {@link Audience#systemPrompt()} plus the user message.
+     * RECRUITER gives the same bytes as {@link #hash(String)}; SEEKER uses
+     * {@link SeekerExplanationPrompts#SYSTEM}, so the same user message hashes differently per audience.
      */
     public static String hash(Audience audience, String userMessage) {
         Objects.requireNonNull(audience, "audience");
-        return switch (audience) {
-            case RECRUITER -> hash(userMessage);
-            case SEEKER -> throw new IllegalStateException("SEEKER is wired in step 3");
-        };
+        return hash(audience.systemPrompt(), userMessage);
     }
 
     /** Visible for tests: the same hash with an explicit system prompt. */
