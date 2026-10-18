@@ -9,6 +9,7 @@ import com.talentmatch.feed.skills.SkillDictionary;
 import com.talentmatch.feed.skills.SkillMention;
 import java.math.BigDecimal;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -37,9 +38,10 @@ import org.springframework.stereotype.Component;
  *       "Spring Boot" on a Spring job is still rejected.</li>
  *   <li><b>Numbers:</b> a number ({@code \d+(?:[.,]\d+)?}) in the headline or explanation is not one of:
  *       the score percent, earned/max points, a matched skill's years, the matched/total required and
- *       nice-to-have counts, or a number in the job title, company, a job skill name or the engine's
- *       summary line (all of which are in MATCH FACTS). Digits inside a mention of one of the job's own
- *       skills or aliases ("k8s", "HTML5") are not numbers. Spelled-out numbers are not checked.</li>
+ *       nice-to-have counts, or a number in the job title, company or the engine's summary line (all of
+ *       which are in MATCH FACTS). Digits inside a mention of one of the job's own skills or aliases
+ *       ("k8s", "HTML5") are not numbers, but a stand-alone "5" on an HTML5 job is not allowed.
+ *       Spelled-out numbers are not checked.</li>
  *   <li><b>Polarity</b> (best effort): a sentence says "you have/bring/know", names a missing skill,
  *       names no matched skill, and has no negation ("no", "not", "without", "lack", "missing", "yet",
  *       "n't", ...).</li>
@@ -289,8 +291,10 @@ public class SeekerGroundingCheck implements ExplanationGroundingCheck {
         List<String> sources = new ArrayList<>();
         sources.add(jobTitle);
         sources.add(company);
-        sources.add(eval.summary());
-        allHits(eval).forEach(h -> sources.add(h.name()));
+        // Job skill names are deliberately not a source: digits inside a skill mention ("HTML5") are
+        // exempted by span in numbersGrounded, so a stand-alone "5" on an HTML5 job is not allowed. The
+        // summary lists missing skills by name ("missing: HTML5"), so those names are masked out of it.
+        sources.add(withoutSkillNames(eval.summary(), eval));
         for (String source : sources) {
             if (source == null) {
                 continue;
@@ -301,6 +305,21 @@ public class SeekerGroundingCheck implements ExplanationGroundingCheck {
             }
         }
         return allowed;
+    }
+
+    /** {@code text} with every bounded mention of one of the breakdown's skill names blanked out. */
+    private static String withoutSkillNames(String text, MatchEvaluation eval) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+        char[] chars = text.toCharArray();
+        allHits(eval).map(SkillHit::name).filter(n -> n != null && !n.isBlank()).map(String::strip)
+                .forEach(name -> {
+                    for (int[] span : spans(text, name)) {
+                        Arrays.fill(chars, span[0], span[1], ' ');
+                    }
+                });
+        return new String(chars);
     }
 
     /**

@@ -90,7 +90,8 @@ public class GlobalExceptionHandler {
     static final String SERVICE_BUSY_MESSAGE =
             "The server is busy with a conflicting update. Please try again in a few seconds.";
     static final int SERVICE_BUSY_RETRY_AFTER_SECONDS = 2;
-    private static final Pattern MATCHES_PATH = Pattern.compile("^/api/(jobs/[^/]+/matches|matches)(/.*)?$");
+    private static final Pattern MATCHES_PATH = Pattern.compile(
+            "^/api/(jobs/[^/]+/matches|candidates/[^/]+/matches|profile/matches|matches)(/.*)?$");
     private static final String EXAMPLE_ID = "3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6";
     private static final Pattern CONSTRAINT_IN_MESSAGE = Pattern.compile("constraint \"([^\"]+)\"");
     private static final int MAX_ECHO = 64;
@@ -367,7 +368,10 @@ public class GlobalExceptionHandler {
                 List.of(), req, headers);
     }
 
-    /** {@code /api/jobs/{id}/matches} and {@code /api/matches/**}. */
+    /**
+     * {@code /api/jobs/{id}/matches}, {@code /api/candidates/{id}/matches}, {@code /api/profile/matches}
+     * and {@code /api/matches/**}.
+     */
     static boolean isMatchesEndpoint(HttpServletRequest req) {
         String uri = req.getRequestURI();
         return uri != null && MATCHES_PATH.matcher(uri).matches();

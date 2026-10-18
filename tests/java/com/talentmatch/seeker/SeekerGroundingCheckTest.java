@@ -169,11 +169,16 @@ class SeekerGroundingCheckTest {
         assertThat(SeekerGroundingCheck.numbersGrounded(v, web, "Frontend Engineer", "Acme", null)).isTrue();
         assertThat(SeekerGroundingCheck.numbersGrounded(v, web, "Frontend Engineer", "Acme", snapshot())).isTrue();
         assertThat(check.accept(v, web, "Frontend Engineer", "Acme")).isTrue();
-        // ...but a bare 5 is still checked against the facts on its own (here 5 is Java's years: allowed)
+        // ...but a bare 5 is checked against the facts on its own (step 4, §12.4: skill-name digits are
+        // no longer allowed numbers)
         MatchEvaluation noFive = eval(List.of(has("HTML5", 2)), List.of(), List.of(), List.of());
         assertThat(SeekerGroundingCheck.numbersGrounded(out("Strong fit", "You have HTML5 and 5 more skills."),
-                noFive, "Frontend Engineer", "Acme", snapshot())).as("allowed via the skill name (spec deviation)")
-                .isTrue();
+                noFive, "Frontend Engineer", "Acme", snapshot())).as("stand-alone 5 on an HTML5 job").isFalse();
+        assertThat(SeekerGroundingCheck.numbersGrounded(out("Strong fit", "You have HTML5 and 5 more skills."),
+                noFive, "Frontend Engineer", "Acme", null)).as("same without a snapshot").isFalse();
+        assertThat(check.accept(out("Strong fit", "You have HTML5 and 5 more skills."), noFive, "Frontend Engineer",
+                "Acme")).isFalse();
+        assertThat(SeekerGroundingCheck.allowedNumbers(noFive, "Frontend Engineer", "Acme")).doesNotContain("5");
         assertThat(SeekerGroundingCheck.numbersGrounded(out("Strong fit", "You have HTML5 and 7 more skills."),
                 noFive, "Frontend Engineer", "Acme", null)).isFalse();
     }
@@ -303,10 +308,11 @@ class SeekerGroundingCheckTest {
         assertThat(SeekerGroundingCheck.canonical("83.30")).isEqualTo("83.3");
         assertThat(SeekerGroundingCheck.allowedNumbers(javaSql(), "Backend Engineer", "Acme"))
                 .containsExactlyInAnyOrder("83", "25", "30", "2", "1", "5");
-        // the score percent comes from eval.score(); the engine summary and skill names contribute digits
+        // the score percent comes from eval.score(); the engine summary contributes digits, skill names
+        // no longer do (step 4, §12.4)
         MatchEvaluation e = eval(List.of(has("Python 3", 7)), List.of(), List.of(miss("Java")), List.of());
         assertThat(SeekerGroundingCheck.allowedNumbers(e, "Engineer", null)).contains("50", "10", "20", "1", "2", "0",
-                "7", "3");
+                "7").doesNotContain("3");
     }
 
     // ------------------------------------------------------------------ polarity
@@ -421,5 +427,83 @@ class SeekerGroundingCheckTest {
         } finally {
             pool.shutdownNow();
         }
+    }
+
+    // ------------------------------------------------------------------ step 4 (§12.4): skill-name digits
+
+    /** The real engine (its summary names missing required skills: "missing: HTML5"). */
+    private static MatchEvaluation engine(List<com.talentmatch.domain.scoring.JobRequirement> reqs,
+                                          List<com.talentmatch.domain.scoring.CandidateSkillFact> facts) {
+        return new com.talentmatch.domain.scoring.ScoringEngine(new com.talentmatch.domain.scoring.ScoringWeights(10, 5))
+                .evaluate(reqs, facts);
+    }
+
+    private static com.talentmatch.domain.scoring.JobRequirement req(String name, boolean required) {
+        return new com.talentmatch.domain.scoring.JobRequirement(id(name), name, required);
+    }
+
+    /** Java (3 years) matched; HTML5 required and missing; Docker nice and missing: 10 of 25 = 40%. */
+    private static MatchEvaluation html5Missing() {
+        return engine(List.of(req("Java", true), req("HTML5", true), req("Docker", false)),
+                List.of(new com.talentmatch.domain.scoring.CandidateSkillFact(id("Java"), 3)));
+    }
+
+    @Test
+    void theEngineSummaryNamesTheMissingSkillButItsDigitsAreMaskedOut() {
+        MatchEvaluation e = html5Missing();
+        assertThat(e.summary()).contains("HTML5");
+        assertThat(SeekerGroundingCheck.allowedNumbers(e, "Frontend Engineer", "Acme"))
+                .contains("40", "10", "25", "3", "1", "2", "0").doesNotContain("5");
+    }
+
+    @Test
+    void aStandAloneFiveIsRejectedWhenHtml5IsAMissingRequiredSkill() {
+        MatchEvaluation e = html5Missing();
+        assertThat(check.accept(out("A partial fit", "You have 3 years of Java. You're missing HTML5, which is "
+                + "required, and Docker, a nice-to-have."), e, "Frontend Engineer", "Acme"))
+                .as("HTML5 named as a gap").isTrue();
+        assertThat(check.accept(out("A partial fit", "You have 3 years of Java but are missing HTML5 and 5 other "
+                + "skills."), e, "Frontend Engineer", "Acme")).as("invented 5").isFalse();
+        assertThat(check.accept(out("A 5-star fit", "You have Java but are missing HTML5."), e, "Frontend Engineer",
+                "Acme")).as("5 in the headline").isFalse();
+        assertThat(SeekerGroundingCheck.numbersGrounded(out("Fit", "You lack HTML5 and 5 more."), e,
+                "Frontend Engineer", "Acme", null)).as("null snapshot").isFalse();
+        assertThat(SeekerGroundingCheck.numbersGrounded(out("Fit", "You lack HTML5 and 2 more."), e,
+                "Frontend Engineer", "Acme", null)).as("2 is a count (of 2 required)").isTrue();
+    }
+
+    @Test
+    void html5IsAcceptedWithAndWithoutTheSnapshotAndItsAlias() {
+        MatchEvaluation e = html5Missing();
+        MatchExplanation v = out("You lack HTML5", "You have 3 years of Java. HTML5 is the one required skill "
+                + "you're missing.");
+        assertThat(SeekerGroundingCheck.numbersGrounded(v, e, "Frontend Engineer", "Acme", null)).isTrue();
+        assertThat(SeekerGroundingCheck.numbersGrounded(v, e, "Frontend Engineer", "Acme", snapshot())).isTrue();
+        assertThat(check.accept(v, e, "Frontend Engineer", "Acme")).isTrue();
+        MatchExplanation alias = out("You lack html 5", "You have 3 years of Java; html 5 is missing.");
+        assertThat(SeekerGroundingCheck.numbersGrounded(alias, e, "Frontend Engineer", "Acme", snapshot()))
+                .as("alias with a space").isTrue();
+        assertThat(SeekerGroundingCheck.numbersGrounded(alias, e, "Frontend Engineer", "Acme", null))
+                .as("without the snapshot the alias is not known").isFalse();
+    }
+
+    @Test
+    void web3TitleDigitsStillCountButSkillNameDigitsDoNot() {
+        MatchEvaluation e = html5Missing();
+        MatchExplanation v = out("A Web3 role", "You have 3 years of Java for this Web3 team; HTML5 is missing.");
+        assertThat(check.accept(v, e, "Web3 Frontend Engineer", "Acme")).isTrue();
+        assertThat(SeekerGroundingCheck.allowedNumbers(e, "Web3 Frontend Engineer", "Acme")).contains("3")
+                .doesNotContain("5");
+        assertThat(SeekerGroundingCheck.allowedNumbers(e, "HTML5 Engineer", "Acme"))
+                .as("a digit in the title is still allowed").contains("5");
+    }
+
+    @Test
+    void maskingDoesNotDropCountsNextToSkillNames() {
+        // matched names do not appear in the summary; missing ones do, next to the counts
+        MatchEvaluation e = engine(List.of(req("Java", true), req("SQL", true), req("Kubernetes", true),
+                        req("Go", true)), List.of(new com.talentmatch.domain.scoring.CandidateSkillFact(id("Java"), null)));
+        assertThat(e.summary()).contains("missing:", "Go", "Kubernetes", "SQL", "1 of 4");
+        assertThat(SeekerGroundingCheck.allowedNumbers(e, "Engineer", "Acme")).contains("1", "4", "25", "10", "40");
     }
 }

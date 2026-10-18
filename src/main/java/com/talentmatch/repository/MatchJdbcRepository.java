@@ -430,19 +430,37 @@ public class MatchJdbcRepository {
         }
     }
 
+    /**
+     * Serializes candidate edits with candidate-side scoring for one candidate until the current
+     * transaction ends (advisory key {@code candidate_match:{id}}). Must run inside a transaction.
+     * Waits at most {@value #LOCK_TIMEOUT}. Lock order everywhere: the candidate lock first, then job
+     * locks in ascending uuid order.
+     *
+     * @throws CannotAcquireLockException if the lock could not be acquired in time
+     * @throws PessimisticLockingFailureException on a deadlock (backstop; should not happen)
+     */
+    public void lockCandidate(UUID candidateId) {
+        setLockTimeout();
+        acquireAdvisoryLock("candidate_match:" + candidateId, "candidate " + candidateId);
+    }
+
     private void setLockTimeout() {
         jdbc.getJdbcOperations().execute(SQL_SET_LOCK_TIMEOUT);
     }
 
     private void acquireJobLock(UUID jobId) {
+        acquireAdvisoryLock("job_match:" + jobId, "job " + jobId);
+    }
+
+    private void acquireAdvisoryLock(String lockKey, String what) {
         try {
-            jdbc.query(SQL_ADVISORY_LOCK, new MapSqlParameterSource("lockKey", "job_match:" + jobId),
+            jdbc.query(SQL_ADVISORY_LOCK, new MapSqlParameterSource("lockKey", lockKey),
                     (ResultSetExtractor<Void>) rs -> null);
         } catch (PessimisticLockingFailureException e) {
             throw e;
         } catch (DataAccessException e) {
             if ("55P03".equals(sqlState(e))) {
-                throw new CannotAcquireLockException("Timed out waiting for the match lock of job " + jobId, e);
+                throw new CannotAcquireLockException("Timed out waiting for the match lock of " + what, e);
             }
             throw e;
         }

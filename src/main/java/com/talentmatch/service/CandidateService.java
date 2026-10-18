@@ -4,6 +4,7 @@ import com.talentmatch.domain.entity.Candidate;
 import com.talentmatch.domain.entity.CandidateSkill;
 import com.talentmatch.domain.entity.Skill;
 import com.talentmatch.repository.CandidateRepository;
+import com.talentmatch.repository.MatchJdbcRepository;
 import com.talentmatch.repository.projection.CandidateListRow;
 import com.talentmatch.service.exception.ConflictException;
 import com.talentmatch.service.exception.NotFoundException;
@@ -44,10 +45,13 @@ public class CandidateService {
 
     private final CandidateRepository candidateRepository;
     private final SkillResolver skillResolver;
+    private final MatchJdbcRepository matchRepository;
 
-    public CandidateService(CandidateRepository candidateRepository, SkillResolver skillResolver) {
+    public CandidateService(CandidateRepository candidateRepository, SkillResolver skillResolver,
+                            MatchJdbcRepository matchRepository) {
         this.candidateRepository = candidateRepository;
         this.skillResolver = skillResolver;
+        this.matchRepository = matchRepository;
     }
 
     @Transactional(readOnly = true)
@@ -89,9 +93,11 @@ public class CandidateService {
     /**
      * Updates a candidate through the candidates API. The owner's own candidate is refused (409):
      * it mirrors the confirmed profile and is changed only through {@code PUT /api/profile}.
+     * Takes the candidate's match lock first (see {@link #updateProfileCandidate}).
      */
     @Transactional
     public CandidateDetailResponse update(UUID id, CandidateRequest request) {
+        matchRepository.lockCandidate(id);
         if (candidateRepository.isOwnerProfileCandidate(id)) {
             throw new ConflictException(ErrorCode.DATA_CONFLICT,
                     "This candidate is your profile; edit it with PUT /api/profile.");
@@ -99,9 +105,15 @@ public class CandidateService {
         return updateProfileCandidate(id, request);
     }
 
-    /** Update without the owner guard; only for the profile service, which keeps both in sync. */
+    /**
+     * Update without the owner guard; only for the profile service, which keeps both in sync.
+     * Takes the candidate's match lock ({@code candidate_match:{id}}) first, so the edit serializes
+     * with candidate-side scoring; re-entrant when {@link #update} already holds it. A lock timeout
+     * propagates as {@link org.springframework.dao.PessimisticLockingFailureException}.
+     */
     @Transactional
     public CandidateDetailResponse updateProfileCandidate(UUID id, CandidateRequest request) {
+        matchRepository.lockCandidate(id);
         Candidate candidate = candidateRepository.findWithSkillsById(id)
                 .orElseThrow(() -> NotFoundException.candidate(id));
         Validated v = validate(request);

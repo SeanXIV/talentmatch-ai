@@ -697,3 +697,8 @@ Until the owner answers §0, build with the recommended defaults. Only the parts
    - `GlobalExceptionHandler.MATCHES_PATH` must also match `candidates/[^/]+/matches` and `profile/matches`, so lock failures there return `MATCHES_BUSY`.
    - PRODUCTION_READINESS §5: log the manual-job path as fixed; log the job-side GET not serializing with candidate edits as a known gap.
    - Tests: an IT that holds `job_match:{id}` and expects `PUT /api/jobs/{id}` → 503 `SERVICE_BUSY`; the same pattern for a candidate update holding `candidate_match:{id}`; matches endpoints → `MATCHES_BUSY`.
+4. **Findings from step 4 (for the step 6 docs):**
+   - §11 Q1 answered: a profile save bumps `candidate.updated_at` only when name, email, headline/summary, skills or years change (Hibernate dirty checking + DB triggers). An identical save is **not** rescored and seeker explanations stay READY. Fix the §4.4 row that says otherwise.
+   - Candidate skills are read once per scoring chunk under the candidate lock (not once per request); the page is read in one REPEATABLE READ read-only transaction.
+   - Seeker grounding: digits from job skill names are no longer allowed numbers; job skill names are masked out of the engine summary before numbers are taken from it. Numbers inside a mention of a job skill/alias are exempt by span.
+   - Known gaps for PRODUCTION_READINESS §5: `CandidateService.delete` and skill deletes don't take the advisory locks (a racing delete can deadlock → MATCHES_BUSY/SERVICE_BUSY); `MatchExplanationValidator` doesn't reject closing tags (`</profile_summary>`, `</candidate_summary>`, `</job_description>`).
