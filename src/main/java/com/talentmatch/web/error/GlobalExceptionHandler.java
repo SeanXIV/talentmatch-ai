@@ -116,7 +116,10 @@ public class GlobalExceptionHandler {
                     "This alias already exists (aliases are case-insensitive)."),
             // Safety net: FeedSourceService inserts with ON CONFLICT and reports the existing id itself.
             "feed_source_source_key_key", new Conflict(ErrorCode.FEED_SOURCE_ALREADY_EXISTS,
-                    "This source is already on your watchlist. List your sources with GET /api/feed/sources."));
+                    "This source is already on your watchlist. List your sources with GET /api/feed/sources."),
+            // Safety net: ApplicationService reports the existing application id itself (V7 partial index).
+            "uq_application_job", new Conflict(ErrorCode.APPLICATION_ALREADY_EXISTS,
+                    "This job is already tracked. List your applications with GET /api/applications."));
 
     private record Conflict(ErrorCode code, String message) {
     }
@@ -396,8 +399,15 @@ public class GlobalExceptionHandler {
 
     // ------------------------------------------------------------------ 500
 
-    /** Endpoints whose failures may carry personal data (CV text, profile) in exception messages. */
-    private static final String PII_PATH_PREFIX = "/api/profile";
+    /**
+     * Endpoints whose failures may carry personal data (CV text, profile; application notes and
+     * tailored documents, Phase 7) in exception messages.
+     */
+    private static final List<String> PII_PATH_PREFIXES = List.of("/api/profile", "/api/applications");
+
+    private static boolean isPiiPath(String uri) {
+        return uri != null && PII_PATH_PREFIXES.stream().anyMatch(uri::startsWith);
+    }
 
     private static String classChain(Throwable ex) {
         StringBuilder sb = new StringBuilder();
@@ -434,9 +444,9 @@ public class GlobalExceptionHandler {
             }
         }
         String requestId = RequestIdFilter.currentRequestId(req);
-        if (req.getRequestURI().startsWith(PII_PATH_PREFIX)) {
-            // Profile requests carry CV data, and exception messages (PostgreSQL row details, JSON
-            // parse errors) can quote it: log the exception classes only.
+        if (isPiiPath(req.getRequestURI())) {
+            // Profile and application requests carry CV data and notes, and exception messages
+            // (PostgreSQL row details, JSON parse errors) can quote it: log the exception classes only.
             log.error("Unexpected error on {} {} (request {}): {}", req.getMethod(), req.getRequestURI(), requestId,
                     classChain(ex));
         } else {

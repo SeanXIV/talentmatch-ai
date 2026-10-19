@@ -48,10 +48,10 @@ class AiProviderUnavailableIT extends AbstractApiIT {
     ChatModel chatModel;
 
     @Test
-    void startsWithV6AndServesTemplatesWhileOllamaIsUnreachable() {
+    void startsWithV7AndServesTemplatesWhileOllamaIsUnreachable() {
         assertThat(chatModel).isInstanceOf(OllamaChatModel.class);
         assertThat(jdbc.queryForList("SELECT version FROM flyway_schema_history WHERE success AND version IS NOT NULL "
-                + "ORDER BY installed_rank", String.class)).containsExactly("1", "2", "3", "4", "5", "6");
+                + "ORDER BY installed_rank", String.class)).containsExactly("1", "2", "3", "4", "5", "6", "7");
 
         skills("Java", "SQL", "Docker");
         UUID job = job("Backend Engineer", "Acme", "Java", "SQL", "~Docker");

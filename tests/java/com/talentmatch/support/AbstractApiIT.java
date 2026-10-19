@@ -71,7 +71,10 @@ public abstract class AbstractApiIT {
     void resetDatabase() {
         api = new Api(port, mapper);
         // No CASCADE: every table must be listed (a missing one fails loudly instead of being silently kept).
-        jdbc.execute("TRUNCATE feed_notification, job_posting, feed_job, feed_source, feed_api_usage, feed_state, "
+        // Phase 7: the five V7 tables go in the same statement as owner_profile_version and job (they reference both).
+        jdbc.execute("TRUNCATE application_document_file, application_generation, application_event, "
+                + "application_document, application, "
+                + "feed_notification, job_posting, feed_job, feed_source, feed_api_usage, feed_state, "
                 + "job_preferences, notification_settings, skill_alias, owner_profile, owner_profile_version, resume, "
                 + "job_match, candidate_skill, job_skill, candidate, job, skill");
     }

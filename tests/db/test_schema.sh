@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_schema.sh - Verify the TalentMatch AI schema (V1 to V6) in the running
+# test_schema.sh - Verify the TalentMatch AI schema (V1 to V7) in the running
 # talentmatch-postgres container. Behavioral checks run in a transaction that
 # is rolled back, so no test data is left behind.
 #
@@ -849,6 +849,110 @@ BEGIN
         RAISE EXCEPTION 'FAIL: skill delete (cascading to job_skill) did not bump job.updated_at (%)', ts;
     END IF;
     RAISE NOTICE 'PASS: skill delete cascades to links and bumps the parent';
+END $$;
+
+ROLLBACK;
+
+-- ---------- V7 applications (rolled back) ----------
+BEGIN;
+
+DO $$
+DECLARE
+    t text; j_id uuid; a_id uuid; keep_id uuid; pv int; cv uuid; cv2 uuid; cl uuid; n int;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM flyway_schema_history WHERE version = '7' AND success) THEN
+        RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V7';
+    END IF;
+    FOREACH t IN ARRAY ARRAY['application','application_document','application_document_file',
+                             'application_generation','application_event'] LOOP
+        IF to_regclass('public.' || t) IS NULL THEN
+            RAISE EXCEPTION 'FAIL: missing table %', t;
+        END IF;
+    END LOOP;
+    FOREACH t IN ARRAY ARRAY['uq_application_job','uq_application_generation_active'] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = t) THEN
+            RAISE EXCEPTION 'FAIL: missing index %', t;
+        END IF;
+    END LOOP;
+    RAISE NOTICE 'PASS: V7 tables and indexes present';
+
+    INSERT INTO job (title, company) VALUES ('QaV7 Engineer', 'QaV7 Corp') RETURNING id INTO j_id;
+    INSERT INTO owner_profile_version (version, profile)
+    SELECT COALESCE(max(version), 0) + 1, '{}' FROM owner_profile_version RETURNING version INTO pv;
+    INSERT INTO application (job_id, job_title, job_company) VALUES (j_id, 'QaV7 Engineer', 'QaV7 Corp')
+    RETURNING id INTO a_id;
+    INSERT INTO application (job_title, job_company) VALUES ('QaV7 Keep', 'QaV7 Corp') RETURNING id INTO keep_id;
+
+    BEGIN
+        INSERT INTO application (job_id, job_title, job_company) VALUES (j_id, 'Dup', 'Dup');
+        RAISE EXCEPTION 'FAIL: second application for one job accepted';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    BEGIN
+        UPDATE application SET status = 'APPLIED' WHERE id = a_id;
+        RAISE EXCEPTION 'FAIL: APPLIED without applied_on accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+
+    INSERT INTO application_document (application_id, kind, version, source, profile_version, content, model,
+                                      input_hash)
+    VALUES (a_id, 'CV', 1, 'AI', pv, '{}', 'qa/m', repeat('a', 64)) RETURNING id INTO cv;
+    INSERT INTO application_document (application_id, kind, version, source, based_on_id, profile_version, content)
+    VALUES (a_id, 'CV', 2, 'EDIT', cv, pv, '{}') RETURNING id INTO cv2;
+    INSERT INTO application_document (application_id, kind, version, source, profile_version, content, model,
+                                      input_hash)
+    VALUES (a_id, 'COVER_LETTER', 1, 'AI', pv, '{}', 'qa/m', repeat('a', 64)) RETURNING id INTO cl;
+
+    BEGIN
+        UPDATE application_document SET content = '{"x": 1}' WHERE id = cv;
+        RAISE EXCEPTION 'FAIL: application_document content UPDATE accepted';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE 'FAIL:%' THEN RAISE; END IF;
+    END;
+    BEGIN
+        INSERT INTO application_document_file (document_id, format, content, size_bytes, sha256)
+        VALUES (cv2, 'PDF', '\x010203', 3, repeat('a', 64));
+        RAISE EXCEPTION 'FAIL: file for an unapproved version accepted';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE 'FAIL:%' THEN RAISE; END IF;
+    END;
+    UPDATE application_document SET approved_at = now(), approval_acknowledged = false WHERE id IN (cv2, cl);
+    BEGIN
+        UPDATE application_document SET approved_at = now() + interval '1 hour' WHERE id = cv2;
+        RAISE EXCEPTION 'FAIL: second approval accepted';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE 'FAIL:%' THEN RAISE; END IF;
+    END;
+    BEGIN
+        DELETE FROM application_document WHERE id = cv;
+        RAISE EXCEPTION 'FAIL: direct application_document DELETE accepted';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE 'FAIL:%' THEN RAISE; END IF;
+    END;
+    INSERT INTO application_document_file (document_id, format, content, size_bytes, sha256)
+    VALUES (cv2, 'PDF', '\x010203', 3, repeat('a', 64)), (cl, 'DOCX', '\x010203', 3, repeat('a', 64));
+    INSERT INTO application_generation (application_id, want_cv, want_cover_letter, status, model, cv_document_id,
+                                        cover_letter_document_id, started_at, finished_at)
+    VALUES (a_id, true, true, 'SUCCEEDED', 'qa/m', cv, cl, now(), now());
+    INSERT INTO application_event (application_id, from_status, to_status) VALUES (a_id, NULL, 'NEW');
+    UPDATE application SET status = 'APPLIED', applied_on = current_date, sent_cv_id = cv2, sent_cover_letter_id = cl
+    WHERE id = a_id;
+    RAISE NOTICE 'PASS: V7 checks, append-only documents and the file guard';
+
+    DELETE FROM application WHERE id = a_id;
+    SELECT (SELECT count(*) FROM application_document WHERE application_id = a_id)
+         + (SELECT count(*) FROM application_document_file WHERE document_id IN (cv, cv2, cl))
+         + (SELECT count(*) FROM application_generation WHERE application_id = a_id)
+         + (SELECT count(*) FROM application_event WHERE application_id = a_id) INTO n;
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'FAIL: application delete left % child row(s)', n;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM application WHERE id = keep_id) THEN
+        RAISE EXCEPTION 'FAIL: application delete removed another application';
+    END IF;
+    RAISE NOTICE 'PASS: deleting an application cascades through the append-only triggers';
 END $$;
 
 ROLLBACK;

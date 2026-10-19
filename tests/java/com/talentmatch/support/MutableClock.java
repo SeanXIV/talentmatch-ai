@@ -49,8 +49,31 @@ public final class MutableClock extends Clock {
         return ZoneOffset.UTC;
     }
 
+    /**
+     * A view of this clock in {@code zone}: same (movable) instant, different zone, so
+     * {@code LocalDate.now(clock.withZone(zone))} gives the date in that zone (Phase 7 appliedOn).
+     */
     @Override
     public Clock withZone(ZoneId zone) {
-        return this;
+        if (zone.equals(getZone())) {
+            return this;
+        }
+        MutableClock base = this;
+        return new Clock() {
+            @Override
+            public ZoneId getZone() {
+                return zone;
+            }
+
+            @Override
+            public Clock withZone(ZoneId other) {
+                return base.withZone(other);
+            }
+
+            @Override
+            public Instant instant() {
+                return base.instant();
+            }
+        };
     }
 }

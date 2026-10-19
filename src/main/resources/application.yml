@@ -174,4 +174,8 @@ talentmatch:
       read-timeout: 10s
       write-timeout: 10s
 
+  # Tailored applications and the tracker (Phase 7, com.talentmatch.application.tailoring.ApplicationProperties).
+  applications:
+    zone: Africa/Johannesburg         # appliedOn default and cover-letter date
+
 logging.pattern.level: "%5p [%X{requestId:-}]"
