@@ -3,7 +3,6 @@ package com.talentmatch.ai;
 import com.talentmatch.domain.scoring.MatchEvaluation;
 import com.talentmatch.domain.scoring.SkillHit;
 import java.util.List;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -16,9 +15,6 @@ import java.util.stream.Collectors;
  * boundary and placed only inside their tags. The candidate's email is never an input.
  */
 public final class ExplanationPromptBuilder {
-
-    private static final Pattern WHITESPACE = Pattern.compile("\\s+");
-    private static final String ELLIPSIS = "…";
 
     private final int maxContextChars;
 
@@ -128,66 +124,18 @@ public final class ExplanationPromptBuilder {
         return truncate(clean, maxContextChars);
     }
 
-    /** Single-line field: sanitized with whitespace (including newlines) collapsed to one space. */
+    /** Single-line field: delegates to {@link PromptText#line}. */
     static String line(String text) {
-        if (text == null) {
-            return "";
-        }
-        return WHITESPACE.matcher(sanitize(text)).replaceAll(" ").strip();
+        return PromptText.line(text);
     }
 
-    /**
-     * Escapes {@code & < >}, breaks up {@code {{ }}}, normalizes line breaks and tabs, and strips
-     * every other control character.
-     */
+    /** Delegates to {@link PromptText#sanitize}. */
     static String sanitize(String text) {
-        if (text == null) {
-            return "";
-        }
-        String s = text.replace("\r\n", "\n").replace('\r', '\n').replace('\t', ' ');
-        StringBuilder sb = new StringBuilder(s.length() + 16);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == '\n') {
-                sb.append(c);
-            } else if (Character.isISOControl(c)) {
-                continue;
-            } else if (c == '&') {
-                sb.append("&amp;");
-            } else if (c == '<') {
-                sb.append("&lt;");
-            } else if (c == '>') {
-                sb.append("&gt;");
-            } else {
-                sb.append(c);
-            }
-        }
-        String out = sb.toString();
-        while (out.contains("{{")) {
-            out = out.replace("{{", "{ {");
-        }
-        while (out.contains("}}")) {
-            out = out.replace("}}", "} }");
-        }
-        return out;
+        return PromptText.sanitize(text);
     }
 
-    /**
-     * Cuts {@code text} to at most {@code max} characters at the last whitespace at or before
-     * the limit (hard cut if there is none) and appends an ellipsis.
-     */
+    /** Delegates to {@link PromptText#truncate}. */
     static String truncate(String text, int max) {
-        if (text.length() <= max) {
-            return text;
-        }
-        int cut = -1;
-        for (int i = Math.min(max, text.length() - 1); i > 0; i--) {
-            if (Character.isWhitespace(text.charAt(i))) {
-                cut = i;
-                break;
-            }
-        }
-        String head = cut > 0 ? text.substring(0, cut) : text.substring(0, max);
-        return head.stripTrailing() + ELLIPSIS;
+        return PromptText.truncate(text, max);
     }
 }

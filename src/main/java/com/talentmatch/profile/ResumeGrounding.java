@@ -5,14 +5,11 @@ import com.talentmatch.profile.ProfileDocument.Education;
 import com.talentmatch.profile.ProfileDocument.Experience;
 import com.talentmatch.profile.ProfileDocument.Project;
 import com.talentmatch.profile.ProfileDocument.SkillEntry;
-import java.text.Normalizer;
 import java.time.Clock;
 import java.time.Year;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -32,13 +29,6 @@ public final class ResumeGrounding {
 
     /** How far (in normalized characters) from a skill name a stated number of years may be. */
     static final int YEARS_WINDOW = 60;
-
-    private static final Pattern NON_WORD = Pattern.compile("[^\\p{L}\\p{N}+#]+");
-    private static final Pattern FORMAT = Pattern.compile("\\p{Cf}");
-    private static final Map<Integer, String> NUMBER_WORDS = Map.ofEntries(Map.entry(1, "one"), Map.entry(2, "two"),
-            Map.entry(3, "three"), Map.entry(4, "four"), Map.entry(5, "five"), Map.entry(6, "six"),
-            Map.entry(7, "seven"), Map.entry(8, "eight"), Map.entry(9, "nine"), Map.entry(10, "ten"),
-            Map.entry(11, "eleven"), Map.entry(12, "twelve"), Map.entry(15, "fifteen"), Map.entry(20, "twenty"));
 
     /** The draft after grounding (ungrounded years removed) and the warnings for the owner. */
     public record Result(ProfileDocument document, List<ProfileWarning> warnings) {
@@ -105,11 +95,7 @@ public final class ResumeGrounding {
      * spaces), lower case, punctuation to spaces, single spaces. Keeps + and # (C++, C#).
      */
     static String key(String s) {
-        if (s == null) {
-            return "";
-        }
-        String t = FORMAT.matcher(Normalizer.normalize(s, Normalizer.Form.NFKC)).replaceAll("");
-        return NON_WORD.matcher(t.toLowerCase(Locale.ROOT)).replaceAll(" ").strip();
+        return ProfileText.key(s);
     }
 
     /** Years not written near the skill name become null, each with a warning. */
@@ -181,8 +167,9 @@ public final class ResumeGrounding {
             if (needle.isEmpty()) {
                 return false;
             }
-            Pattern number = Pattern.compile(" (" + years + (NUMBER_WORDS.containsKey(years)
-                    ? "|" + NUMBER_WORDS.get(years) : "") + ")\\+? "); // "5 years", "5+ years", "five years"
+            String word = ProfileText.numberWord(years);
+            Pattern number = Pattern.compile(" (" + years + (word != null
+                    ? "|" + word : "") + ")\\+? "); // "5 years", "5+ years", "five years"
             for (String form : needle.contains(" ") ? List.of(needle, needle.replace(" ", "")) : List.of(needle)) {
                 String target = " " + form + " ";
                 for (int at = spaced.indexOf(target); at >= 0; at = spaced.indexOf(target, at + 1)) {
