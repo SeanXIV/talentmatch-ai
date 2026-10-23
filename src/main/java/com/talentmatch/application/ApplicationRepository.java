@@ -178,6 +178,16 @@ public class ApplicationRepository {
                 new MapSqlParameterSource("jobId", jobId), UUID.class).stream().findFirst();
     }
 
+    /**
+     * The {@code updated_at} of the application's job, stored on new versions ({@code job_updated_at}); empty
+     * when the job was deleted (or the application doesn't exist).
+     */
+    public Optional<Instant> jobUpdatedAt(UUID applicationId) {
+        return jdbc.query("SELECT j.updated_at FROM application a JOIN job j ON j.id = a.job_id WHERE a.id = :id",
+                new MapSqlParameterSource("id", applicationId), (rs, n) -> instant(rs, "updated_at"))
+                .stream().findFirst();
+    }
+
     /** Status history, oldest first. */
     public List<EventView> events(UUID applicationId) {
         return jdbc.query("SELECT from_status, to_status, forced, at FROM application_event "

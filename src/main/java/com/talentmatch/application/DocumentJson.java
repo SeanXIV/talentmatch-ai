@@ -3,6 +3,7 @@ package com.talentmatch.application;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
@@ -25,10 +26,31 @@ final class DocumentJson {
             .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
             .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
             .build();
+    /**
+     * Owner edits (request bodies): unknown properties are rejected, as the web layer does for every
+     * other request field, so a misspelt field isn't silently dropped.
+     */
+    private static final ObjectMapper EDIT_MAPPER = JsonMapper.builder()
+            .addModule(new JavaTimeModule())
+            .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, true)
+            .build();
     private static final TypeReference<List<Finding>> FINDINGS = new TypeReference<>() {
     };
 
     private DocumentJson() {
+    }
+
+    /**
+     * An owner's edited content of one kind, from the request's {@code content} object.
+     *
+     * @throws JsonProcessingException for an unknown field or a value of the wrong type (the exception's
+     *                                 path is relative to {@code content})
+     */
+    static Object edited(DocumentKind kind, JsonNode content) throws JsonProcessingException {
+        return switch (kind) {
+            case CV -> EDIT_MAPPER.treeToValue(content, TailoredCvContent.class);
+            case COVER_LETTER -> EDIT_MAPPER.treeToValue(content, CoverLetterContent.class);
+        };
     }
 
     /** A {@link TailoredCvContent}, a {@link CoverLetterContent} or a findings list as JSON. */
