@@ -305,7 +305,8 @@ class ApplicationTrackerIT extends AbstractApiIT {
     @Test
     void unknownJsonFieldsAreMalformed() {
         UUID jobId = newJob();
-        assertError(api.post(BASE, "{\"jobId\":\"" + jobId + "\",\"generate\":true}"), 400, "MALFORMED_REQUEST");
+        // Phase 7 step 5: "generate" is a real field now (see GenerationIT); a near-miss name is still unknown
+        assertError(api.post(BASE, "{\"jobId\":\"" + jobId + "\",\"generateNow\":true}"), 400, "MALFORMED_REQUEST");
         assertError(api.post(BASE, "{\"jobId\":\"" + jobId + "\",\"bogus\":1}"), 400, "MALFORMED_REQUEST");
         assertError(api.post(BASE, "{\"jobId\":\"not-a-uuid\"}"), 400, "MALFORMED_REQUEST");
         assertThat(jdbc.queryForObject("SELECT count(*) FROM application", Integer.class)).isZero();
