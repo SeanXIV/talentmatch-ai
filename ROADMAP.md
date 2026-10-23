@@ -182,15 +182,53 @@ Principles for everything below:
 - n. Paging with `page` + `limit`, as on `/jobs/{id}/matches`.
 
 ## Phase 7 — Tailored CV and cover letter
-- [ ] For one job, generate a tailored CV (pick, order and rephrase entries from the
+- [x] For one job, generate a tailored CV (pick, order and rephrase entries from the
       master profile to match the posting) and a cover letter
-- [ ] Grounding validator: every role, project, skill, certificate and number in the
+      (`POST /api/applications/{id}/generations`, async with a persisted queue)
+- [x] Grounding validator: every role, project, skill, certificate and number in the
       output must exist in the master profile; anything else is rejected or flagged
-- [ ] Export DOCX and PDF; keep every version; owner edits and approves
-- [ ] Application tracker: status (new → shortlisted → applied → interview →
+      (selection by reference; drop, revert or BLOCKING finding per item)
+- [x] Export DOCX and PDF; keep every version; owner edits and approves (immutable versions,
+      files stored at approval, DRAFT footer on unapproved downloads)
+- [x] Application tracker: status (new → shortlisted → applied → interview →
       offer/rejected), applied date, notes, and which CV/cover-letter version was sent
+      (plus withdrawn and dismissed; enforced transitions with `force`; V7)
 
-**Demonstrable output:** from notification to a reviewed, tailored application in minutes.
+**Demonstrable output:** from notification to a reviewed, tailored application in minutes
+(with a hosted provider or a GPU; 20–30 minutes on a CPU-only machine).
+
+**Decisions (2026-10-19)** (details in the Phase 7 spec):
+- a. DOCX with Apache POI, PDF with PDFBox and a bundled Noto Sans (OFL); nothing copyleft.
+- b. One fixed, single-column, ATS-friendly layout per document; no user templates.
+- c. Provider-agnostic with local Ollama by default; a hosted provider tailors only with
+  `talentmatch.applications.allow-remote-generation=true` (separate from CV extraction's flag).
+- d. Async generation on a persisted queue (the Phase 4 pattern), holding the local model
+  exclusively.
+- e. The CV is built by reference: the model returns profile refs and reworded text; the server
+  copies every fact from the profile version.
+- f. Every role and education entry is always included, in profile order; highlights, projects,
+  certifications and skills may be picked and ordered.
+- g. Rephrasing may change wording, order, tense and length, never numbers, employers, titles,
+  dates, skills or technologies.
+- h. Grounding per item, never silent: fabricated structure dropped, failed CV text reverted,
+  failed letter text flagged BLOCKING; the whole answer is rejected only if unparseable or mostly
+  unusable.
+- i. An edit is a new immutable version; facts copied from the profile are read-only.
+- j. Immutable versions per kind; approval is recorded once and needs an acknowledgement for
+  BLOCKING findings (including a changed profile); no un-approve.
+- k. Versions and the PDF/DOCX files stored at approval live in the database.
+- l. Unapproved versions can be downloaded with a DRAFT footer and a `-draft` file name.
+- m. Statuses add WITHDRAWN and DISMISSED; transitions are enforced, with `force` to correct
+  mistakes.
+- n. Applications are created explicitly by the owner, at most one per job.
+- o. Entering APPLIED defaults the date to today (Africa/Johannesburg) and the sent versions to
+  the newest approved ones.
+- p. Cover letter: first person, plain British English, 3–4 paragraphs, 180–350 words; date,
+  greeting, sign-off and the optional notice-period sentence are added by the server.
+- q. Contact details, links, preferences and salary are never sent to the model.
+- r. An application keeps a snapshot of the job and outlives it; a closed job can still be
+  tailored.
+- s. No tracker state in `/api/profile/matches` in Phase 7.
 
 ## Phase 8 — Frontend
 - [ ] Scaffold a React app
@@ -229,6 +267,14 @@ Principles for everything below:
 - **Background seeker explanations** for new feed jobs, and the explanation in notification
   emails (Phase 6 decision m).
 - **Stricter free-text grounding for recruiter explanations**, like the Phase 6 seeker check.
+- **Automatic tracker entries** from notifications or matches (Phase 7 decision n: the owner
+  creates each application).
+- **Tracker state in `/api/profile/matches`**: an `application {id, status}` field and a "hide
+  dismissed" filter (Phase 7 decision s).
+- **User DOCX templates** for tailored documents (Phase 7 has one fixed layout per kind, decision b).
+- **Other languages** for tailored documents (English only in Phase 7).
+- **A delete-my-data path covering applications**: today versions and files go only with their
+  whole application, and profile versions are kept forever (PRODUCTION_READINESS section 11).
 
 ## Minimum Viable Version
 

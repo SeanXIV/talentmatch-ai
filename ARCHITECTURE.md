@@ -28,8 +28,10 @@ flowchart TB
         SVC["Match Service\n(skill-overlap scoring)"]
         AI["AI Explanation Service\n(LangChain4j)"]
         FEED["Job feed\n(poller, processor,\nenrichment, notifier)"]
+        APPS["Applications\n(tracker, tailored CV and\ncover letter, PDF/DOCX)"]
         API --> SVC
         SVC --> AI
+        API --> APPS
     end
 
     subgraph External["LLM Provider (swappable)"]
@@ -58,6 +60,9 @@ flowchart TB
     FEED --> SMTP
     FEED <--> DB
     FEED <--> OLLAMA
+    APPS <--> DB
+    APPS <--> OLLAMA
+    APPS -. "only with allow-remote-generation" .-> HOSTED
 
     subgraph Infra["Infrastructure"]
         DOCKER["Docker + docker-compose"]
@@ -77,6 +82,7 @@ flowchart TB
 | LLM Provider | Ollama (local, free) by default; OpenAI/Claude API optional, swappable via config for higher-quality output | Natural-language generation |
 | Job feed (Phase 5) | Poll watched job boards and Adzuna searches, deduplicate postings into feed jobs, extract skills (dictionary, then AI enrichment), filter by preferences and score against the owner's profile | Fresh jobs |
 | Notifier (Phase 5) | Send one email per new, matching job over SMTP (at least once, hourly cap, backoff) | Job alerts |
+| Applications (Phase 7) | Track applications (status, applied date, notes, sent versions); generate a tailored CV and cover letter per job in the background, grounded in the master profile; keep immutable versions, owner edits and approvals; render PDF and DOCX | Tailored applications |
 | React Frontend | Present candidates, jobs, and match results to a user | User interface |
 | Docker / AWS | Package and run every component consistently, locally and in the cloud | Deployment |
 
@@ -109,10 +115,14 @@ cleaner or loader.
 | `domain.entity` | JPA entities matching the Flyway schema (`ddl-auto=validate`) | — |
 | `domain.scoring` | **pure** `ScoringEngine` (no Spring, no JPA): score, breakdown, summary | — |
 | `config` | typed properties (`talentmatch.*`), executor, startup failure analyzer | — |
-| `ai` | AI explanation layer for two **audiences** (`Audience`: RECRUITER, Phase 3; SEEKER, Phase 6), each with its own system prompt, input hash, storage columns (`repository.ExplanationTarget`) and template: prompt builder + hasher, LangChain4j `ExplanationAssistant` / `SeekerExplanationAssistant`, generator, validator, template renderers (`ExplanationFallbackRenderer`, `SeekerFallbackRenderer`), single-flight/backoff (`ExplanationService.explainAll`), circuit breaker, regenerate rate limiter (job and candidate scopes), the `ExplanationGroundingCheck` SPI (implemented in `seeker`, so `ai` never imports `feed.skills`), `ai` health indicator | `repository`, `domain.scoring`, `ai.config` |
+| `ai` | AI explanation layer for two **audiences** (`Audience`: RECRUITER, Phase 3; SEEKER, Phase 6), each with its own system prompt, input hash, storage columns (`repository.ExplanationTarget`) and template: prompt builder + hasher, LangChain4j `ExplanationAssistant` / `SeekerExplanationAssistant`, generator, validator, template renderers (`ExplanationFallbackRenderer`, `SeekerFallbackRenderer`), single-flight/backoff (`ExplanationService.explainAll`), circuit breaker, regenerate rate limiter (job and candidate scopes), the `ExplanationGroundingCheck` SPI (implemented in `seeker`, so `ai` never imports `feed.skills`), `ai` health indicator, and (Phase 7) the public `PromptText` sanitiser shared with tailoring (explanation prompts byte-identical) | `repository`, `domain.scoring`, `ai.config` |
 | `seeker` | jobs for a candidate (Phase 6): params → `CandidateMatchQuery`, scope SQL, candidate-side scoring in locked chunks and the ranked page (`CandidateMatchRepository`, `CandidateMatchService`), views, and `SeekerGroundingCheck` (free-text grounding of seeker explanations against the skill vocabulary) | `ai`, `repository`, `domain.scoring`, `feed.skills` (dictionary snapshot, grounding only), `profile` (`OwnerProfileRepository`, read-only), `preferences` (enums only), `service` (`MatchBreakdownView`, `MatchReason`, exceptions), `config` (`MatchProperties`) |
-| `ai.config` | `AiConfiguration` (model info, `aiExecutor`, both assistants, generator with the grounding check via `ObjectProvider`, `Clock`), one `ChatModel` config per provider (each also builds the CV `ResumeExtractionModel`; Ollama also the `LocalModelGate`), startup failure analyzer | `ai`, `profile` (properties, model holder) |
-| `profile` | owner's master profile (Phase 4): PDF upload and text extraction (`ResumeService`, `ResumeTextExtractor`, PDFBox), background AI extraction (`ResumeExtractionService`, hand-built `ProfileJsonSchema`), cleaning (`ProfileNormalizer`), never-invent checks (`ResumeGrounding`), saving the confirmed profile (`ProfileService`), restart recovery (`ProfileRecovery`), JDBC repositories for `resume` / `owner_profile` | `service`, `repository`, `ai` (`FailureKind`, `LocalModelGate`) |
+| `ai.config` | `AiConfiguration` (model info, `aiExecutor`, both assistants, generator with the grounding check via `ObjectProvider`, `Clock`), one `ChatModel` config per provider (each also builds the CV `ResumeExtractionModel` and, Phase 7, the `TailoringModel`; Ollama also the `LocalModelGate` and the `requireTailoringBudget` startup check), startup failure analyzer | `ai`, `profile` (properties, model holder), `application.tailoring` (`ApplicationProperties`, `TailoringModel`; never the root `application` package) |
+| `profile` | owner's master profile (Phase 4): PDF upload and text extraction (`ResumeService`, `ResumeTextExtractor`, PDFBox), background AI extraction (`ResumeExtractionService`, hand-built `ProfileJsonSchema`), cleaning (`ProfileNormalizer`), never-invent checks (`ResumeGrounding`; number canonicalisation and number words in `ProfileText`, shared with Phase 7), saving the confirmed profile (`ProfileService`), restart recovery (`ProfileRecovery`), JDBC repositories for `resume` / `owner_profile` and one profile version (`ProfileVersionReader`) | `service`, `repository`, `ai` (`FailureKind`, `LocalModelGate`) |
+| `application` | application tracker and tailored documents (Phase 7): tracker use cases and transitions (`ApplicationService`, `ApplicationStatus`), the generation queue (`GenerationService` on the single-thread `applicationExecutor`, `GenerationRecovery`), versions, edits, approval and downloads (`DocumentService`), JDBC repositories for the V7 tables, views | `application.tailoring`, `application.render`, `application.content`, `profile` (`OwnerProfileRepository`, `ProfileVersionReader`), `ai` (`LocalModelGate`, `Interrupts`), `ai.config` (`MdcTaskDecorator`), `preferences` (`noticePeriodDays` only), `feed.skills` (dictionary snapshot), `service` (exceptions, `FieldErrors`, paging), `web.error` (`ErrorCode`) |
+| `application.content` | pure records and enums of a version's `content` and findings (`TailoredCvContent`, `CoverLetterContent`, `Finding`, `FindingCode`, `Severity`, `DocumentKind`) | — |
+| `application.tailoring` | the tailoring engine, pure apart from one model call (no database, no transactions): profile refs and allowed sets (`ProfileFacts`), prompts and hand-built JSON schemas, `TailoringEngine` (request → model → finish checks → parse → assemble), grounding (`FactCheck`, `TailoredCvAssembler`, `CoverLetterAssembler`, `EditValidator`), `GenerationFailure`, `ApplicationProperties`, `TailoringModel` | `application.content`, `profile` (`ProfileDocument`, `ProfileText`, `ProfileNormalizer`), `ai` (`PromptText`, `FailureKind`, `Interrupts`), `feed.skills` (dictionary snapshot and matcher) |
+| `application.render` | one shared block model rendered two ways: `CvLayout` / `LetterLayout` → `DocxWriter` (Apache POI XWPF) and `PdfWriter` (PDFBox, bundled Noto Sans), `DocumentRenderer` (file names, draft footer) | `application.content`, `service` (`FileNames`, shared with the CV download) |
 | `feed` | job feed (Phase 5): sources and leases (`FeedSourceService`, `FeedScheduler`, `SourcePoller`, `PollWriter`), dedup and canonical jobs, processing (`FeedProcessor`, `FeedScorer`), refresh triggers, AI enrichment (`JobSkillEnrichmentService`; in `feed` rather than `feed.skills` because it needs the processor), status, health, metrics, restart recovery (`FeedRecovery`) | `feed.source`, `feed.skills`, `preferences`, `notify`, `profile` (read-only, events), `repository`, `domain.scoring`, `service`, `ai` |
 | `feed.source` | provider adapters (Greenhouse, Lever, Ashby, Adzuna), `SourceHttpClient`, HTML to text; pure HTTP and parsing, no database | `preferences` (enums, gazetteer) |
 | `feed.skills` | skill dictionary and matcher, requirement heuristic, AI enrichment prompts, schema, validator and model holder | `ai` (`FailureKind`), `service` (`TextNormalizer`) |
@@ -382,6 +392,100 @@ CandidateMatchService.getMatches(candidateId, query, page, limit, regenerate)
   (for the owner: headline + summary) inside `<profile_summary>` tags in the untrusted
   BACKGROUND section.
 
+### Tailored applications (Phase 7)
+
+```
+web.controller ──> application ──────────> application.tailoring ──> application.content
+                     │   │                      │  ├─> profile      (ProfileDocument, ProfileText)
+                     │   │                      │  ├─> ai           (PromptText, FailureKind, Interrupts)
+                     │   │                      │  └─> feed.skills  (SkillDictionary snapshot)
+                     │   └──────────────────> application.render ──> application.content
+                     ├─> profile   (OwnerProfileRepository, ProfileVersionReader)
+                     ├─> ai        (LocalModelGate, Interrupts)
+                     ├─> preferences (PreferencesRepository: noticePeriodDays only)
+                     └─> service   (exceptions, FieldErrors), web.error (ErrorCode)
+ai.config ──> application.tailoring   (builds TailoringModel beans; reads ApplicationProperties)
+```
+
+```
+POST /api/applications {jobId, status?, notes?, generate?, kinds?, mentionNoticePeriod?}
+  validate (400) · tx: generate && no owner profile → 404 PROFILE_NOT_FOUND (nothing created)
+      job exists? (404, FOR KEY SHARE) · already tracked? (409 APPLICATION_ALREADY_EXISTS)
+      INSERT application (snapshot title/company/url) + application_event(null → status)
+      generate → INSERT application_generation PENDING
+  after commit: generate → GenerationService.enqueue(genId)                  → 201 ApplicationView
+
+POST /api/applications/{id}/generations {kinds, mentionNoticePeriod}
+  tx: lock application row FOR UPDATE (10 s → 503) · job_id null or job gone → 409 DATA_CONFLICT
+      no profile → 404 · active generation → 409 GENERATION_IN_PROGRESS · INSERT generation PENDING
+  after commit: enqueue                                                      → 202 GenerationView
+
+applicationExecutor (1 thread, queue 10; full → FAILED/QUEUE_FULL): GenerationService.run   never throws
+  claim PENDING→RUNNING (attempts+1; out of attempts → FAILED/TOO_MANY_ATTEMPTS)
+  no TailoringModel → FAILED/AI_DISABLED · hosted && !allow-remote-generation → FAILED/REMOTE_GENERATION_DISABLED
+  read tx: application + job (title, company, description, updated_at, required/nice skills)
+           current owner profile (version N) · preferences.noticePeriodDays (if asked)
+           application gone → discard · job gone → FAILED/JOB_DELETED
+  facts = ProfileFacts.of(profile, max-profile-chars) · record model + profile_version = N
+  LocalModelGate.acquireExclusive()  (local model only)
+    per wanted kind, CV first (a kind already stored by an interrupted attempt is skipped):
+      prompt → model.chat(ChatRequest + JSON schema) → finish checks → parse
+      → TailoredCvAssembler / CoverLetterAssembler (refs, drop/revert/block, findings)
+      → rejected: per-kind failure  |  stored: one tx { lock application row (wait ≤ 120 s;
+        gone → discard) · INSERT version (MAX+1) · record document id on the generation }
+  releaseExclusive()
+  finish: SUCCEEDED if ≥ 1 document stored, else FAILED(the CV's failure, or the letter's)
+startup (ApplicationReadyEvent): GenerationRecovery: RUNNING → PENDING, enqueue every PENDING
+
+POST …/documents {basedOn, content}
+  tx: lock application row (10 s → 503) · base in this application? (400 basedOn)
+      parse content (400 MALFORMED_REQUEST) · EditValidator against the base's profile version
+      (read-only facts, refs, limits; free text re-checked → WARNING findings)
+      INSERT EDIT version (MAX+1, based_on_id, job_updated_at = the job's now)         → 201 Document
+POST …/documents/{docId}/approve {acknowledgeFindings}
+  read: version + computed PROFILE_CHANGED · already approved → 200 (no change)
+        BLOCKING && !ack → 409 FINDINGS_NOT_ACKNOWLEDGED
+  render PDF + DOCX outside any tx (no draft footer)
+  tx: lock application · UPDATE approved_at = now() (only if null) · INSERT 2 files   → 200 Document
+GET …/documents/{docId}/file?format=pdf|docx
+  approved → stored bytes · else → render now with the DRAFT footer and a "-draft" file name
+PUT /api/applications/{id}  tx: lock row · validate · transition check (or force)
+                                 · applied date and sent-version defaults · sent ids validated
+                                 · UPDATE + application_event                          → 200
+```
+
+- **The Phase 4 queue pattern, reused.** A persisted generation row (guarded claim, 3 attempts,
+  startup recovery), one worker thread, and `LocalModelGate` held exclusively for the calls, so
+  explanations return templates (`AI_BUSY`) and feed enrichment defers while a generation runs.
+  On a CPU-only machine both documents take 20–30 minutes (CV ~15–20, letter ~5–10;
+  `call-timeout` 45 min per call). Interrupts (shutdown) leave the row `RUNNING` for recovery.
+  The circuit breaker is not fed. Metrics: timer `talentmatch.ai.tailoring` (`kind`, `outcome`,
+  `provider`, `model`).
+- **Per-kind persistence.** Each kind is stored as soon as it is done, together with its
+  generation result in one transaction, so the CV is readable while the letter is written and a
+  re-run after a crash never stores a kind twice. One kind failing never discards the other.
+- **One context size.** The tailoring model sends the same Ollama `num_ctx` as explanations and
+  extraction. `requireTailoringBudget` fails startup when `context-tokens` can't hold
+  `ceil((max-profile-chars + max-job-chars) / 3) + 1200 + max-output-tokens` (8582 with the
+  defaults, within 12288); a call that fills the context anyway is `CONTEXT_OVERFLOW`.
+- **The profile leaves the machine only on purpose.** Tailoring sends the whole profile minus
+  contact data, so a hosted provider is used only with
+  `talentmatch.applications.allow-remote-generation=true`, a separate opt-in from Phase 4's
+  `allow-remote-extraction`. The CV is still never in an enrichment prompt.
+- **Versions are immutable and self-contained.** Each version stores the facts copied from its
+  profile version plus the rewritten text. An owner edit is a new version (`source EDIT`); an
+  approval is recorded once, and the PDF and DOCX rendered at approval are stored, so "the
+  version that was sent" stays byte-exact even if the renderer changes. A profile saved after a
+  version was built marks it `PROFILE_CHANGED` (BLOCKING, computed at read time).
+- **One block model, two writers.** `CvLayout` and `LetterLayout` turn content into blocks;
+  `PdfWriter` (PDFBox 3, Noto Sans Regular and Bold embedded as subsets, A4, word wrap, page
+  breaks, unencodable characters → "?") and `DocxWriter` (POI XWPF, Noto Sans named, one numbering
+  definition for bullets, no tables) render the same blocks, so the PDF and the DOCX always say
+  the same thing. One fixed single-column, ATS-friendly layout per kind.
+- **The tracker is explicit.** Applications are created by the owner, at most one per job
+  (`uq_application_job`); transitions are enforced in `ApplicationStatus` with `force` as the
+  escape hatch, and every status change is appended to `application_event`.
+
 ### AI explains, never scores
 
 The deterministic `ScoringEngine` decides the score; the model only explains it. The prompt
@@ -403,6 +507,51 @@ After the validator, `SeekerGroundingCheck` rejects the **whole** output (templa
 It fails closed: without the skill vocabulary (or without a grounding-check bean) every seeker
 output is rejected. Skills outside the vocabulary and spelled-out numbers can't be checked
 (PRODUCTION_READINESS).
+
+### Never invent in tailored documents (Phase 7)
+
+Tailored CVs and cover letters may select, reorder and reword the master profile, never add to
+it. The design makes most inventions impossible and checks the rest per item:
+- **Refs, not facts.** `ProfileFacts` labels every profile entry with a stable ref (`E1`,
+  `E1.H2`, `P1`, `P1.H1`, `C1`, `D1`) in the prompt's authoritative PROFILE FACTS. The CV answer
+  (a hand-built JSON schema) holds only refs, skill names and reworded texts. The server copies
+  every fact (titles, employers, dates, project, certification and education names, the contact
+  header) from the profile version, so roles, projects, certificates and dates can't be invented:
+  an unknown ref is simply dropped. Every role and education entry is always included, in profile
+  order, so nothing is hidden by omission. The cover letter's date, "Re:" line, greeting, sign-off
+  and optional notice-period sentence are added by the server.
+- **Drop, revert or block.** Fabricated structure (an unknown or duplicate ref, a highlight
+  under the wrong role, a skill not in the profile) is **dropped**. A CV text that fails a check
+  is **reverted** to the profile's wording. Both are `INFO` findings, so an AI CV is grounded
+  after repair. A cover-letter paragraph can't be reverted, so a failing one is kept and flagged
+  **`BLOCKING`**: approval needs `acknowledgeFindings=true`. Heuristic doubts (heavy rewording,
+  an unknown capitalised name, length) are `WARNING`. The whole kind is rejected
+  (`INVALID_OUTPUT`, nothing stored) only when the answer is unparseable or too much of it failed
+  (more than half of the CV's items, with at least 4; more than half of the letter's paragraphs).
+  Owner edits get the same checks, but their findings are `WARNING` only, and fact fields are
+  read-only.
+- **The fact check** (`FactCheck`, pure, thread-safe):
+  - **numbers** must be allowed in that context: a rewritten highlight only the numbers of **its
+    own** original highlight (plus its role's technologies, so "Java 17" passes), the headline and
+    summary the numbers stated anywhere in the profile (text, date years, skill years; the summary
+    also the career span in whole years), the letter those plus each role's duration in whole
+    years and the numbers in the job title and company. Comparison is exact after
+    canonicalising (`10,000` = `10000`, `40%` = `40 per cent`, `5+` = `5`, "two".."twenty" =
+    digits); no rounding or unit conversion. Profile numbers count only as whole tokens ("12,000"
+    allows 12000, not 12 or 000), unlike Phase 4's CV check, which still splits numbers into
+    parts. Digits inside an allowed skill mention ("HTML5", "k8s") are exempt;
+  - **years** (19xx/20xx) in the letter must be years of the profile's dates;
+  - **skills** found by the dictionary matcher (names and aliases, boundary and ambiguity rules)
+    must be in that highlight or its role (highlights) or anywhere in the profile (headline,
+    summary, letter);
+  - **contact details** (email, URL, phone) are never allowed in free text;
+  - it **fails closed**: without the skill vocabulary every skill check fails, so CV texts are
+    reverted and letter paragraphs flagged.
+- **Personal data stays out of prompts.** The name, email, phone, location, links, credential ids,
+  certificate URLs, preferences and salary are never sent; the server inserts the header.
+- **Prompt hygiene as Phase 3.** The job description and the profile's free text go inside
+  `<job_description>` and `<profile_text>` tags, sanitised by `PromptText` (the same code as the
+  explanation prompts), and the system prompts say they are data.
 
 ### Prompt-injection handling
 
