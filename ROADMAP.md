@@ -193,6 +193,10 @@ Principles for everything below:
 - [x] Application tracker: status (new → shortlisted → applied → interview →
       offer/rejected), applied date, notes, and which CV/cover-letter version was sent
       (plus withdrawn and dismissed; enforced transitions with `force`; V7)
+- [x] Tests: unit tests for transitions, profile facts, prompts, schemas, fact check, assemblers,
+      edit validator, layouts, writers and file names; Testcontainers ITs for V7, the tracker,
+      generation, grounding, recovery, the model gate, documents, locks, deletion during a run
+      and PII-free logs (fake tailoring model; no real network or model in CI)
 
 **Demonstrable output:** from notification to a reviewed, tailored application in minutes
 (with a hosted provider or a GPU; 20–30 minutes on a CPU-only machine).

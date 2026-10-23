@@ -165,6 +165,25 @@ class GenerationIT extends AbstractGenerationIT {
     }
 
     @Test
+    void theLetterDateIsTodayInTheConfiguredZoneNearMidnightUtc() {
+        saveProfile();
+        LocalDate utcToday = LocalDate.now(java.time.ZoneOffset.UTC);
+        java.time.Instant lateUtc = utcToday.atTime(23, 30).toInstant(java.time.ZoneOffset.UTC);
+        Duration shift = Duration.between(clock.instant(), lateUtc);
+        clock.advance(shift);
+        try {
+            JsonNode app = createGenerating(initechJob(), "kinds", List.of("COVER_LETTER"));
+            UUID appId = id(app);
+            awaitGeneration(appId, generationId(app), "SUCCEEDED");
+            JsonNode letter = json(onlyDocument(appId, "COVER_LETTER").get("content"));
+            // Africa/Johannesburg is UTC+2 without DST: 23:30 UTC is already tomorrow there
+            assertThat(letter.get("date").asText()).isEqualTo(utcToday.plusDays(1).toString());
+        } finally {
+            clock.advance(shift.negated());
+        }
+    }
+
+    @Test
     void postGenerationsIs202WithLocationAndANewVersionIsTwo() {
         saveProfile();
         UUID appId = id(createGenerating(initechJob()));
