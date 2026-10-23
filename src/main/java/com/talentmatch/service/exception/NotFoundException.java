@@ -55,6 +55,20 @@ public class NotFoundException extends ApiException {
                 + ". List your sources with GET /api/feed/sources.");
     }
 
+    public static NotFoundException application(UUID id) {
+        return new NotFoundException(ErrorCode.APPLICATION_NOT_FOUND, "No application with id " + id + ".");
+    }
+
+    public static NotFoundException document(UUID applicationId, UUID documentId) {
+        return new NotFoundException(ErrorCode.DOCUMENT_NOT_FOUND,
+                "Application " + applicationId + " has no document version " + documentId + ".");
+    }
+
+    public static NotFoundException generation(UUID applicationId, UUID generationId) {
+        return new NotFoundException(ErrorCode.GENERATION_NOT_FOUND,
+                "Application " + applicationId + " has no generation " + generationId + ".");
+    }
+
     public static NotFoundException recomputeRun(UUID id, int historySize) {
         return new NotFoundException(ErrorCode.RECOMPUTE_RUN_NOT_FOUND, "No recompute run with id " + id
                 + ". Run status is kept in memory (last " + historySize

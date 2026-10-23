@@ -8,6 +8,8 @@ import com.talentmatch.ai.AiHealthIndicator;
 import com.talentmatch.ai.AiProperties;
 import com.talentmatch.ai.ExplanationAssistant;
 import com.talentmatch.ai.ExplanationGenerator;
+import com.talentmatch.ai.ExplanationGroundingCheck;
+import com.talentmatch.ai.SeekerExplanationAssistant;
 import com.talentmatch.ai.ExplanationRateLimiter;
 import com.talentmatch.ai.ExplanationService;
 import com.talentmatch.ai.LocalModelGate;
@@ -24,14 +26,19 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 import java.time.Clock;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.context.properties.bind.BindException;
 import org.springframework.boot.diagnostics.FailureAnalysis;
 import org.springframework.boot.diagnostics.FailureAnalyzer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
+import org.springframework.test.util.ReflectionTestUtils;
 
 /** Spec §2 provider wiring / §7 / §10 unit 8. No network: building a model never connects. */
+@ExtendWith(OutputCaptureExtension.class)
 class AiProviderWiringTest {
 
     /** {@code talentmatch.feed.skills.*} (bound by the app's properties scan). */
@@ -282,6 +289,51 @@ class AiProviderWiringTest {
         assertThat(List.of(factories.getProperty(FailureAnalyzer.class.getName()).split("\\s*,\\s*")))
                 .contains(AiStartupFailureAnalyzer.class.getName(),
                         "com.talentmatch.config.DatabaseStartupFailureAnalyzer");
+    }
+
+    // ------------------------------------------------------------------ Phase 6 step 3: seeker assistant
+
+    @Test
+    void enabledHasOneSeekerAssistantWiredIntoTheGeneratorWithTheGroundingCheck() {
+        runner.withUserConfiguration(com.talentmatch.seeker.SeekerGroundingCheck.class).run(ctx -> {
+            assertThat(ctx).hasNotFailed();
+            assertThat(ctx).hasSingleBean(SeekerExplanationAssistant.class).hasSingleBean(ExplanationAssistant.class)
+                    .hasSingleBean(ExplanationGroundingCheck.class);
+            assertThat(ctx.getBeansOfType(ChatModel.class)).as("both assistants share one model").hasSize(1);
+            ExplanationGenerator g = ctx.getBean(ExplanationGenerator.class);
+            assertThat(ReflectionTestUtils.getField(g, "seekerAssistant"))
+                    .isSameAs(ctx.getBean(SeekerExplanationAssistant.class));
+            assertThat(ReflectionTestUtils.getField(g, "groundingCheck"))
+                    .isSameAs(ctx.getBean(ExplanationGroundingCheck.class));
+        });
+        for (String provider : List.of("talentmatch.ai.provider=openai", "talentmatch.ai.provider=claude")) {
+            runner.withPropertyValues(provider, "talentmatch.ai.openai.api-key=sk-test-123",
+                    "talentmatch.ai.claude.api-key=sk-ant-test").run(ctx -> {
+                        assertThat(ctx).hasNotFailed();
+                        assertThat(ctx).as(provider).hasSingleBean(SeekerExplanationAssistant.class);
+                    });
+        }
+    }
+
+    @Test
+    void withoutAGroundingCheckBeanTheGeneratorStillStartsAndFailsClosed(CapturedOutput out) {
+        runner.run(ctx -> {
+            assertThat(ctx).hasNotFailed();
+            assertThat(ctx).hasSingleBean(SeekerExplanationAssistant.class).doesNotHaveBean(ExplanationGroundingCheck.class);
+            assertThat(ReflectionTestUtils.getField(ctx.getBean(ExplanationGenerator.class), "groundingCheck")).isNull();
+        });
+        assertThat(out.getAll()).contains("No unique ExplanationGroundingCheck bean");
+    }
+
+    @Test
+    void disabledHasNoSeekerAssistant() {
+        runner.withPropertyValues("talentmatch.ai.enabled=false", "talentmatch.ai.provider=claude")
+                .withUserConfiguration(com.talentmatch.seeker.SeekerGroundingCheck.class).run(ctx -> {
+                    assertThat(ctx).hasNotFailed();
+                    assertThat(ctx).doesNotHaveBean(SeekerExplanationAssistant.class)
+                            .doesNotHaveBean(ExplanationGenerator.class);
+                    assertThat(ctx.getBean(ExplanationService.class).aiActive()).isFalse();
+                });
     }
 
     private static FailureAnalysis analyze(Throwable failure) {

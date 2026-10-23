@@ -13,7 +13,7 @@
 
     <groupId>com.talentmatch</groupId>
     <artifactId>talentmatch-api</artifactId>
-    <version>0.5.0-SNAPSHOT</version>
+    <version>0.7.0-SNAPSHOT</version>
     <packaging>jar</packaging>
     <name>talentmatch-api</name>
     <description>TalentMatch AI REST API: candidates, jobs, skills, skill-overlap match scoring, AI match explanations and a master profile from an uploaded CV</description>
@@ -25,6 +25,8 @@
         <langchain4j.version>1.20.2</langchain4j.version>
         <pdfbox.version>3.0.7</pdfbox.version>
         <jsoup.version>1.21.2</jsoup.version>
+        <!-- Tailored CV / cover letter DOCX export (Phase 7, Apache-2.0). -->
+        <poi.version>5.4.1</poi.version>
         <!-- Test-scope in-process SMTP server (Apache-2.0); 2.1.x uses Jakarta Mail 2.1 / Angus Mail 2.0, as Boot 3.5. -->
         <greenmail.version>2.1.3</greenmail.version>
     </properties>
@@ -98,6 +100,33 @@
             <groupId>org.apache.pdfbox</groupId>
             <artifactId>pdfbox</artifactId>
             <version>${pdfbox.version}</version>
+        </dependency>
+
+        <!-- Tailored CV and cover letter export as DOCX (Phase 7). PDF export reuses PDFBox above.
+             poi-ooxml-full replaces poi-ooxml-lite: lite only holds the schema classes POI's own
+             test suite touches, and the writer needs section (page size/margins), numbering and
+             paragraph-property classes that lite doesn't guarantee (NoClassDefFoundError at runtime).
+             POI's log4j-api resolves to the version Boot manages and routes through Boot's
+             log4j-to-slf4j bridge; log4j-core must never be on the classpath (excluded defensively). -->
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml</artifactId>
+            <version>${poi.version}</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.apache.poi</groupId>
+                    <artifactId>poi-ooxml-lite</artifactId>
+                </exclusion>
+                <exclusion>
+                    <groupId>org.apache.logging.log4j</groupId>
+                    <artifactId>log4j-core</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.poi</groupId>
+            <artifactId>poi-ooxml-full</artifactId>
+            <version>${poi.version}</version>
         </dependency>
 
         <!-- Job feed: HTML (and entity-escaped HTML) from job boards to plain text (Phase 5) -->

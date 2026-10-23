@@ -4,6 +4,7 @@ import com.talentmatch.domain.entity.Job;
 import com.talentmatch.domain.entity.JobSkill;
 import com.talentmatch.domain.entity.Skill;
 import com.talentmatch.repository.JobRepository;
+import com.talentmatch.repository.MatchJdbcRepository;
 import com.talentmatch.repository.projection.JobListRow;
 import com.talentmatch.service.exception.ConflictException;
 import com.talentmatch.service.exception.NotFoundException;
@@ -45,10 +46,13 @@ public class JobService {
 
     private final JobRepository jobRepository;
     private final SkillResolver skillResolver;
+    private final MatchJdbcRepository matchRepository;
 
-    public JobService(JobRepository jobRepository, SkillResolver skillResolver) {
+    public JobService(JobRepository jobRepository, SkillResolver skillResolver,
+                      MatchJdbcRepository matchRepository) {
         this.jobRepository = jobRepository;
         this.skillResolver = skillResolver;
+        this.matchRepository = matchRepository;
     }
 
     @Transactional(readOnly = true)
@@ -83,9 +87,15 @@ public class JobService {
         return toDetail(job, job.getUpdatedAt());
     }
 
-    /** Updates a MANUAL job. FEED jobs are owned by the job feed and refused (409) before validation. */
+    /**
+     * Updates a MANUAL job. FEED jobs are owned by the job feed and refused (409) before validation.
+     * Takes the job's match lock first, so the skill change serializes with every match writer
+     * (job-side and candidate-side scoring); a lock timeout propagates as
+     * {@link org.springframework.dao.PessimisticLockingFailureException} (503 SERVICE_BUSY).
+     */
     @Transactional
     public JobDetailResponse update(UUID id, JobRequest request) {
+        matchRepository.lockJob(id);
         Job job = jobRepository.findWithSkillsById(id).orElseThrow(() -> NotFoundException.job(id));
         if (job.isFeed()) {
             throw feedJobReadOnly(id);

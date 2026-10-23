@@ -1,6 +1,8 @@
 package com.talentmatch.ai.config;
 
 import com.talentmatch.ai.AiProperties;
+import com.talentmatch.application.tailoring.ApplicationProperties;
+import com.talentmatch.application.tailoring.TailoringModel;
 import com.talentmatch.feed.skills.JobSkillExtractionModel;
 import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.profile.ProfileProperties;
@@ -60,6 +62,18 @@ public class ClaudeChatModelConfig {
         SkillsProperties.Enrichment e = skills.enrichment();
         return JobSkillExtractionModel.remote(build(ai, e.callTimeout(),
                 Math.max(e.maxOutputTokens(), MIN_ENRICHMENT_TOKENS)), ModelInfo.of(ai).label());
+    }
+
+    /**
+     * Same model for tailored CVs and cover letters (Phase 7), with at least {@value #MIN_EXTRACTION_TOKENS}
+     * output tokens (adaptive thinking). Only called with
+     * {@code talentmatch.applications.allow-remote-generation=true}. No temperature.
+     */
+    @Bean
+    public TailoringModel claudeTailoringModel(AiProperties ai, ApplicationProperties applications) {
+        ApplicationProperties.Generation g = applications.generation();
+        return TailoringModel.remote(build(ai, g.callTimeout(), Math.max(g.maxOutputTokens(), MIN_EXTRACTION_TOKENS)),
+                ModelInfo.of(ai).label());
     }
 
     private static ChatModel build(AiProperties ai, Duration timeout, int maxTokens) {

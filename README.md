@@ -25,6 +25,9 @@ English — turning a scoring number into something a recruiter can actually act
 - Job feed: watches company job boards (Greenhouse, Lever, Ashby) and Adzuna searches, scores
   new postings against your profile, filters them by your preferences and emails you the good
   ones within minutes
+- Tailored applications: a CV and cover letter drafted for one job from your profile, checked
+  so nothing is invented, edited and approved by you, exported as PDF or DOCX, plus an
+  application tracker (status, applied date, notes, versions sent)
 - React dashboard to browse candidates, jobs, and match results
 - Fully containerized (Docker) and deployed to AWS
 - Automated tests (JUnit, pytest) and CI on every push (GitHub Actions)
@@ -64,7 +67,13 @@ profile, which is then matched against jobs like any candidate. Phase 5 (job fee
 implemented and being hardened: the app polls the company boards and Adzuna searches you
 watch, finds skills in each new posting (dictionary first, AI later), checks it against your
 preferences, scores it against your profile and emails you when it scores above your
-threshold.
+threshold. Phase 6 (jobs for me) is implemented: `GET /api/profile/matches` ranks the jobs
+for your profile, with filters for date, country/remote, location and minimum score, a
+newest-first sort, and an explanation written to you (why you fit, what you're missing).
+Phase 7 (tailored applications) is implemented: track a job, let the AI draft a tailored CV and
+cover letter from your profile in the background (every fact copied from your profile, every
+rewritten claim checked), edit and approve versions, download them as PDF or DOCX, and record
+when you applied and which versions you sent.
 
 ## Getting Started
 
@@ -319,6 +328,87 @@ Check how it is doing with `curl -s localhost:8080/api/feed/status` (sources, ba
 state and the median time from posting to email) and `GET /api/feed/jobs` for the jobs found.
 `FEED_ENABLED=false` switches polling off. **The laptop must be awake to poll**: nothing is
 checked while it sleeps.
+
+### Quick start (jobs for me)
+
+With your profile saved, list the newest jobs from the last two days that fit you at least 60%,
+each with an explanation written to you:
+
+```bash
+curl -s 'localhost:8080/api/profile/matches?sort=newest&postedSince=P2D&minScore=0.6' \
+  | jq '.matches[] | {rank, title, company, listedAt, scorePercent, explanationStatus, text: .explanation.text}'
+```
+
+Add `&country=ZA` to keep jobs in South Africa plus remote jobs (a job with no location data
+stays in, flagged `LOCATION_UNKNOWN`), `&remote=only` for remote jobs only, or `&origin=feed` to
+hide jobs you typed in yourself (and the ETL's sample jobs). The default sort is by score
+(`sort=score`). The top 5 get an AI explanation (with Ollama on a CPU the first one can take
+minutes: the item says `PENDING`, reload later); the rest get a template built from the skill
+breakdown. Any candidate's list is at `GET /api/candidates/{id}/matches` with the same
+parameters (without your preference verdicts). All parameters are in
+[`API_SPEC.md`](./API_SPEC.md), "Jobs for a candidate".
+
+### Quick start (tailored CV, cover letter and tracker)
+
+With your profile saved and a job you want (its id from `/api/profile/matches`, a notification
+email or `/api/feed/jobs`), track it and have the AI draft both documents:
+
+```bash
+curl -s -X POST -H 'Content-Type: application/json' localhost:8080/api/applications \
+  -d '{"jobId": "<job-id>", "generate": true}' | jq '{id, status, generation: .latestGeneration.id}'
+# 201 Created; the generation is PENDING
+```
+
+Poll the generation until `status` is `SUCCEEDED` (or `FAILED`, whose `hint` says what to do).
+The CV is stored first, so it can be read while the letter is still being written:
+
+```bash
+curl -s localhost:8080/api/applications/<app-id>/generations/<gen-id> | jq '{status, failureReason, hint, results}'
+```
+
+Read each document (`results[].documentId`) and its `findings`. `BLOCKING` findings (a claim in
+the letter that isn't in your profile, or a profile saved since) must be read and acknowledged
+before approval:
+
+```bash
+curl -s localhost:8080/api/applications/<app-id>/documents/<doc-id> | jq '{kind, version, findings, content}'
+curl -s -X POST -H 'Content-Type: application/json' \
+  localhost:8080/api/applications/<app-id>/documents/<doc-id>/approve -d '{"acknowledgeFindings": true}'
+```
+
+To change the wording first, send the edited `content` as a new version
+(`POST /api/applications/<app-id>/documents` with `{"basedOn": "<doc-id>", "content": {…}}`) and
+approve that one. Facts copied from your profile (titles, employers, dates, …) can't be edited
+there: change your profile and generate again (`POST /api/applications/<app-id>/generations`).
+Approve the cover letter the same way. Download the approved files (the CV shown; the same for
+the cover letter's id), then record that you applied (the date defaults to today and the
+sent versions to the newest approved ones):
+
+```bash
+curl -s -o cv.pdf 'localhost:8080/api/applications/<app-id>/documents/<cv-doc-id>/file?format=pdf'
+curl -s -o cv.docx 'localhost:8080/api/applications/<app-id>/documents/<cv-doc-id>/file?format=docx'
+curl -s -X PUT -H 'Content-Type: application/json' localhost:8080/api/applications/<app-id> \
+  -d '{"status": "APPLIED"}' | jq '{status, appliedOn, sentCv, sentCoverLetter}'
+```
+
+Downloading a version before approving it gives a draft with a "DRAFT – not approved in
+TalentMatch" footer and a `-draft` file name. `GET /api/applications?status=APPLIED,INTERVIEW`
+lists your applications; later moves are `INTERVIEW`, `OFFER`, `REJECTED` or `WITHDRAWN`
+(`force: true` corrects a mistake). Everything is in [`API_SPEC.md`](./API_SPEC.md),
+"Applications".
+
+**Timing:** with Ollama on a CPU-only machine both documents take **20–30 minutes** (CV about
+15–20, letter about 5–10; `TALENTMATCH_APPLICATIONS_GENERATION_CALL_TIMEOUT`, default `45m` per
+document, at most `2h`). Keep the computer awake; an interrupted generation re-runs on the next
+start and keeps a document it already finished. While it runs, match explanations show templates
+(`AI_BUSY`). With a GPU or a hosted provider it takes minutes. `kinds: ["CV"]` generates only one
+document.
+
+**Your profile stays on your machine** with the default Ollama provider. With the `claude` or
+`openai` profile the generation ends as `FAILED/REMOTE_GENERATION_DISABLED` unless you opt in with
+`TALENTMATCH_APPLICATIONS_ALLOW_REMOTE_GENERATION=true`; then your profile (roles, employers,
+highlights, skills, education; never your name, contact details or links) and the posting are
+sent to that provider. This is separate from the CV-reading opt-in.
 
 _(Full-stack `docker-compose up` instructions will be added once the backend and
 frontend land.)_

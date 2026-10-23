@@ -3,3 +3,5 @@ mvnw  text eol=lf
 *.sh  text eol=lf
 # Windows command scripts keep CRLF.
 *.cmd text eol=crlf
+# Bundled fonts (Phase 7 PDF export) are binary: no line-ending conversion, no textual diff.
+*.ttf binary

@@ -26,12 +26,9 @@ final class ResumeFactCheck {
     /** A highlight must share at least this share of its content words with the CV. */
     static final double HIGHLIGHT_MIN_OVERLAP = 0.70;
     /** Content words: at least this many letters (skips "and", "the", "with"). */
-    static final int CONTENT_WORD_MIN_LETTERS = 4;
+    static final int CONTENT_WORD_MIN_LETTERS = ProfileText.CONTENT_WORD_MIN_LETTERS;
 
     private static final Pattern FORMAT = Pattern.compile("\\p{Cf}");
-    /** 40, 40%, 1.5, 10,000, 2021 (a number may contain . or , between digits). */
-    private static final Pattern NUMBER = Pattern.compile("\\d+(?:[.,]\\d+)*");
-    private static final Pattern CONTENT_WORD = Pattern.compile("\\p{L}{" + CONTENT_WORD_MIN_LETTERS + ",}");
     private static final Pattern NON_DIGIT = Pattern.compile("\\D");
     private static final Pattern WHITESPACE = Pattern.compile("\\s+");
     private static final Pattern URL_PREFIX = Pattern.compile("^(?:[a-z][a-z0-9+.-]*://)?(?:www\\.)?");
@@ -49,15 +46,9 @@ final class ResumeFactCheck {
         lower = t.toLowerCase(Locale.ROOT);
         compact = WHITESPACE.matcher(lower).replaceAll("");
         digits = NON_DIGIT.matcher(lower).replaceAll("");
-        Matcher n = NUMBER.matcher(lower);
-        while (n.find()) {
-            numbers.add(canonicalNumber(n.group()));
-            // "2019-2021" or "03/2021" also state the single numbers
-            for (String part : n.group().split("[.,]")) {
-                numbers.add(part);
-            }
-        }
-        Matcher w = CONTENT_WORD.matcher(lower);
+        // canonical numbers, plus their parts: "2019-2021" or "03/2021" also state the single numbers
+        numbers.addAll(ProfileText.numbers(lower));
+        Matcher w = ProfileText.CONTENT_WORD.matcher(lower);
         while (w.find()) {
             words.add(w.group());
         }
@@ -121,9 +112,9 @@ final class ResumeFactCheck {
             return;
         }
         Set<String> missing = new LinkedHashSet<>();
-        Matcher m = NUMBER.matcher(text);
+        Matcher m = ProfileText.NUMBER.matcher(text);
         while (m.find()) {
-            if (!numbers.contains(canonicalNumber(m.group()))) {
+            if (!numbers.contains(ProfileText.canonicalNumber(m.group()))) {
                 missing.add(m.group());
             }
         }
@@ -136,12 +127,11 @@ final class ResumeFactCheck {
 
     /** At least 70% of the bullet's content words must appear in the CV. */
     private void wording(String path, String bullet) {
-        Matcher m = CONTENT_WORD.matcher(Normalizer.normalize(bullet, Normalizer.Form.NFKC).toLowerCase(Locale.ROOT));
         int total = 0;
         int found = 0;
-        while (m.find()) {
+        for (String word : ProfileText.contentWords(bullet)) {
             total++;
-            if (words.contains(m.group())) {
+            if (words.contains(word)) {
                 found++;
             }
         }
@@ -191,11 +181,6 @@ final class ResumeFactCheck {
         if (!u.isEmpty() && !compact.contains(u)) {
             warn(path, url, "This link is not in your CV text. Check it before saving.");
         }
-    }
-
-    /** "10,000" = "10000"; "1.5" stays; a trailing ".0" is not removed (rare in CVs). */
-    private static String canonicalNumber(String n) {
-        return n.replaceAll(",(?=\\d{3}(?:\\D|$))", "");
     }
 
     private void warn(String path, String value, String message) {

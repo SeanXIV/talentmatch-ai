@@ -8,10 +8,12 @@ ISO-8601 UTC (`2026-10-01T10:00:00Z`). Ids are UUIDs.
 Items marked **(extension)** were added in Phase 2 on top of the Phase 0 draft, and items
 marked **(extension, Phase 3)** were added with the AI explanation layer; they are all
 additive, so clients written against the draft keep working. The **Profile** endpoints
-(Phase 4) are new.
+(Phase 4) are new. **(Phase 5)**, **(Phase 6)** and **(Phase 7)** items are new in those
+phases.
 
 > **Personal data, no auth.** `/api/profile/**` returns the owner's CV and contact details
-> (PII) to anyone who can reach the port. The server listens on `127.0.0.1` by default
+> (PII) to anyone who can reach the port, and so does `/api/applications/**` **(Phase 7)**:
+> tailored CVs, cover letters, their PDF/DOCX files and the tracker notes. The server listens on `127.0.0.1` by default
 > (`SERVER_ADDRESS`); don't expose it until authentication exists (`PRODUCTION_READINESS.md`,
 > section 6).
 
@@ -112,7 +114,12 @@ identical `PUT` writes nothing (and does not make matches stale). Last write win
 
 **Response `200`** candidate detail. **Errors:** `400`, `404 CANDIDATE_NOT_FOUND`, `409 EMAIL_ALREADY_EXISTS`,
 `409 DATA_CONFLICT` for the owner's own candidate (`"This candidate is your profile; edit it with
-PUT /api/profile."`, Phase 4).
+PUT /api/profile."`, Phase 4), `503 SERVICE_BUSY` (+ `Retry-After: 2`) **(Phase 6)**.
+
+**Phase 6:** the update first takes the candidate's match lock (`candidate_match:{id}`), so it
+serializes with candidate-side scoring (`GET /candidates/{id}/matches`). If the lock can't be taken
+within 10 s, nothing is saved and the answer is `503 SERVICE_BUSY` (`"The server is busy with a
+conflicting update. Please try again in a few seconds."`); retry.
 
 ### `DELETE /candidates/{id}` **(extension)**
 **Response `204`**. Also deletes the candidate's skills and match rows.
@@ -181,7 +188,15 @@ Full replace, links diffed like candidates. **Response `200`**.
 **Errors:** `400`, `404 JOB_NOT_FOUND`, `409 JOB_ALREADY_EXISTS`, `409 DATA_CONFLICT` for a FEED
 job (checked before the body is validated): `"This job comes from the job feed (source
 greenhouse:acme) and is kept up to date automatically. It can't be edited or deleted here."`
-(the source part is omitted when the job has no posting).
+(the source part is omitted when the job has no posting), `503 SERVICE_BUSY` (+ `Retry-After: 2`)
+**(Phase 6)**.
+
+**Phase 6:** the update first takes the job's match lock (`job_match:{id}`, the lock every match
+writer uses), so a score is never computed from skills that are being replaced. If the lock can't
+be taken within 10 s (for example while `GET /jobs/{id}/matches` or a candidate's matches request
+is scoring this job), nothing is saved and the answer is `503 SERVICE_BUSY` (`"The server is busy
+with a conflicting update. Please try again in a few seconds."`); retry. `POST` and `DELETE` don't
+take the lock.
 
 ### `DELETE /jobs/{id}` **(extension)**
 **Response `204`** (also deletes the job's skills and match rows). **Errors:** `400`, `404`,
@@ -832,6 +847,181 @@ Only one run at a time.
 **Errors:** `400 INVALID_ID`, `404 RECOMPUTE_RUN_NOT_FOUND` (`"No recompute run with id …. Run
 status is kept in memory (last 20 runs) and is lost when the server restarts."`)
 
+### Jobs for a candidate (Phase 6)
+
+#### `GET /candidates/{id}/matches` and `GET /profile/matches`
+
+Ranked, explained jobs for one candidate: the reverse of `GET /jobs/{id}/matches`, using the same
+`job_match` score cache and staleness rule. `GET /profile/matches` is the owner's shortcut: the
+same list as `/candidates/{ownerCandidateId}/matches`, with the same parameters
+(`404 PROFILE_NOT_FOUND` before a profile is saved).
+
+Missing or stale scores for the in-scope jobs (older than the latest change of the candidate or
+the job) are computed first, in chunks of `talentmatch.matches.rescore-chunk` (200) jobs, each
+under the candidate's match lock and the jobs' match locks (see DATA_MODEL, "Advisory locks").
+Feed jobs the feed processor already scored for the owner are reused, not rescored.
+
+| Param | Default | Allowed | Notes |
+|---|---|---|---|
+| `limit` | `10` | `1..100` (`talentmatch.matches.default-limit` / `max-limit`) | page size |
+| `page` | `0` | `>= 0`, and `page * limit` must fit in an int | zero-based |
+| `minScore` | `0` | `0..1` | only jobs with `score >= minScore`; 0-score jobs are listed at the default |
+| `sort` | `score` | `score`, `newest` (case-insensitive) | `score`: score desc, then `listedAt` desc (undated last), then job id. `newest`: `listedAt` desc (undated last), then score desc, then job id. Stable across pages and ties |
+| `postedSince` | none | an ISO-8601 instant (`2026-10-16T00:00:00Z`, an offset is accepted) **or** a positive ISO-8601 duration of at most `P366D` (`P2D`, `PT6H`), meaning now minus the duration | compared with `listedAt`; undated jobs (`listedAtSource: UNKNOWN`) are excluded |
+| `country` | none | ISO 3166 alpha-2 codes, comma-separated and/or repeated (`country=za,GB&country=NA`), at most 20; upper-cased, duplicates dropped | a non-remote feed job must list one of the countries. A feed job with **no** country data passes (flag `LOCATION_UNKNOWN`); MANUAL jobs pass; with `remote=include` (or `only`) a REMOTE job passes whatever its countries |
+| `remote` | `include` | `include`, `only`, `exclude` (case-insensitive) | `only`: REMOTE feed jobs only (MANUAL jobs drop out). `exclude`: no REMOTE jobs |
+| `location` | none | 2..100 characters after NFKC, trim and whitespace collapse | case-insensitive substring of the feed job's location text (`%` and `_` are literal); MANUAL jobs and jobs without location text drop out |
+| `origin` | `all` | `all`, `feed`, `manual` (case-insensitive) | `feed` hides MANUAL (incl. ETL) jobs |
+| `includeClosed` | `false` | `true` / `false` only | closed feed jobs are hidden by default, for every candidate |
+| `includeFiltered` | `false` | `true` / `false` only | **owner only**: jobs the owner's preferences FILTERED are hidden (and not scored or counted) unless `true`. Ignored for other candidates, who see them anyway |
+| `regenerate` | `false` | `true` / `false` only | rescores **every** in-scope job and, with AI enabled, forces new seeker explanations for the page's top-N rows. Rate-limited per candidate (below) |
+
+A blank text parameter means "use the default". Only jobs with at least one skill are ranked
+(`unmatchableJobs` counts the in-scope jobs without skills).
+
+**`listedAt`** (when the job was listed) and `listedAtSource`:
+
+| `listedAtSource` | Job | `listedAt` |
+|---|---|---|
+| `POSTED` | feed job with a provider date | the earlier of `postedAt` and `firstSeenAt` (guards against provider clock skew) |
+| `FIRST_SEEN` | feed job without a provider date, found after its source was added | `firstSeenAt` |
+| `CREATED` | MANUAL job | the job's `createdAt` |
+| `UNKNOWN` | baseline feed job (already open when its source was added) without a provider date | `null`: excluded by `postedSince`, last in `sort=newest`, otherwise listed |
+
+**Response `200`**
+```json
+{
+  "candidateId": "6c1e…", "owner": true, "profileVersion": 4,
+  "sort": "NEWEST", "page": 0, "limit": 10, "totalPages": 2, "totalElements": 14,
+  "recomputedJobs": 3, "explanationsGenerated": 1, "unmatchableJobs": 2,
+  "reason": null, "message": null,
+  "matches": [
+    {
+      "rank": 1,
+      "jobId": "a71f…", "title": "Backend Engineer", "company": "Acme", "origin": "FEED",
+      "listedAt": "2026-10-18T07:12:00Z", "listedAtSource": "POSTED",
+      "postedAt": "2026-10-18T07:12:00Z", "firstSeenAt": "2026-10-18T07:16:41Z", "closedAt": null,
+      "baseline": false, "primaryUrl": "https://jobs.lever.co/acme/…",
+      "workplace": "HYBRID", "locationText": "Cape Town", "countryCodes": ["ZA"], "seniority": "SENIOR",
+      "salary": { "min": 600000, "max": 800000, "currency": "ZAR", "period": "YEAR", "estimated": false },
+      "enrichmentStatus": "SUCCEEDED",
+      "preferenceVerdict": "PASS", "filterReasons": [], "flags": [],
+      "score": 0.8, "scorePercent": 80,
+      "summary": "Matches 2 of 2 required skills; 0 of 1 nice-to-have.",
+      "breakdown": {
+        "earnedPoints": 20, "maxPoints": 25,
+        "matchedRequired":   [ { "skillId": "…", "name": "Java", "yearsExperience": 5 },
+                               { "skillId": "…", "name": "SQL", "yearsExperience": null } ],
+        "matchedNiceToHave": [],
+        "missingRequired":   [],
+        "missingNiceToHave": [ { "skillId": "…", "name": "Kubernetes", "yearsExperience": null } ]
+      },
+      "aiExplanation": "You have both required skills, Java with 5 years of experience and SQL. The one thing missing is Kubernetes, which the role lists as nice-to-have.",
+      "explanationStatus": "READY",
+      "explanation": {
+        "source": "AI", "headline": "You cover every required skill",
+        "text": "You have both required skills, Java with 5 years of experience and SQL. The one thing missing is Kubernetes, which the role lists as nice-to-have.",
+        "strengths": ["Java with 5 years", "SQL"], "gaps": ["Kubernetes (nice-to-have)"],
+        "model": "ollama/qwen2.5:7b-instruct", "generatedAt": "2026-10-18T07:20:03Z",
+        "reason": null, "note": null
+      },
+      "computedAt": "2026-10-18T07:16:45Z"
+    }
+  ]
+}
+```
+
+Field notes:
+- `owner`: the candidate is the owner's (the profile's) candidate. `profileVersion` is the owner's
+  current profile version, `null` for other candidates. `sort` is `SCORE` or `NEWEST`.
+- `rank` = `page * limit + index + 1`.
+- **Feed-only fields** (`primaryUrl`, `firstSeenAt`, `postedAt`, `closedAt`, `baseline`,
+  `workplace`, `locationText`, `seniority`, `salary`, `enrichmentStatus`) are `null` for MANUAL
+  jobs, and `countryCodes` is `[]`. `salary` is `null` when the posting states none.
+- **Preference fields:** `preferenceVerdict` (`PASS`, `FILTERED` or `null`), `filterReasons` and
+  the stored preference `flags` (as on `/feed/jobs`) are **owner only**: `null` / `[]` for any
+  other candidate.
+- **`LOCATION_UNKNOWN` (computed):** for **any** caller who passes `country`, `flags` also gets
+  `LOCATION_UNKNOWN` on a feed job that has no country data and isn't REMOTE, so you can see it
+  passed the country filter unchecked. REMOTE and MANUAL jobs never get it. Without `country`, a
+  non-owner's `flags` is always `[]`. No duplicates (the owner's stored flags may already have it).
+- `score`, `scorePercent`, `summary`, `breakdown`, `computedAt`: as on `/jobs/{id}/matches`
+  (score rounded to 4 decimals; years never change the score; `yearsExperience: null` means
+  unknown).
+- `recomputedJobs` = scores written by this request (0 when everything was fresh);
+  `explanationsGenerated` = AI explanations generated by this request; `unmatchableJobs` =
+  in-scope jobs without skills (not ranked).
+- `aiExplanation`, `explanationStatus`, `explanation`: the Phase 3 contract and invariant
+  (`aiExplanation != null` ⇔ `READY` ⇔ `source == "AI"`), written to the job seeker (below).
+
+**Reasons** (`200`, with `message`):
+- `NO_MATCHABLE_JOBS` (no ranked job and no in-scope job with skills): "No job with listed skills
+  matches these filters. Jobs without skills can't be ranked; widen the filters or wait for the
+  feed to find skills."
+- `CANDIDATE_HAS_NO_SKILLS` (otherwise, when the candidate has no skills): "This candidate has no
+  skills yet, so every job scores 0%. Add skills (or confirm your profile with PUT /api/profile)
+  to see real matches." Jobs are still listed, all at 0, when `minScore` is 0.
+
+**Validation messages** (`400 INVALID_PARAMETER`, `field` = the parameter; the first invalid
+parameter is reported):
+
+| Param | Message |
+|---|---|
+| `limit` | "limit must be between 1 and 100." |
+| `page` | "page must be 0 or greater." / "page is too large for this page size." |
+| `minScore` | "minScore must be between 0 and 1." |
+| `sort` | "sort must be score or newest." |
+| `postedSince` | "postedSince must be an ISO-8601 instant like 2026-10-16T00:00:00Z or a duration like P2D (at most P366D)." (also for `P0D` and negative durations) |
+| `country` | "'XX' is not an ISO country code." / "Use at most 20 country codes." |
+| `remote` | "remote must be include, only or exclude." |
+| `location` | "location must be 2 to 100 characters." |
+| `origin` | "origin must be all, feed or manual." |
+| `includeClosed`, `includeFiltered`, `regenerate` | "Parameter 'includeClosed' must be true or false." (strict binding) |
+
+**Rate limit:** with AI enabled, `regenerate=true` is allowed **once per candidate per
+`regenerate-window`** (default 60 s). `/profile/matches` and `/candidates/{ownerId}/matches`
+share the owner's slot; the candidate slot never collides with a job's slot on
+`/jobs/{id}/matches`, even for the same UUID. A repeat gets `429 REGENERATE_RATE_LIMITED` with
+`Retry-After: n` and the message "Matches for this candidate were regenerated recently. You can
+regenerate again in n seconds; reload without regenerate=true to see the current results." The
+check runs after parameter validation (and, on `/profile/matches`, after the profile lookup) and
+before any other database work; a request that then fails (404, 503, …) releases the slot. With
+AI disabled, `regenerate` only rescores and is never rate-limited.
+
+**Errors:** `400 INVALID_ID`, `400 INVALID_PARAMETER`, `404 CANDIDATE_NOT_FOUND` ("No candidate
+with id ….") on `/candidates/{id}/matches`, `404 PROFILE_NOT_FOUND` ("You have not saved a profile
+yet. …") on `/profile/matches`, `429 REGENERATE_RATE_LIMITED` (+ `Retry-After: n`),
+`503 MATCHES_BUSY` (+ `Retry-After: 2`) when a match lock of the candidate or of one of its jobs is
+held for more than 10 s (or on a deadlock): "Matches for this candidate are being recalculated by
+another request. Please try again in a few seconds." (score chunks already committed stay; a retry
+has less to do), `503 DATABASE_UNAVAILABLE` (+ `Retry-After: 5`).
+
+#### Seeker explanations (Phase 6)
+
+- **Voice:** written to the job seeker in the second person ("you have Java…"), the same shape as
+  the recruiter explanation (`headline`, `text`, `strengths`, `gaps`), so a client can reuse one
+  component. The template (`source: TEMPLATE`) is in the second person too, e.g. headline
+  "Strong match: you have 2 of 2 required skills", text "You have all 2 required skills: Java
+  (5 years), SQL. Nice-to-have skills: you're missing Kubernetes."
+- **What the model sees:** the job's title, company and description, the score and skill
+  breakdown, and the candidate's summary (for the owner: profile headline + summary). The
+  candidate's **name and email are never sent**, nor preferences, salary, the CV or experience
+  entries.
+- **Storage and freshness:** stored separately from the recruiter explanation (both can be
+  `READY` for the same pair). A stored seeker explanation is reused until anything the model sees
+  changes (the summary, skills or years, the job's title, company, description or skills, the
+  score); a profile save that changes none of these keeps it `READY`.
+- **Top N, budget, PENDING, notes:** as in Phase 3, over this list's ranks. For `STALE` items the
+  note is prefixed with "The previous AI explanation is out of date because your profile or the
+  job changed. ".
+- **Grounding (stricter than Phase 3):** besides the Phase 3 checks on `strengths` and `gaps`, the
+  whole output is rejected (template with `reason: GENERATION_FAILED`, nothing stored) if any
+  field names a known skill that isn't one of this job's skills, if the headline or text contains
+  a number that isn't in the match facts (score percent, points, a matched skill's years, the
+  skill counts, a number in the job title or company), or if a sentence says "you have/bring/know"
+  a missing skill without a negation. Skills outside the skill vocabulary and spelled-out numbers
+  can't be checked.
+
 ---
 
 ## Profile (Phase 4)
@@ -979,7 +1169,12 @@ Save the reviewed profile as the master profile (creates it on the first call).
 
 The owner's candidate is created or updated in the same transaction: `fullName`, `email`,
 `summary` = headline + summary, skills with years. Skill changes mark the owner's cached
-matches stale, as for any candidate.
+matches stale, as for any candidate. **(Phase 6)** Only a visible change (name, email,
+headline/summary, skills or years) bumps the candidate's `updatedAt`; an identical save rescores
+nothing and keeps the owner's seeker explanations (`GET /profile/matches`) current. On later saves
+the candidate update first takes the candidate's match lock (`candidate_match:{id}`, as
+`PUT /candidates/{id}`); if it can't be taken within 10 s, nothing is saved and the answer is
+`503 SERVICE_BUSY` (+ `Retry-After: 2`).
 
 **Response `200`**:
 ```json
@@ -995,11 +1190,442 @@ flags new skills that look like existing ones.
 `resumeId`), `400 MALFORMED_REQUEST`, `409 EMAIL_ALREADY_EXISTS` on the first save when another
 candidate already uses this email (field `profile.email`: `"Candidate <id> already uses this
 email. Delete it or change its email, then save your profile again."`; the existing candidate is
-never adopted or merged).
+never adopted or merged), `503 SERVICE_BUSY` (+ `Retry-After: 2`, `"The server is busy with a
+conflicting update. Please try again in a few seconds."`) **(Phase 6)**.
 
 ### `GET /profile`
 The saved master profile (same body as the `PUT` response, `warnings: []`).
 **Errors:** `404 PROFILE_NOT_FOUND` ("You have not saved a profile yet. …")
+
+---
+
+## Applications (Phase 7)
+
+The **application tracker** plus **tailored documents**: for one job, the AI drafts a tailored CV
+and a cover letter from the confirmed master profile in the background; every version is
+grounding-checked, the owner edits and approves versions, downloads them as PDF or DOCX, and
+tracks the application to an offer or a rejection. All of these responses contain personal data.
+
+The typical sequence:
+1. `POST /applications {"jobId": "…", "generate": true}` → `201`, `latestGeneration.status: "PENDING"`;
+2. poll `GET /applications/{id}/generations/{genId}` until `SUCCEEDED` (20–30 minutes for both
+   documents with Ollama on a CPU; minutes with a GPU or a hosted provider);
+3. read `GET /applications/{id}/documents/{docId}`, edit if needed (`POST /applications/{id}/documents`),
+   then `POST …/documents/{docId}/approve`;
+4. download with `GET …/documents/{docId}/file?format=pdf` (or `docx`);
+5. `PUT /applications/{id}` with `status: "APPLIED"`: the tracker records the date and the
+   approved versions sent.
+
+Applications are created only by the owner, at most one per job; nothing is tracked
+automatically from matches or notifications, and `/profile/matches` is unchanged.
+
+### Application
+
+```json
+{
+  "id": "1b7e…", "jobId": "a71f…", "jobTitle": "Backend Engineer", "jobCompany": "Acme",
+  "jobUrl": "https://jobs.lever.co/acme/…", "jobExists": true, "jobClosed": false, "jobOrigin": "FEED",
+  "status": "APPLIED", "statusChangedAt": "2026-10-19T09:40:00Z", "appliedOn": "2026-10-19",
+  "notes": "Referred by …", "allowedTransitions": ["INTERVIEW", "OFFER", "REJECTED", "WITHDRAWN"],
+  "sentCv": { "id": "…", "version": 2 }, "sentCoverLetter": { "id": "…", "version": 1 },
+  "documents": {
+    "cv":          { "latest": { …DocumentSummary… }, "approved": { …DocumentSummary… }, "versions": 2 },
+    "coverLetter": { "latest": { … }, "approved": { … }, "versions": 1 }
+  },
+  "latestGeneration": { …Generation… },
+  "history": [ { "from": null, "to": "NEW", "forced": false, "at": "…" },
+               { "from": "NEW", "to": "APPLIED", "forced": false, "at": "…" } ],
+  "createdAt": "…", "updatedAt": "…"
+}
+```
+
+Field notes:
+- `jobTitle`, `jobCompany`, `jobUrl` are a **snapshot** taken at creation (`jobUrl` is the feed
+  job's primary URL, `null` for manual jobs). The application outlives the job: when the job is
+  deleted (feed jobs are deleted when orphaned), `jobId` becomes `null`, `jobExists: false`,
+  `jobOrigin: null`, and versions, files and history stay. A **closed** feed job (`jobClosed:
+  true`) can still be tailored.
+- `allowedTransitions`: the statuses reachable without `force`, in table order (below).
+- `sentCv` / `sentCoverLetter`: the versions recorded as sent (applied statuses only), or `null`.
+- `documents.*.latest` is the newest version of that kind, `approved` the newest approved one
+  (the "current" version), `versions` the count; `null`/`0` when there is none.
+- `latestGeneration`: the newest generation in any status, or `null`. `history`: status changes,
+  oldest first (`from: null` is the creation; `forced: true` was a `force` move).
+
+List item (`GET /applications`): `id`, `jobId`, `jobTitle`, `jobCompany`, `jobUrl`, `jobExists`,
+`status`, `appliedOn`, `latestCvVersion`, `latestCoverLetterVersion` (numbers or `null`),
+`approvedCv`, `approvedCoverLetter` (booleans: at least one approved version), `generationStatus`
+(the newest generation's status or `null`), `updatedAt`.
+
+### Tracker statuses
+
+`NEW`, `SHORTLISTED`, `APPLIED`, `INTERVIEW`, `OFFER`, `REJECTED`, `WITHDRAWN` (you pulled out
+after applying) and `DISMISSED` (not interested). Moves are enforced:
+
+| From | Allowed to |
+|---|---|
+| `NEW` | `SHORTLISTED`, `APPLIED`, `DISMISSED` |
+| `SHORTLISTED` | `NEW`, `APPLIED`, `DISMISSED` |
+| `APPLIED` | `INTERVIEW`, `OFFER`, `REJECTED`, `WITHDRAWN` |
+| `INTERVIEW` | `OFFER`, `REJECTED`, `WITHDRAWN` |
+| `OFFER` | `REJECTED`, `WITHDRAWN` |
+| `DISMISSED` | `NEW`, `SHORTLISTED` |
+| `REJECTED`, `WITHDRAWN` | none (terminal) |
+
+`force: true` allows any move, to correct a mistake, and is recorded in `history`. The applied
+statuses are `APPLIED`, `INTERVIEW`, `OFFER`, `REJECTED` and `WITHDRAWN`: they always have an
+`appliedOn`; the others never have an `appliedOn` or sent versions.
+
+### `POST /applications`
+Track a job, optionally generating its documents at once.
+
+```json
+{ "jobId": "a71f…", "status": "NEW", "notes": "…", "generate": true,
+  "kinds": ["CV", "COVER_LETTER"], "mentionNoticePeriod": false }
+```
+- `jobId` (required); `status`: `NEW` (default) or `SHORTLISTED`; `notes`: optional, at most
+  10000 characters (trimmed; blank = none).
+- `generate` (default `false`): also queue a generation (below) of `kinds` (default both) with
+  `mentionNoticePeriod`. `kinds` is validated even without `generate`.
+
+**Response `201`** the application + `Location: /api/applications/{id}`; with `generate`,
+`latestGeneration` is `PENDING`.
+
+**Errors:** `400 VALIDATION_FAILED`, `400 MALFORMED_REQUEST`, `404 PROFILE_NOT_FOUND` (only with
+`generate`, checked before the job; nothing is created), `404 JOB_NOT_FOUND`,
+`409 APPLICATION_ALREADY_EXISTS` ("This job is already tracked as application {id}. Open it with
+GET /api/applications/{id}.").
+
+### `GET /applications`
+The tracked applications, paged (`page`, `size` as in the conventions).
+
+| Param | Default | Allowed | Notes |
+|---|---|---|---|
+| `status` | all | status names, comma-separated and/or repeated (`status=NEW,APPLIED&status=OFFER`), case-insensitive; blank entries ignored | |
+| `sort` | `updated` | `updated`, `created` (case-insensitive) | newest first (`updatedAt` or `createdAt` desc) |
+
+**Errors:** `400 INVALID_PARAMETER` ("status must be a comma-separated list of NEW, SHORTLISTED,
+APPLIED, INTERVIEW, OFFER, REJECTED, WITHDRAWN, DISMISSED.", "sort must be updated or created.",
+the paging messages).
+
+### `GET /applications/{id}`
+One application. **Errors:** `400 INVALID_ID`, `404 APPLICATION_NOT_FOUND`
+
+### `PUT /applications/{id}`
+Change the status and the tracker fields, under the application row lock.
+
+```json
+{ "status": "APPLIED", "appliedOn": "2026-10-19", "notes": "…",
+  "sentCvId": "…", "sentCoverLetterId": "…", "force": false }
+```
+- `status` (required). Staying in the same status is always allowed; any other move follows the
+  table unless `force: true`.
+- `notes` is replaced: `null` (or blank) clears it.
+- **Entering an applied status** (from `NEW`, `SHORTLISTED` or `DISMISSED`): `appliedOn` defaults
+  to today in `talentmatch.applications.zone` (default `Africa/Johannesburg`); `sentCvId` and
+  `sentCoverLetterId` default to the newest **approved** version of each kind, or `null` if
+  there is none (applying without TalentMatch documents is fine).
+- **Staying in the applied statuses:** `appliedOn`, `sentCvId` or `sentCoverLetterId` left out
+  (or `null`) keeps the stored value; a value replaces it.
+- **Leaving the applied statuses** (only with `force`) clears `appliedOn` and both sent versions.
+- An explicit sent id must be a version of **this** application, of the right kind, and
+  approved.
+
+**Response `200`** the application.
+
+**Errors:** `400 VALIDATION_FAILED` (messages below), `400 INVALID_ID`, `404 APPLICATION_NOT_FOUND`,
+`409 INVALID_STATUS_TRANSITION` ("An application can't move from NEW to INTERVIEW. Allowed next:
+SHORTLISTED, APPLIED, DISMISSED. To correct a mistake, send force=true."), `503 SERVICE_BUSY`
+(+ `Retry-After: 2`, after a 10 s wait for the row lock; nothing saved).
+
+### `DELETE /applications/{id}`
+Delete the application in any status, with its document versions, files, generations and
+history. A generation running at that moment discards its result. **Response `204`**.
+**Errors:** `400 INVALID_ID`, `404 APPLICATION_NOT_FOUND`, `503 SERVICE_BUSY`
+
+### Tracker validation messages
+
+`400 VALIDATION_FAILED`, `field` = the request field:
+
+| Field | Message |
+|---|---|
+| `jobId` | "jobId is required." |
+| `status` (create) | "A new application starts as NEW or SHORTLISTED." |
+| `status` (update) | "status must be one of NEW, SHORTLISTED, APPLIED, INTERVIEW, OFFER, REJECTED, WITHDRAWN, DISMISSED." |
+| `appliedOn` | "appliedOn must be a date like 2026-10-19, not in the future and not before 2000-01-01." / "appliedOn can only be set once the application is APPLIED or later." |
+| `notes` | "Notes can be at most 10000 characters." |
+| `sentCvId`, `sentCoverLetterId` | "No CV version {id} in this application." (also for a version of the other kind) / "CV version {n} is not approved yet. Approve it first (POST /api/applications/{id}/documents/{docId}/approve) or choose an approved version." / "sentCvId can only be set once the application is APPLIED or later." (cover letter wording for `sentCoverLetterId`) |
+| `kinds` | "kinds must contain CV and/or COVER_LETTER, each at most once." (empty, duplicate or unknown values; case-insensitive) |
+
+### Generations
+
+#### `POST /applications/{id}/generations`
+Queue an AI generation of the application's documents.
+
+```json
+{ "kinds": ["CV", "COVER_LETTER"], "mentionNoticePeriod": false }
+```
+- `kinds`: default both; `CV` and/or `COVER_LETTER`, case-insensitive, each at most once.
+- `mentionNoticePeriod` (default `false`): append the fixed sentence "I am available to start
+  after a notice period of {n} days." to the letter, from `noticePeriodDays` in your preferences
+  (never written by the model). No preferences or no notice period → finding
+  `NOTICE_PERIOD_UNKNOWN` and no sentence.
+- The body may be omitted (both kinds).
+
+**Response `202`** the generation (`PENDING`) + `Location: /api/applications/{id}/generations/{genId}`.
+
+**Errors:** `400 VALIDATION_FAILED` (`kinds`), `404 APPLICATION_NOT_FOUND`,
+`409 DATA_CONFLICT` ("The job for this application no longer exists, so documents can't be
+tailored to it. Existing versions are kept."), `404 PROFILE_NOT_FOUND`,
+`409 GENERATION_IN_PROGRESS` ("A generation for this application is already RUNNING (generation
+{genId}). Wait for it with GET /api/applications/{id}/generations/{genId}."), `503 SERVICE_BUSY`.
+With AI disabled the request still returns `202`, and the generation becomes `FAILED/AI_DISABLED`.
+
+#### `GET /applications/{id}/generations/{genId}`
+
+```json
+{ "id": "…", "applicationId": "…", "status": "SUCCEEDED", "wantCv": true, "wantCoverLetter": true,
+  "failureReason": null, "hint": null, "model": "ollama/qwen2.5:7b-instruct", "profileVersion": 4,
+  "attempts": 1, "queuedAt": "…", "startedAt": "…", "finishedAt": "…",
+  "results": [ { "kind": "CV", "documentId": "…", "failureReason": null, "hint": null },
+               { "kind": "COVER_LETTER", "documentId": null, "failureReason": "INVALID_OUTPUT",
+                 "hint": "The model's answer couldn't be used (…). Generate again; …" } ] }
+```
+**Errors:** `400 INVALID_ID`, `404 GENERATION_NOT_FOUND`
+
+- `status`: `PENDING` (queued) → `RUNNING` (the model is writing) → `SUCCEEDED` (at least one
+  document stored) | `FAILED` (`failureReason` and `hint` set). One generation at a time per
+  application.
+- The CV is written first and stored as soon as it is done, so it can be read while the letter
+  is written. `results` has one entry per wanted kind once it is finished: the stored
+  `documentId`, or a per-kind `failureReason` and `hint`. One kind failing doesn't discard the
+  other: a stored CV with a failed letter is `SUCCEEDED`. When nothing is stored the generation is
+  `FAILED` with the CV's failure (the letter's if only the letter was wanted).
+- `profileVersion` is the owner profile version the run read when it started; the documents are
+  built from it.
+- A restart re-runs an unfinished generation and skips a kind it already stored; after 3
+  interrupted attempts it is `FAILED/TOO_MANY_ATTEMPTS`.
+
+| `failureReason` | Meaning (the `hint` says what to do) |
+|---|---|
+| `AI_DISABLED` | AI is off (`talentmatch.ai.enabled=false`) |
+| `TIMEOUT` | a model call took longer than `talentmatch.applications.generation.call-timeout` (45 min); on a CPU both documents take 20–30 minutes, keep the computer awake |
+| `PROVIDER_ERROR` | the model server couldn't be reached or failed (also: a database error while storing) |
+| `REFUSED` | the model stopped without finishing |
+| `INVALID_OUTPUT` | malformed or cut-off answer, or too much of it failed the grounding checks (below) |
+| `QUEUE_FULL` | too many generations waiting (queue of 10) |
+| `CONTEXT_OVERFLOW` | the profile and posting filled the model's context window; raise `talentmatch.ai.ollama.context-tokens` or lower `talentmatch.applications.generation.max-profile-chars` |
+| `TOO_MANY_ATTEMPTS` | interrupted 3 times (restarts or crashes); start a new generation |
+| `REMOTE_GENERATION_DISABLED` | the provider is hosted (`claude`/`openai` profile) and `talentmatch.applications.allow-remote-generation` is `false`, so nothing was sent; the default Ollama provider keeps the profile local |
+| `JOB_DELETED` | the job was deleted before the run |
+
+Only `TIMEOUT`, `PROVIDER_ERROR`, `REFUSED`, `INVALID_OUTPUT` and `CONTEXT_OVERFLOW` occur per
+kind.
+
+**What the model sees:** the job's title, company, required and nice-to-have skills and
+description (at most `max-job-chars`, 4000), and your profile as labelled facts (at most
+`max-profile-chars`, 12000): headline, summary, roles (title, employer, dates, technologies,
+highlights), projects, skills with years, certificate names and issuers, education and
+languages. **Never sent:** your name, email, phone, location, links, credential ids, certificate
+URLs, preferences or salary; the header, greeting and sign-off are added by the server. When the
+profile is longer than the budget, older highlights are left out (finding `PROFILE_TRUNCATED`).
+
+### Document versions
+
+Each kind (`CV`, `COVER_LETTER`) has immutable versions numbered 1, 2, 3, … per application:
+`source: "AI"` from a generation, `source: "EDIT"` from an owner edit (`basedOnId` = the version
+edited). A version is self-contained: it holds the facts copied from the profile version it was
+built from (`profileVersion`) plus the rewritten text.
+
+**DocumentSummary** (lists, and inside the application):
+```json
+{ "id": "…", "kind": "CV", "version": 2, "source": "EDIT", "basedOnId": "…", "profileVersion": 4,
+  "profileCurrent": true, "model": null, "createdAt": "…", "approvedAt": null,
+  "findingCounts": { "blocking": 0, "warning": 1, "info": 3 } }
+```
+
+**Document** (`GET …/documents/{docId}`): the summary plus `content`, `findings`,
+`approvalAcknowledged` (`null` until approved), `jobChanged`, `files` and `downloads`:
+```json
+{ "id": "…", "kind": "CV", "version": 1, "source": "AI", "basedOnId": null, "profileVersion": 4,
+  "profileCurrent": true, "model": "ollama/qwen2.5:7b-instruct", "createdAt": "…", "approvedAt": null,
+  "findingCounts": { "blocking": 0, "warning": 0, "info": 1 },
+  "content": {
+    "header": { "fullName": "Ada Lovelace", "email": "ada@example.com", "phone": "…", "location": "London, UK",
+                "links": [ { "label": "GitHub", "url": "https://github.com/ada" } ] },
+    "headline": "Backend engineer for payment platforms", "summary": "…",
+    "skills": ["Java", "PostgreSQL"],
+    "experience": [ { "ref": "E1", "title": "Senior Engineer", "company": "Acme", "location": "London",
+                      "startDate": "2021-03", "endDate": null, "current": true, "technologies": ["Java"],
+                      "highlights": [ { "ref": "E1.H2", "text": "Cut p95 latency by 40%" } ] } ],
+    "projects": [ { "ref": "P1", "name": "…", "description": "…", "technologies": [], "url": null, "highlights": [] } ],
+    "certifications": [ { "ref": "C1", "name": "AWS SAA", "issuer": "Amazon", "issued": "2023-05", "expires": null } ],
+    "education": [ { "ref": "D1", "institution": "…", "qualification": "BSc", "field": "Mathematics",
+                     "startDate": "2010", "endDate": "2013" } ],
+    "languages": [ { "name": "English", "level": "Native" } ] },
+  "findings": [ { "severity": "INFO", "code": "REVERTED", "path": "experience[0].highlights[1]", "value": "35%",
+                  "message": "…a number not in this point of your profile…" } ],
+  "approvalAcknowledged": null, "jobChanged": false, "files": [],
+  "downloads": { "pdf": "/api/applications/{id}/documents/{docId}/file?format=pdf",
+                 "docx": "/api/applications/{id}/documents/{docId}/file?format=docx" } }
+```
+A cover letter's `content` is `{ header, company, jobTitle, date, salutation, paragraphs[], closing,
+signature }`: `salutation` "Dear Hiring Manager,", `closing` "Kind regards,", `signature` your
+full name, `date` today in the configured zone, all set by the server.
+
+Field notes:
+- **Refs** (`E1`, `E1.H2`, `P1`, `P1.H1`, `C1`, `D1`) point into the profile version: roles,
+  role highlights, projects, project highlights, certifications, education, in profile order.
+- `findings[]`: `{severity, code, path, value, message}`; `path` points into `content`, `value` is
+  the offending token only (`"40%"`, `"Kubernetes"`), never a sentence. Codes below.
+- `profileCurrent: false` when the profile was saved again after this version was built; the
+  version then also carries the computed `BLOCKING` finding `PROFILE_CHANGED` (first in
+  `findings`, counted in `findingCounts`).
+- `jobChanged: true` when the job still exists and was updated after the version was built
+  (informational only).
+- `files`: `["PDF", "DOCX"]` once approved, else `[]`.
+
+#### `GET /applications/{id}/documents`
+The versions, newest first. `kind=CV|COVER_LETTER` (optional, case-insensitive) narrows it.
+**Response `200`** `[DocumentSummary]`. **Errors:** `400 INVALID_PARAMETER` ("kind must be CV or
+COVER_LETTER."), `404 APPLICATION_NOT_FOUND`
+
+#### `GET /applications/{id}/documents/{docId}`
+**Response `200`** Document. **Errors:** `400 INVALID_ID`, `404 APPLICATION_NOT_FOUND`,
+`404 DOCUMENT_NOT_FOUND`
+
+#### `POST /applications/{id}/documents`
+Save your edit of a version as a new version of the same kind.
+
+```json
+{ "basedOn": "…docId…", "content": { …the base's content, edited… } }
+```
+Edit rules:
+- `content` has the same shape as the base's `content` (unknown or wrong-typed fields inside it
+  are `400 MALFORMED_REQUEST`, path `content.…`).
+- **Facts are read-only:** the header, titles, companies, locations, dates, `current`,
+  technologies, project names, descriptions and URLs, certification and education fields and
+  languages must equal the profile version's values (compared after trimming and collapsing
+  whitespace). To change a fact, change your profile (`PUT /profile`) and generate again.
+- Every role and every education entry stays, roles in profile order; projects and
+  certifications may be dropped or reordered. Every highlight keeps a ref of its own role or
+  project; skills must be profile skills (stored in the profile's spelling, duplicates removed).
+- Limits: highlights 1..400 characters, headline at most 120, summary at most 900. Letters: 1..8
+  paragraphs of at most 1500 characters and at most 600 words; `company`, `jobTitle`, `date`,
+  `salutation`, `closing` and `signature` stay as in the base.
+- Changed free text gets the same fact checks as AI text, but findings on your own text are
+  `WARNING`, never `BLOCKING`. The new version keeps the base's `profileVersion`.
+
+**Response `201`** the new Document + `Location: /api/applications/{id}/documents/{docId}`.
+
+**Errors:** `400 VALIDATION_FAILED`, `400 MALFORMED_REQUEST`, `404 APPLICATION_NOT_FOUND`,
+`503 SERVICE_BUSY` (+ `Retry-After: 2`; the application row lock is taken before validating).
+Validation messages (`field` as shown):
+
+| Field | Message |
+|---|---|
+| `basedOn` | "basedOn is required." / "No version {id} in this application." |
+| `content` | "content is required." |
+| `content.experience[0].title` (any read-only fact) | "content.experience[0].title can't be changed here: it comes from your profile (version 4). Change it with PUT /api/profile, then generate again." |
+| `content.company`, `content.jobTitle`, `content.date`, `content.salutation`, `content.closing` | "content.salutation can't be changed here: it is set by TalentMatch for this application." (`content.signature` uses the profile message) |
+| `content.experience` | "content.experience: every role from your profile stays in the CV, in profile order (E1, E2, E3)." |
+| `content.education` | "content.education: every education entry from your profile stays in the CV." |
+| `content.projects[1].ref` | "content.projects[1].ref 'P9' is not in profile version 4." / "… is listed twice." / "… is required." |
+| `content.experience[0].highlights[2].ref` | "content.experience[0].highlights[2].ref 'E2.H1' belongs to another role." |
+| `content.skills[3]` | "content.skills[3]: 'Kubernetes' is not in your profile skills. Add it to your profile first." |
+| `content.experience[0].highlights[1].text` | "content.experience[0].highlights[1].text must be 1 to 400 characters." |
+| `content.headline`, `content.summary` | "content.summary must be at most 900 characters." (120 for the headline) |
+| `content.paragraphs` | "content.paragraphs must have 1 to 8 paragraphs of at most 1500 characters, 600 words in total." |
+
+#### `POST /applications/{id}/documents/{docId}/approve`
+Approve a version for sending.
+
+```json
+{ "acknowledgeFindings": true }
+```
+- A version with a `BLOCKING` finding (including the computed `PROFILE_CHANGED`) needs
+  `acknowledgeFindings: true`; otherwise `409 FINDINGS_NOT_ACKNOWLEDGED` ("This version has 2
+  finding(s) that need your review (PROFILE_CHANGED, NUMBER_NOT_IN_PROFILE). Read them, then approve
+  again with acknowledgeFindings=true."). The body may be omitted (`false`).
+- The PDF and DOCX are rendered (no draft footer) and stored together with the approval, so an
+  approved version always has both files and downloads return those exact bytes from then on.
+- The approval is recorded once (`approvedAt`, `approvalAcknowledged`). Approving an approved
+  version returns `200` and changes nothing (no acknowledgement needed). There is no un-approve:
+  approve a newer version instead. Several versions may be approved; the newest is "current".
+
+**Response `200`** Document. **Errors:** `400 INVALID_ID`, `404 APPLICATION_NOT_FOUND`,
+`404 DOCUMENT_NOT_FOUND`, `409 FINDINGS_NOT_ACKNOWLEDGED`, `503 SERVICE_BUSY`
+
+#### `GET /applications/{id}/documents/{docId}/file`
+`format=pdf|docx` (default `pdf`, case-insensitive). An approved version returns the bytes stored
+at approval. An unapproved version is rendered now as a **draft**: every page has the footer
+"DRAFT – not approved in TalentMatch" and the file name ends in `-draft`.
+
+`Content-Type` `application/pdf` or
+`application/vnd.openxmlformats-officedocument.wordprocessingml.document`;
+`Content-Disposition: attachment` with a UTF-8 `filename*` (`"CV - {fullName} - {company}[-draft].pdf"`
+or `"Cover letter - …"`, unsafe characters removed, at most 150 characters);
+`X-Content-Type-Options: nosniff`.
+
+Layout: one fixed, single-column, ATS-friendly A4 layout per kind (Noto Sans, headings and
+bullets; no tables, columns or images). PDFs embed the font; DOCX files name it, and Word
+substitutes a similar font when it is missing.
+
+**Errors:** `400 INVALID_PARAMETER` ("format must be pdf or docx."), `400 INVALID_ID`,
+`404 APPLICATION_NOT_FOUND`, `404 DOCUMENT_NOT_FOUND`
+
+### Grounding in plain words
+
+Tailored documents may select, reorder and reword what is in the profile version, never add to
+it.
+- **The CV is built by reference.** The model returns only refs, skill names and reworded texts
+  (headline, summary, highlights). Every fact (titles, employers, dates, project, certificate and
+  education names, the contact header) is copied by the server from the profile version, so roles,
+  projects, certificates and dates can't be invented. Every role and education entry is always
+  included, in profile order; the model picks and orders 2–5 highlights per role (at most 6 are
+  kept), up to 4 projects, certifications and up to 20 skills.
+- **Fabricated structure is dropped** (`INFO`): an unknown or repeated ref, a highlight under the
+  wrong role, a skill not in the profile. A role left without highlights gets its first 2
+  original highlights (`ROLE_DEFAULTED`); no skill left → the profile's skills, the job's first
+  (`SKILLS_DEFAULTED`).
+- **A failed CV claim is reverted** (`REVERTED`, `INFO`) to the profile's wording: a highlight
+  with a number not in **that** highlight or a skill not in that highlight or its role, a
+  headline or summary with a number or skill not in the profile, or contact details. So an AI CV
+  never contains an unverifiable fact; the repairs are listed.
+- **A failed cover-letter sentence is kept and flagged** `BLOCKING` (it can't be reverted): a
+  number, vocabulary skill or year (19xx/20xx) not in the profile (numbers in the job title and
+  company are allowed), or an email, URL or phone number. Approving needs an acknowledgement.
+- **Numbers** are compared exactly after canonicalising: `10,000` = `10000`; `40%` = `40 percent`
+  = `40 per cent`; `5+` = `5`; "two" … "twenty" = digits. No rounding and no unit conversion
+  (`$1.2M` is not `1,200,000`). A profile number counts only as a whole token: "12,000" allows
+  12000, not 12 or 000. Years must be years of the profile's dates; the summary may also use the
+  career span in whole years, and the letter also each role's duration in whole years. Digits
+  inside an allowed skill name ("HTML5") don't count.
+- **The whole answer is rejected** (`INVALID_OUTPUT`, nothing stored for that kind) when it is
+  unparseable; for the CV, when more than half of the model's items (at least 4) had to be dropped
+  or reverted, or it returned no role at all; for the letter, when it has no paragraphs, fewer
+  than half the minimum or more than 1.5 × the maximum words, or more than half of its paragraphs
+  have a `BLOCKING` finding.
+- If the skill vocabulary can't be loaded, the skill checks fail closed: CV texts are reverted,
+  letter paragraphs flagged.
+
+| Code | Severity | When |
+|---|---|---|
+| `UNKNOWN_REF`, `DUPLICATE_REF` | INFO | an unknown, hidden or repeated ref was dropped |
+| `SKILL_NOT_IN_PROFILE` | INFO (CV skills list) | a skill not in the profile was dropped |
+| `ROLE_DEFAULTED`, `SKILLS_DEFAULTED` | INFO | the profile's originals were used |
+| `REVERTED` | INFO | a CV text failed a check and was reverted (the message names the reason) |
+| `PROFILE_TRUNCATED` | INFO | older highlights weren't shown to the model (long profile) |
+| `NOTICE_PERIOD_UNKNOWN` | INFO | `mentionNoticePeriod` without a notice period in your preferences |
+| `HEAVILY_REWORDED` | WARNING | under 50% of a rewritten highlight's content words come from the original, its role or the job |
+| `UNKNOWN_NAME` | WARNING | a capitalised word in the letter that the profile and the job don't contain |
+| `LENGTH` | WARNING | headline/summary cut, or the letter outside `min-words`..`max-words` (180..350) |
+| `NUMBER_NOT_IN_PROFILE`, `SKILL_NOT_IN_PROFILE`, `YEAR_NOT_IN_PROFILE`, `CONTACT_DETAILS` | BLOCKING in AI letters, WARNING in edits | free text states something the profile doesn't |
+| `PROFILE_CHANGED` | BLOCKING (computed when read) | the profile was saved again after this version |
+
+Limits of the heuristics (PRODUCTION_READINESS section 10): skills outside the vocabulary,
+spelled-out numbers above twenty, and a rewording that changes the meaning with the same words
+can't be detected; `UNKNOWN_NAME` is a capitalisation heuristic.
 
 ---
 
@@ -1044,9 +1670,10 @@ exception class names or SQL.
 | 400 | `VALIDATION_FAILED` | request body field(s) invalid (unknown/duplicate skill, length, email, years, ...) |
 | 400 | `INVALID_PARAMETER` | query parameter out of range or wrong type |
 | 400 | `INVALID_ID` | path id is not a UUID (`"'abc' is not a valid id. Ids look like 3f2c0e9a-…"`) |
-| 400 | `MALFORMED_REQUEST` | body is not valid JSON, has an unknown field, or a field has the wrong type |
+| 400 | `MALFORMED_REQUEST` | body is not valid JSON, has an unknown field, or a field has the wrong type (**(Phase 7)** also inside a document edit's `content`, with the field path prefixed `content.`) |
 | 400 | `RESUME_UNREADABLE` | uploaded PDF can't be read (damaged, protected, scanned, too many pages, too slow) **(Phase 4)** |
 | 404 | `CANDIDATE_NOT_FOUND` / `JOB_NOT_FOUND` / `SKILL_NOT_FOUND` / `RECOMPUTE_RUN_NOT_FOUND` / `RESUME_NOT_FOUND` / `PROFILE_NOT_FOUND` / `PREFERENCES_NOT_FOUND` / `SKILL_ALIAS_NOT_FOUND` / `FEED_SOURCE_NOT_FOUND` | resource missing |
+| 404 | `APPLICATION_NOT_FOUND` / `DOCUMENT_NOT_FOUND` / `GENERATION_NOT_FOUND` | application, document version or generation missing ("No application with id ….", "Application … has no document version ….", "Application … has no generation ….") **(Phase 7)** |
 | 404 | `ENDPOINT_NOT_FOUND` | no such endpoint (`"No endpoint GET /api/foo."`) |
 | 405 | `METHOD_NOT_ALLOWED` | wrong HTTP method (`Allow` header lists the supported ones) |
 | 413 | `PAYLOAD_TOO_LARGE` | uploaded CV over the size limit **(Phase 4)** |
@@ -1057,14 +1684,18 @@ exception class names or SQL.
 | 409 | `RESUME_EXTRACTION_IN_PROGRESS` | the CV is queued or being read **(Phase 4)** |
 | 409 | `FEED_POLL_IN_PROGRESS` | the feed source is being polled right now **(Phase 5)** |
 | 409 | `FEED_DISABLED` | the job feed is switched off (`FEED_ENABLED=false`) **(Phase 5)** |
-| 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job within the regenerate window (`Retry-After: n`) **(extension, Phase 3)** |
+| 409 | `APPLICATION_ALREADY_EXISTS` | the job is already tracked; the message names the existing application **(Phase 7)** |
+| 409 | `INVALID_STATUS_TRANSITION` | the tracker status move isn't allowed (the message lists the allowed next statuses; `force=true` corrects a mistake) **(Phase 7)** |
+| 409 | `GENERATION_IN_PROGRESS` | the application already has a `PENDING` or `RUNNING` generation (the message names it) **(Phase 7)** |
+| 409 | `FINDINGS_NOT_ACKNOWLEDGED` | approving a version with a `BLOCKING` finding without `acknowledgeFindings=true` **(Phase 7)** |
+| 429 | `REGENERATE_RATE_LIMITED` | `regenerate=true` repeated for a job (`/jobs/{id}/matches`) or, **(Phase 6)**, for a candidate (`/candidates/{id}/matches`, `/profile/matches`) within the regenerate window (`Retry-After: n`); the message names the job or the candidate **(extension, Phase 3)** |
 | 409 | `NOTIFICATION_NOT_CONFIGURED` | `POST /notifications/test` while email isn't configured **(Phase 5)** |
 | 429 | `FEED_POLL_RATE_LIMITED` | a poll on request within 60 s of the source's last poll (`Retry-After: n`) **(Phase 5)** |
 | 429 | `FEED_LOOKUP_RATE_LIMITED` | a company lookup while another runs, or within 10 s of the last one (`Retry-After: n`) **(Phase 5)** |
 | 429 | `NOTIFICATION_TEST_RATE_LIMITED` | a test email within 30 s of the last attempt, failed attempts included (`Retry-After: n`) **(Phase 5)** |
 | 502 | `NOTIFICATION_DELIVERY_FAILED` | the test email couldn't be delivered; the message names the cause, host:port and the SMTP code, never the server's reply text or a credential. The only 502 in the API; a container-level 502 on `/error` still reports `INTERNAL_ERROR` **(Phase 5)** |
-| 503 | `MATCHES_BUSY` | another request is recomputing this job's matches (`Retry-After: 2`); `/jobs/{id}/matches` and `/matches/**` only |
-| 503 | `SERVICE_BUSY` | any other endpoint lost a lock conflict with a concurrent update; nothing was saved, retry (`Retry-After: 2`) **(Phase 5)** |
+| 503 | `MATCHES_BUSY` | another request is recomputing these matches (`Retry-After: 2`); `/jobs/{id}/matches`, `/matches/**` and, **(Phase 6)**, `/candidates/{id}/matches` and `/profile/matches` (with the candidate message "Matches for this candidate are being recalculated by another request. Please try again in a few seconds.") only |
+| 503 | `SERVICE_BUSY` | any other endpoint lost a lock conflict with a concurrent update; nothing was saved, retry (`Retry-After: 2`) **(Phase 5)**. Phase 6: also `PUT /jobs/{id}`, `PUT /candidates/{id}` and `PUT /profile` after a 10 s wait for a match lock. **(Phase 7)** also `/applications/**` writes (`PUT`, `DELETE`, generation requests, edits, approvals) after a 10 s wait for the application row lock |
 | 503 | `DATABASE_UNAVAILABLE` | database unreachable (`Retry-After: 5`) |
 | 503 | `UPLOAD_BUSY` | every PDF reader is busy; retry the upload in a minute **(Phase 4)** |
 | 500 | `INTERNAL_ERROR` | unexpected; message includes the request id to quote |
@@ -1080,5 +1711,8 @@ exception class names or SQL.
 - Pagination and filtering are included from the start rather than added later, since
   retrofitting pagination onto an existing API is a common real-world pain point.
 - No authentication: single owner, not public yet (see `PRODUCTION_READINESS.md`, section 6).
-  The `/api/profile/**` endpoints return personal data; the server binds to `127.0.0.1` by
-  default for that reason.
+  The `/api/profile/**` and (Phase 7) `/api/applications/**` endpoints return personal data;
+  the server binds to `127.0.0.1` by default for that reason.
+- Tailored documents (Phase 7) are generated in the background like CV extraction, never on a
+  request thread: the request returns `202` with a pollable generation, and a restart re-runs
+  unfinished work.

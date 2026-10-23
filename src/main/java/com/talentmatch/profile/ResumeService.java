@@ -1,6 +1,7 @@
 package com.talentmatch.profile;
 
 import com.talentmatch.service.FieldErrors;
+import com.talentmatch.service.FileNames;
 import com.talentmatch.service.exception.ApiException;
 import com.talentmatch.service.exception.ConflictException;
 import com.talentmatch.service.exception.NotFoundException;
@@ -13,7 +14,6 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Locale;
 import java.util.UUID;
-import java.util.regex.Pattern;
 import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -25,9 +25,6 @@ import org.springframework.web.multipart.MultipartFile;
 public class ResumeService {
 
     public static final String PDF = "application/pdf";
-
-    /** Control and format characters (bidi overrides such as U+202E can disguise "cv.exe"), quotes, slashes. */
-    private static final Pattern UNSAFE_NAME = Pattern.compile("[\\p{Cntrl}\\p{Cf}\"\\\\/]");
 
     private final ResumeRepository repository;
     private final ResumeTextExtractor textExtractor;
@@ -151,18 +148,11 @@ public class ResumeService {
     static String fileName(String original) {
         String name = original == null ? "" : original;
         int slash = Math.max(name.lastIndexOf('/'), name.lastIndexOf('\\'));
-        name = UNSAFE_NAME.matcher(name.substring(slash + 1)).replaceAll("").strip();
+        name = FileNames.stripUnsafe(name.substring(slash + 1));
         if (name.isEmpty()) {
             return "cv.pdf";
         }
-        if (name.length() <= 255) {
-            return name;
-        }
-        int start = name.length() - 255;
-        if (Character.isLowSurrogate(name.charAt(start))) {
-            start++; // never keep half of a surrogate pair
-        }
-        return name.substring(start);
+        return FileNames.keepEnd(name, 255); // never keeps half of a surrogate pair
     }
 
     static String sha256(byte[] bytes) {

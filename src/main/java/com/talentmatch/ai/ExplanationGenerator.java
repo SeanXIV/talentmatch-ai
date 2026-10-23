@@ -25,6 +25,14 @@ import org.springframework.dao.DataAccessException;
  * Runs one explanation generation on the AI executor: model call, finish-reason check,
  * validation, guarded persist (autocommit, outside any request transaction), circuit-breaker
  * bookkeeping, metrics and one INFO log line. Never logs prompt contents, names or keys at INFO.
+ * The task's {@link Audience} picks the assistant and the storage columns, and tags the timer
+ * ({@code audience}) and the log line.
+ *
+ * <p>SEEKER outputs pass one more gate after validation: the {@link ExplanationGroundingCheck}
+ * (Phase 6 §4.5). A rejection is {@link FailureKind#INVALID_OUTPUT} (template, nothing stored, the
+ * circuit records a success). The check fails closed: without a check, or if it throws, every
+ * SEEKER output is rejected. Without a {@link SeekerExplanationAssistant} (the Phase 3 constructors),
+ * SEEKER tasks fail with INVALID_OUTPUT without calling a model or touching the circuit.
  *
  * <p>Only created when AI is enabled (see {@code AiConfiguration}).
  */
@@ -38,18 +46,28 @@ public class ExplanationGenerator {
      * One unit of work.
      *
      * @param prompt    the exact user message
-     * @param inputHash {@link ExplanationInputHasher#hash(String)} of {@code prompt}
+     * @param inputHash {@link ExplanationInputHasher#hash(Audience, String)} of {@code prompt}
+     * @param audience  who the explanation is for (assistant, storage columns, metric/log tag)
      */
-    public record GenerationTask(JobContext job, MatchContext match, String prompt, String inputHash) {
+    public record GenerationTask(JobContext job, MatchContext match, String prompt, String inputHash,
+                                 Audience audience) {
         public GenerationTask {
             Objects.requireNonNull(job, "job");
             Objects.requireNonNull(match, "match");
             Objects.requireNonNull(prompt, "prompt");
             Objects.requireNonNull(inputHash, "inputHash");
+            Objects.requireNonNull(audience, "audience");
+        }
+
+        /** A RECRUITER task (Phase 3 shape). */
+        public GenerationTask(JobContext job, MatchContext match, String prompt, String inputHash) {
+            this(job, match, prompt, inputHash, Audience.RECRUITER);
         }
     }
 
     private final ExplanationAssistant assistant;
+    private final SeekerExplanationAssistant seekerAssistant; // null: SEEKER tasks fail closed
+    private final ExplanationGroundingCheck groundingCheck;   // null: SEEKER outputs are rejected
     private final MatchExplanationValidator validator;
     private final MatchJdbcRepository repository;
     private final AiCircuitBreaker circuit;
@@ -65,11 +83,32 @@ public class ExplanationGenerator {
         this(assistant, validator, repository, circuit, modelInfo, executor, clock, meterRegistry, null);
     }
 
-    /** @param gate shared with CV extraction when the model is local (Ollama); null otherwise */
+    /**
+     * Recruiter-only generator (Phase 3 shape): SEEKER tasks fail closed.
+     *
+     * @param gate shared with CV extraction when the model is local (Ollama); null otherwise
+     */
     public ExplanationGenerator(ExplanationAssistant assistant, MatchExplanationValidator validator,
                                 MatchJdbcRepository repository, AiCircuitBreaker circuit, ModelInfo modelInfo,
                                 Executor executor, Clock clock, MeterRegistry meterRegistry, LocalModelGate gate) {
+        this(assistant, null, null, validator, repository, circuit, modelInfo, executor, clock, meterRegistry, gate);
+    }
+
+    /**
+     * Both audiences.
+     *
+     * @param seekerAssistant the seeker AI service; null makes every SEEKER task fail closed
+     * @param groundingCheck  the seeker free-text check; null makes every SEEKER output rejected
+     * @param meterRegistry   null to use {@link Metrics#globalRegistry}
+     * @param gate            shared with CV extraction when the model is local (Ollama); null otherwise
+     */
+    public ExplanationGenerator(ExplanationAssistant assistant, SeekerExplanationAssistant seekerAssistant,
+                                ExplanationGroundingCheck groundingCheck, MatchExplanationValidator validator,
+                                MatchJdbcRepository repository, AiCircuitBreaker circuit, ModelInfo modelInfo,
+                                Executor executor, Clock clock, MeterRegistry meterRegistry, LocalModelGate gate) {
         this.gate = gate;
+        this.seekerAssistant = seekerAssistant;
+        this.groundingCheck = groundingCheck;
         this.assistant = Objects.requireNonNull(assistant, "assistant");
         this.validator = Objects.requireNonNull(validator, "validator");
         this.repository = Objects.requireNonNull(repository, "repository");
@@ -94,22 +133,28 @@ public class ExplanationGenerator {
      * is then already completed with {@link GenerationOutcome.Rejected}.
      */
     public CompletableFuture<GenerationOutcome> submit(GenerationTask task) {
+        if (!wired(task.audience())) {
+            return CompletableFuture.completedFuture(notWired(task));
+        }
         try {
             return CompletableFuture.supplyAsync(() -> run(task), executor);
         } catch (RejectedExecutionException e) { // includes Spring's TaskRejectedException
-            log.warn("AI executor is full; explanation for candidate {} / job {} not generated",
-                    task.match().candidateId(), task.job().jobId());
-            recordTimer("rejected", 0L);
+            log.warn("AI executor is full; {} explanation for candidate {} / job {} not generated",
+                    task.audience().tag(), task.match().candidateId(), task.job().jobId());
+            recordTimer(task.audience(), "rejected", 0L);
             return CompletableFuture.completedFuture(new GenerationOutcome.Rejected());
         }
     }
 
-    /** Runs the task on the calling thread. Never throws. */
+    /** Runs the task on the calling thread. Never throws (except {@link Error}s). */
     GenerationOutcome run(GenerationTask task) {
+        if (!wired(task.audience())) {
+            return notWired(task);
+        }
         if (gate != null && !gate.tryAcquireShared()) {
-            log.info("AI explanation job={} candidate={} outcome=local_model_busy (a CV is being read)",
-                    task.job().jobId(), task.match().candidateId());
-            recordTimer("rejected", 0L);
+            log.info("AI explanation job={} candidate={} audience={} outcome=local_model_busy (a CV is being read)",
+                    task.job().jobId(), task.match().candidateId(), task.audience().tag());
+            recordTimer(task.audience(), "rejected", 0L);
             return new GenerationOutcome.Rejected(); // AI_BUSY; not a provider failure
         }
         try {
@@ -127,10 +172,11 @@ public class ExplanationGenerator {
         TokenUsage usage = null;
         try {
             if (log.isDebugEnabled()) {
-                log.debug("AI explanation request job={} candidate={} promptChars={}",
-                        task.job().jobId(), task.match().candidateId(), task.prompt().length());
+                log.debug("AI explanation request job={} candidate={} audience={} promptChars={}",
+                        task.job().jobId(), task.match().candidateId(), task.audience().tag(),
+                        task.prompt().length());
             }
-            Result<MatchExplanation> result = assistant.explain(task.prompt());
+            Result<MatchExplanation> result = callAssistant(task);
             usage = result == null ? null : result.tokenUsage();
             outcome = evaluate(task, result, elapsedMs(t0));
         } catch (RuntimeException e) {
@@ -144,6 +190,61 @@ public class ExplanationGenerator {
             finish(task, outcome, usage);
         }
         return outcome;
+    }
+
+    /** The audience's assistant (SEEKER is only reached when {@link #wired} is true). */
+    private Result<MatchExplanation> callAssistant(GenerationTask task) {
+        return switch (task.audience()) {
+            case RECRUITER -> assistant.explain(task.prompt());
+            case SEEKER -> seekerAssistant.explain(task.prompt());
+        };
+    }
+
+    /** True if this generator has an assistant for the audience. */
+    private boolean wired(Audience audience) {
+        return audience != Audience.SEEKER || seekerAssistant != null;
+    }
+
+    /**
+     * Fail-closed outcome for an audience without an assistant: INVALID_OUTPUT (template
+     * GENERATION_FAILED), with no model call, no executor slot and no circuit-breaker bookkeeping.
+     */
+    private GenerationOutcome notWired(GenerationTask task) {
+        log.warn("AI explanation job={} candidate={} audience={} outcome=invalid_output (no assistant configured)",
+                task.job().jobId(), task.match().candidateId(), task.audience().tag());
+        try {
+            recordTimer(task.audience(), FailureKind.INVALID_OUTPUT.tag(), 0L);
+        } catch (RuntimeException e) {
+            log.debug("Could not record AI metrics", e);
+        }
+        return new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, 0L);
+    }
+
+    /**
+     * The SEEKER free-text gate (Phase 6 §4.5). Fails closed: no check, or a check that throws,
+     * rejects. Logs never contain the output text.
+     */
+    private boolean grounded(GenerationTask task, MatchExplanation value) {
+        if (groundingCheck == null) {
+            log.warn("AI {} explanation for candidate {} / job {} rejected: no grounding check is configured",
+                    task.audience().tag(), task.match().candidateId(), task.job().jobId());
+            return false;
+        }
+        boolean accepted;
+        try {
+            accepted = groundingCheck.accept(value, task.match().evaluation(), task.job().title(),
+                    task.job().company());
+        } catch (RuntimeException e) {
+            log.warn("AI {} explanation for candidate {} / job {} rejected: the grounding check failed ({})",
+                    task.audience().tag(), task.match().candidateId(), task.job().jobId(),
+                    e.getClass().getSimpleName());
+            return false;
+        }
+        if (!accepted) {
+            log.info("AI {} explanation for candidate {} / job {} rejected by the grounding check",
+                    task.audience().tag(), task.match().candidateId(), task.job().jobId());
+        }
+        return accepted;
     }
 
     private GenerationOutcome evaluate(GenerationTask task, Result<MatchExplanation> result, long latencyMs) {
@@ -162,6 +263,9 @@ public class ExplanationGenerator {
             return new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, latencyMs);
         }
         MatchExplanation value = valid.get();
+        if (task.audience() == Audience.SEEKER && !grounded(task, value)) {
+            return new GenerationOutcome.Failure(FailureKind.INVALID_OUTPUT, latencyMs);
+        }
         // PostgreSQL timestamptz keeps microseconds; truncate so this response and later reads agree
         Instant generatedAt = clock.instant().truncatedTo(ChronoUnit.MICROS);
         boolean persisted = persist(task, value, generatedAt);
@@ -171,17 +275,18 @@ public class ExplanationGenerator {
     private boolean persist(GenerationTask task, MatchExplanation value, Instant generatedAt) {
         MatchContext m = task.match();
         try {
-            int rows = repository.saveExplanation(task.job().jobId(), m.candidateId(), m.storedScore(),
-                    m.candidateUpdatedAt(), task.job().updatedAt(), value.explanation(),
+            int rows = repository.saveExplanation(task.audience().target(), task.job().jobId(), m.candidateId(),
+                    m.storedScore(), m.candidateUpdatedAt(), task.job().updatedAt(), value.explanation(),
                     ExplanationPayloadCodec.toJson(value), task.inputHash(), modelInfo.label(), generatedAt);
             if (rows == 0) {
-                log.info("AI explanation for candidate {} / job {} not stored: the candidate, job or score "
-                        + "changed while it was generated", m.candidateId(), task.job().jobId());
+                log.info("AI {} explanation for candidate {} / job {} not stored: the candidate, job or score "
+                        + "changed while it was generated", task.audience().tag(), m.candidateId(),
+                        task.job().jobId());
             }
             return rows > 0;
         } catch (DataAccessException e) {
-            log.warn("Could not store AI explanation for candidate {} / job {}: {}",
-                    m.candidateId(), task.job().jobId(), e.getClass().getSimpleName());
+            log.warn("Could not store AI {} explanation for candidate {} / job {}: {}",
+                    task.audience().tag(), m.candidateId(), task.job().jobId(), e.getClass().getSimpleName());
             return false;
         }
     }
@@ -206,21 +311,22 @@ public class ExplanationGenerator {
             latencyMs = 0L;
         }
         try {
-            recordTimer(outcomeTag, latencyMs);
+            recordTimer(task.audience(), outcomeTag, latencyMs);
         } catch (RuntimeException e) {
             log.debug("Could not record AI metrics", e);
         }
-        log.info("AI explanation job={} candidate={} provider={} model={} outcome={} latencyMs={} "
+        log.info("AI explanation job={} candidate={} audience={} provider={} model={} outcome={} latencyMs={} "
                         + "inputTokens={} outputTokens={}",
-                task.job().jobId(), task.match().candidateId(), modelInfo.provider().id(), modelInfo.modelName(),
-                outcomeTag, latencyMs,
+                task.job().jobId(), task.match().candidateId(), task.audience().tag(), modelInfo.provider().id(),
+                modelInfo.modelName(), outcomeTag, latencyMs,
                 usage == null ? null : usage.inputTokenCount(),
                 usage == null ? null : usage.outputTokenCount());
     }
 
-    private void recordTimer(String outcomeTag, long latencyMs) {
+    private void recordTimer(Audience audience, String outcomeTag, long latencyMs) {
         Timer.builder(TIMER)
                 .description("AI explanation generations")
+                .tag("audience", audience.tag())
                 .tag("provider", modelInfo.provider().id())
                 .tag("model", modelInfo.modelName())
                 .tag("outcome", outcomeTag)

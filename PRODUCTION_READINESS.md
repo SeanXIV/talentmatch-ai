@@ -170,7 +170,11 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Now (Phase 3):** `GET /jobs/{id}/matches` waits for the page's explanations up to a
     request budget (`talentmatch.ai.request-budget`, 8s default) on a bounded in-process
     executor (`aiExecutor`); unfinished generations keep running in the background, persist
-    themselves, and the item is reported `PENDING` ("reload in a few seconds").
+    themselves, and the item is reported `PENDING` ("reload in a few seconds"). Since Phase 6
+    two audiences share that one executor (2 threads, queue 20), circuit and `LocalModelGate`:
+    recruiter explanations (`/jobs/{id}/matches`) and seeker explanations
+    (`/candidates/{id}/matches`, `/profile/matches`) compete for it; a full queue gives the
+    `AI_BUSY` template.
   - **Production:** a real queue/worker with persisted job state, and polling or SSE so the
     frontend refreshes without a full reload.
   - **Why:** LLM latency must not block or time out the match endpoint, and background work
@@ -199,8 +203,8 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **When:** before first prod deploy.
 
 - [ ] **Cost caps and quotas**
-  - **Now (dev):** only the per-job regenerate rate limit, top-N and the executor size bound
-    spend.
+  - **Now (dev):** only the per-job and (Phase 6) per-candidate regenerate rate limits, top-N
+    and the executor size bound spend.
   - **Production:** monthly cost caps and per-tenant quotas with alerts.
   - **When:** before enabling a paid provider in production.
 
@@ -214,7 +218,15 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Now (dev):** hosted profiles send the candidate's name and summary (never the email)
     to OpenAI/Anthropic; data is synthetic. Ollama keeps everything local. From Phase 4 this
     is the owner's own CV: sending it to a hosted provider is the owner's choice (decide per
-    feature: CV extraction and tailoring send far more than a name and summary).
+    feature: CV extraction and tailoring send far more than a name and summary). Phase 6 seeker
+    explanations send the owner's profile headline and summary (no name, no email) when a
+    hosted provider is configured. **Phase 7** tailoring sends the whole profile minus contact
+    data (headline, summary, roles with employers, dates and highlights, projects, skills with
+    years, certificate names and issuers, education, languages; never the name, email, phone,
+    location, links, credential ids, certificate URLs, preferences or salary) plus the job posting,
+    and only with `talentmatch.applications.allow-remote-generation=true` (default `false`; without
+    it a hosted provider is never called and the generation is `FAILED/REMOTE_GENERATION_DISABLED`).
+    Consent is per feature: this flag is separate from Phase 4's `allow-remote-extraction`.
   - **Production:** DPA with the provider, candidate consent, data-residency review, or
     pseudonymize names before sending.
   - **When:** before using real candidate data with a hosted provider.
@@ -270,6 +282,43 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     update or delete (API and ETL alike; no-op ETL reruns bump nothing). A row is stale
     when `computed_at < GREATEST(candidate.updated_at, job.updated_at)` (`DATA_MODEL.md`).
   - **Why:** without it, persisted matches silently go out of date.
+
+- [x] **Manual job edits race with match scoring** (fixed in Phase 6)
+  - **Was:** `PUT /api/jobs/{id}` replaced `job_skill` without the job's match lock, so a
+    concurrent scorer could read the old skills and then write a score whose `computed_at` made
+    it look fresh.
+  - **Now:** `JobService.update` takes `job_match:{id}` as its first statement (the lock every
+    match writer uses); a 10 s wait ends in `503 SERVICE_BUSY` with nothing saved. Candidate
+    edits (`PUT /api/candidates/{id}`, the owner sync in `PUT /api/profile`) take the new
+    `candidate_match:{id}` lock, which candidate-side scoring takes before its job locks
+    (`DATA_MODEL.md`, "Advisory locks on matches"). Job create and delete don't lock (nothing
+    stale can be written for a job that doesn't exist yet; delete cascades the rows).
+
+- [ ] **Job-side GET is not serialized with candidate edits** (known gap, Phase 6)
+  - **Now:** `GET /api/jobs/{id}/matches` holds only the job lock, not the candidates' locks, so
+    a candidate edit committing while it scores can leave that candidate's row scored from the
+    old skills but with a `computed_at` that looks fresh (the V2 triggers stamp transaction start).
+    `?regenerate=true` repairs it; the candidate side is not affected (it takes the candidate lock).
+  - **Production:** switch the V2 triggers to `clock_timestamp()`, or re-check
+    `candidate.updated_at` under the lock before the upsert.
+  - **When:** with the trigger follow-up migration.
+
+- [ ] **Candidate and skill deletes take no advisory lock** (known gap, Phase 6)
+  - **Now:** `DELETE /api/candidates/{id}` and skill deletes (which cascade to `candidate_skill`,
+    `job_skill` and `job_match`) take row locks only. Racing a scoring transaction they can
+    deadlock; PostgreSQL aborts one side, which surfaces as `503 MATCHES_BUSY` (matches) or
+    `503 SERVICE_BUSY` (the delete). Retrying succeeds; no data is wrong.
+  - **Production:** take `candidate_match:{id}` (and, for skills, the affected job locks in uuid
+    order) first in those deletes.
+  - **When:** before concurrent multi-user editing.
+
+- [ ] **Explanation validator doesn't reject closing tags** (known gap, Phase 6)
+  - **Now:** `MatchExplanationValidator` rejects echoes of opening tags (`<job_description`,
+    `<candidate_summary`, `<profile_summary`) and section names, but not closing tags
+    (`</profile_summary>`, `</candidate_summary>`, `</job_description>`). Output is plain JSON
+    text and never rendered as HTML by the API, so the risk is a cosmetic leak of a tag.
+  - **Production:** reject `</…>` forms too (with the prompt-injection review, section 4).
+  - **When:** before first prod deploy.
 
 ## 6. API, security & UX
 
@@ -541,6 +590,38 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **Why:** a wrong guess either misses a company or watches the wrong one.
   - **When:** if missed or wrong boards show up in practice.
 
+- [ ] **Candidate-side rescoring cost**
+  - **Now (Phase 6):** `GET /api/candidates/{id}/matches` scores the stale in-scope jobs on read,
+    in chunks of 200 (`talentmatch.matches.rescore-chunk`), one transaction each with the
+    candidate lock plus one advisory lock per job. A first read for a new candidate over
+    thousands of feed jobs takes many lock round trips; above 10 000 targets one WARN is logged.
+    Feed jobs already scored for the owner by the processor are reused.
+  - **Production:** score feed jobs for all candidates in the background, or paginate in SQL
+    over a materialized ranking.
+  - **Why:** the first request for a candidate must not take seconds or hold hundreds of locks.
+  - **When:** before more than one real candidate uses the feed.
+
+- [ ] **Seeker explanation grounding is heuristic**
+  - **Now (Phase 6):** `SeekerGroundingCheck` rejects the whole seeker explanation when it names
+    a vocabulary skill that isn't on the job, a number not in the match facts, or claims a
+    missing skill ("you have …") without a negation. Skills outside the vocabulary, spelled-out
+    numbers and subtler polarity can't be detected. A reject shows the template
+    (`GENERATION_FAILED`). Recruiter explanations still get only the Phase 3 checks.
+  - **Production:** the golden set (section 4, "Offline model evaluation") covering both
+    audiences; stricter free-text grounding for recruiter explanations.
+  - **Why:** "never invent" is the product promise.
+  - **When:** before relying on seeker explanations day to day.
+
+- [ ] **`listedAt` is approximate**
+  - **Now (Phase 6):** `listedAt` (for `postedSince` and `sort=newest`) is the earlier of the
+    provider's posting date and the first-seen time, or the first-seen time when the provider
+    gives no date, or `created_at` for MANUAL jobs. Baseline feed jobs (already open when their
+    source was added) without a provider date are undated: excluded by `postedSince`, last in
+    `newest`.
+  - **Production:** good enough; revisit if providers' dates prove unreliable.
+  - **Why:** "new jobs" is only as good as the dates behind it.
+  - **When:** if the newest list looks wrong in practice.
+
 - [ ] **Uploaded CV files**
   - **Now (Phase 4):** built. PDF only, at most 5 MB (`talentmatch.profile.max-resume-bytes`;
     Spring's multipart limits 6/7 MB sit above it so our 413 message wins, and
@@ -554,20 +635,81 @@ shortcuts we took on purpose, written down so they don't get forgotten.
   - **When:** before first prod deploy.
 
 - [ ] **Never-invent check on tailored documents**
-  - **Now (dev):** not built yet.
-  - **Production:** a grounding validator rejects any role, skill, certificate, date or
-    number not in the confirmed master profile, plus a golden-set evaluation before
-    changing models or prompts (section 4, "Offline model evaluation").
+  - **Now (Phase 7):** built (`com.talentmatch.application.tailoring`; `ARCHITECTURE.md`, "Never
+    invent in tailored documents"). The CV is assembled **by reference**: the model returns
+    profile refs, skill names and reworded texts, and the server copies every fact (titles,
+    employers, dates, project, certificate and education names, contact header) from the profile
+    version, so roles, projects, certificates and dates can't be invented. Every role and
+    education entry is always included. Unknown or duplicate refs, highlights under the wrong role
+    and skills not in the profile are dropped; a CV text with a number not in that highlight, a
+    skill outside its role or contact details is reverted to the profile's wording (INFO
+    findings). A cover-letter paragraph with a number, skill or year not in the profile, or
+    contact details, is kept and flagged BLOCKING, and approval needs an explicit acknowledgement.
+    Numbers are exact after canonicalising (no rounding, no unit conversion) and compared as
+    whole tokens. Owner edits are re-checked (WARNING only) and can't change facts. **Limits of
+    the heuristics:** spelled-out numbers above twenty (and "one", which is mostly a pronoun) are
+    not checked; a rewording that changes the meaning with the same words passes (the 50%
+    word-overlap `HEAVILY_REWORDED` warning catches only heavy rewrites); `UNKNOWN_NAME` is a
+    capitalisation heuristic (false positives on ordinary capitalised words, misses lower-case
+    names); skills outside the skill vocabulary (no name or alias in the `skill` table) can't be
+    detected. Unit tests cover the heuristics; there is no evaluation set.
+  - **Production:** the golden set (section 4, "Offline model evaluation") with grounding and
+    rejection-rate metrics for tailored CVs and letters, run before changing models or prompts.
   - **Why:** a fabricated claim on a real application damages the owner's credibility.
-  - **When:** Phase 7.
+  - **When:** golden set before relying on unreviewed drafts or switching models.
 
-- [ ] **Model choice for CV extraction and tailoring**: OPEN DECISION
-  - **Now (dev):** local `qwen2.5:7b-instruct` on CPU (~1.7 tokens/s, see section 4 "Local
-    model needs real hardware"): a full CV or cover letter would take many minutes, and a
-    7B model's writing quality may not be good enough for applications.
-  - **Production:** decide per feature between a GPU-backed local model and a hosted
-    provider (quality and speed vs. cost and sending the CV off the machine).
-  - **When:** before Phase 7 (extraction in Phase 4 can run async on the local model).
+- [ ] **Model choice for CV extraction and tailoring** (DECIDED 2026-10-19, Phase 7 decision c)
+  - **Now (dev):** provider-agnostic, with local Ollama (`qwen2.5:7b-instruct`) as the default, so
+    the CV and profile never leave the machine. A hosted provider (`claude`/`openai` profile) is
+    used for extraction only with `allow-remote-extraction` and for tailoring only with
+    `talentmatch.applications.allow-remote-generation=true`. On this CPU (~1.7 tokens/s) a CV
+    takes 20–40 minutes to read, and a tailored CV plus cover letter 20–30 minutes (CV ~15–20,
+    letter ~5–10; `talentmatch.applications.generation.call-timeout` 45m per call, at most 2h),
+    so both run in the background; the 7B model's writing may be weak. That trade-off is the
+    owner's.
+  - **Production:** a GPU-backed local model, or a hosted provider with its DPA (section 4).
+  - **When:** when drafting quality or speed becomes the bottleneck.
+
+- [ ] **Single-instance, in-process generation queue**
+  - **Now (Phase 7):** tailoring runs on one in-process thread (`applicationExecutor`, queue 10;
+    a full queue gives `FAILED/QUEUE_FULL`). State lives in the `application_generation` row: a
+    shutdown leaves the interrupted generation `RUNNING`, and `GenerationRecovery` puts `RUNNING`
+    rows back to `PENDING` and re-queues every `PENDING` row on start; a kind already stored is
+    skipped. Each claim counts an attempt; after 3 the generation is `FAILED/TOO_MANY_ATTEMPTS`.
+    At most one active generation per application (`uq_application_generation_active`). Two app
+    instances would both reset and re-queue the same rows (claims are guarded, so each runs once
+    at a time, but recovery could reset a row another instance is processing).
+  - **Production:** a real queue/worker with leases and heartbeats, or one designated worker
+    instance (as for CV extraction, section 11).
+  - **When:** before running more than one instance.
+
+- [ ] **Generated documents render untrusted text**
+  - **Now (Phase 7):** PDFs (PDFBox 3) and DOCX files (Apache POI XWPF) are rendered in the
+    app's JVM from the version's content, which includes model output and owner edits. Bounds:
+    highlights ≤ 400 characters, summary ≤ 900, letters ≤ 8 paragraphs and 600 words; control
+    characters and XML-invalid characters are stripped, characters the font can't encode become
+    "?"; a rendered file over 5 MB fails (CHECK on `application_document_file`) with a 500. Plain
+    text only: no scripts, links, images, fields or external references are written (URLs from
+    the profile header appear as text). Approved files are rendered once and stored; drafts are
+    rendered on the request thread for each download.
+  - **Production:** rate-limit draft downloads once more than the owner can reach the API; render
+    in a resource-limited worker if documents ever come from untrusted users.
+  - **Why:** rendering is CPU and memory work driven by text the app doesn't fully control.
+  - **When:** before going public (section 6).
+
+- [ ] **Fonts and licences**
+  - **Now (Phase 7):** Noto Sans Regular and Bold (static, hinted TTFs from the notofonts project)
+    are bundled in `src/main/resources/fonts` with their licence (`OFL.txt`, SIL Open Font
+    Licence 1.1), and embedded as subsets in every PDF. DOCX files name the font without
+    embedding it. Apache POI (`poi-ooxml` with `poi-ooxml-full`, 5.4.1) and PDFBox are
+    Apache-2.0; POI's `log4j-api` routes through Boot's `log4j-to-slf4j` and `log4j-core` is
+    excluded. Nothing copyleft ships in the jar (iText, OpenPDF and openhtmltopdf were rejected
+    for that reason). The jar grows noticeably, mostly from POI's full OOXML schema jar (needed
+    for page setup and numbering, which `poi-ooxml-lite` doesn't guarantee).
+  - **Production:** keep `OFL.txt` next to the fonts in every distribution (including the Docker
+    image, Phase 9); recheck licences when adding a dependency (`mvn dependency:tree`).
+  - **Why:** licence compliance for a distributed artefact.
+  - **When:** Phase 9 (image), and on every new dependency.
 
 ## 11. Master profile and CV extraction (Phase 4)
 
@@ -576,9 +718,14 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     (`resume.content`, `bytea`), its full text (`resume.extracted_text`), the AI draft
     (`resume.draft`, `jsonb`), the confirmed profile (`owner_profile.profile`) and every earlier
     confirmed version (`owner_profile_version`, append-only), plus name,
-    email and summary in the owner's `candidate` row. The dev Docker volume therefore holds real
+    email and summary in the owner's `candidate` row. **Phase 7** adds the tailored CV and
+    cover-letter versions (`application_document.content`, `jsonb`, append-only), the PDF and DOCX
+    files stored at approval (`application_document_file.content`, `bytea`, append-only) and the
+    tracker notes (`application.notes`). The dev Docker volume therefore holds real
     PII, which section 1 otherwise forbids. Uploads can be deleted
     (`DELETE /api/profile/resume/{id}`); the confirmed profile has no delete endpoint yet.
+    Document versions and files can't be deleted one by one: only deleting the whole application
+    (`DELETE /api/applications/{id}`) removes them, by cascade.
   - **Production:** encryption at rest (disk/RDS, or column-level for `content` and
     `extracted_text`), backups covered by the retention policy, a "delete my profile" action,
     and never restoring a production dump into dev.
@@ -652,7 +799,9 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     counting an attempt) while a CV extraction holds the model. A timeout or provider error
     pauses the enrichment stage for `failure-backoff` (5 min) without feeding the explanation
     circuit breaker. At ~2–3 minutes per posting on this CPU, enrichment and explanations queue
-    behind each other.
+    behind each other. **Phase 7** adds a fourth: a tailoring generation holds the model
+    exclusively, like an extraction, for its 20–30 minutes (same `num_ctx`; a startup check
+    refuses a context that can't hold the tailoring prompt).
   - **Production:** a GPU host, or separate model servers for interactive explanations and
     batch extraction.
   - **Why:** one CPU-bound model can't serve both without starving one of them.
@@ -697,8 +846,9 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     Not checked: location, languages, credential ids; word-level checks miss changed meaning
     with the same words, and numbers are matched anywhere in the CV, not in context.
   - **Production:** a golden-set evaluation of extraction (section 4, "Offline model
-    evaluation"), and the stricter Phase 7 validator for tailored documents.
-  - **When:** before Phase 7.
+    evaluation"). Phase 7's stricter validator (numbers checked per highlight, as whole tokens)
+    covers tailored documents only; the CV extraction check is unchanged.
+  - **When:** before relying on drafts without review.
 
 - [ ] **Near-duplicate skills**
   - **Now (dev):** saving a profile with `createMissingSkills=true` warns (does not block) when
@@ -730,7 +880,10 @@ shortcuts we took on purpose, written down so they don't get forgotten.
     (`spring.datasource.hikari.data-source-properties.logServerErrorDetail: false`, which also
     hides row details for non-profile errors). The profile code and the 500 handler for
     `/api/profile` log exception class names (plus SQLState) only, never messages, because
-    model parse errors quote the model's output.
+    model parse errors quote the model's output. Phase 7 follows the same rule: tracker,
+    generation and document logs carry ids, kinds, statuses, counts, latencies and tokens only,
+    never notes, document text, findings' values, job descriptions, prompts or file names (they
+    contain the owner's name).
   - **Production:** structured logging with a PII scrubber and a test that scans captured
     logs for CV content.
   - **When:** before first prod deploy.

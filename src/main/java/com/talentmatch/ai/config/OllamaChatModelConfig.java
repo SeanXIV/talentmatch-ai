@@ -2,6 +2,8 @@ package com.talentmatch.ai.config;
 
 import com.talentmatch.ai.AiProperties;
 import com.talentmatch.ai.LocalModelGate;
+import com.talentmatch.application.tailoring.ApplicationProperties;
+import com.talentmatch.application.tailoring.TailoringModel;
 import com.talentmatch.feed.skills.JobSkillExtractionModel;
 import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.profile.ProfileProperties;
@@ -58,6 +60,42 @@ public class OllamaChatModelConfig {
         }
         return new JobSkillExtractionModel(build(ai.ollama(), e.callTimeout(), e.maxOutputTokens(), e.temperature()),
                 ModelInfo.of(ai).label(), ai.ollama().contextTokens(), true);
+    }
+
+    /**
+     * Same model for tailored CVs and cover letters (Phase 7): the generation timeout, output budget and
+     * temperature, same num_ctx. Local, so the profile stays on this machine (decision c).
+     */
+    @Bean
+    public TailoringModel ollamaTailoringModel(AiProperties ai, ApplicationProperties applications) {
+        requireTailoringBudget(ai.ollama(), applications);
+        ApplicationProperties.Generation g = applications.generation();
+        return new TailoringModel(build(ai.ollama(), g.callTimeout(), g.maxOutputTokens(), g.temperature()),
+                ModelInfo.of(ai).label(), ai.ollama().contextTokens(), true);
+    }
+
+    /**
+     * Fails startup when the context window cannot hold the profile and posting budgets plus prompt and
+     * answer: Ollama would otherwise silently drop part of the profile.
+     */
+    static void requireTailoringBudget(AiProperties.Ollama ollama, ApplicationProperties applications) {
+        int required = applications.requiredContextTokens();
+        if (required <= ollama.contextTokens()) {
+            return;
+        }
+        ApplicationProperties.Generation g = applications.generation();
+        throw new AiConfigurationException(
+                "talentmatch.ai.ollama.context-tokens is " + ollama.contextTokens() + ", but tailoring needs at "
+                        + "least " + required + " ((talentmatch.applications.generation.max-profile-chars "
+                        + g.maxProfileChars() + " + talentmatch.applications.generation.max-job-chars "
+                        + g.maxJobChars() + ") / " + ApplicationProperties.CHARS_PER_TOKEN + " + "
+                        + ApplicationProperties.PROMPT_OVERHEAD_TOKENS
+                        + " prompt + talentmatch.applications.generation.max-output-tokens "
+                        + g.maxOutputTokens() + ").",
+                "Raise talentmatch.ai.ollama.context-tokens to at least " + required + " (uses more memory), or "
+                        + "lower talentmatch.applications.generation.max-profile-chars, "
+                        + "talentmatch.applications.generation.max-job-chars or "
+                        + "talentmatch.applications.generation.max-output-tokens.");
     }
 
     /** Fails startup when the context window cannot hold the longest posting text plus prompt and answer. */

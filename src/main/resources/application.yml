@@ -61,6 +61,7 @@ talentmatch:
   matches:
     default-limit: 10
     max-limit: 100
+    rescore-chunk: 200          # jobs scored per transaction on the candidate side (1..1000)
   recompute:
     history-size: 20
     max-failures-reported: 50
@@ -172,5 +173,19 @@ talentmatch:
       connection-timeout: 10s
       read-timeout: 10s
       write-timeout: 10s
+
+  # Tailored applications and the tracker (Phase 7, com.talentmatch.application.tailoring.ApplicationProperties).
+  applications:
+    allow-remote-generation: false    # true = send the profile (roles, highlights) to the claude/openai provider
+    zone: Africa/Johannesburg         # appliedOn default and cover-letter date
+    generation:
+      call-timeout: 45m               # per model call (1s..2h); CPU-only Ollama: CV ~15-20 min, letter ~5-10 min
+      max-output-tokens: 2048         # 512..16384; Claude gets at least 16000 (adaptive thinking)
+      temperature: 0.2                # Ollama/OpenAI; ignored for Claude
+      max-profile-chars: 12000        # PROFILE FACTS budget (1000..60000)
+      max-job-chars: 4000             # job description budget (500..20000)
+    cover-letter:
+      min-words: 180                  # 50..600, min < max
+      max-words: 350
 
 logging.pattern.level: "%5p [%X{requestId:-}]"
