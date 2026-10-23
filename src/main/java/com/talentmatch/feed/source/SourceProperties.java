@@ -5,6 +5,7 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.Locale;
 import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.boot.context.properties.bind.ConstructorBinding;
 import org.springframework.boot.context.properties.bind.DefaultValue;
 import org.springframework.validation.annotation.Validated;
 
@@ -15,6 +16,7 @@ import org.springframework.validation.annotation.Validated;
  * {@code FeedProperties}. The two bind disjoint keys under the same prefix.
  *
  * @param maxPostingsPerSource a listing with more postings fails with INVALID_RESPONSE (runaway data)
+ * @param adzuna               the aggregator (decision c): host, keys, query shape and daily budget
  */
 @Validated
 @ConfigurationProperties("talentmatch.feed")
@@ -23,19 +25,27 @@ public record SourceProperties(
         @DefaultValue @Valid Http http,
         @DefaultValue @Valid Greenhouse greenhouse,
         @DefaultValue @Valid Lever lever,
-        @DefaultValue @Valid Ashby ashby) {
+        @DefaultValue @Valid Ashby ashby,
+        @DefaultValue @Valid Adzuna adzuna) {
 
+    @ConstructorBinding
     public SourceProperties {
         requireRange("talentmatch.feed.max-postings-per-source", maxPostingsPerSource, 1, 50_000);
         http = http == null ? Http.defaults() : http;
         greenhouse = greenhouse == null ? Greenhouse.defaults() : greenhouse;
         lever = lever == null ? Lever.defaults() : lever;
         ashby = ashby == null ? Ashby.defaults() : ashby;
+        adzuna = adzuna == null ? Adzuna.defaults() : adzuna;
+    }
+
+    /** Step-4 shape (no Adzuna settings); Adzuna takes its defaults (no keys: not configured). */
+    public SourceProperties(int maxPostingsPerSource, Http http, Greenhouse greenhouse, Lever lever, Ashby ashby) {
+        this(maxPostingsPerSource, http, greenhouse, lever, ashby, null);
     }
 
     /** All defaults (the public provider hosts). */
     public static SourceProperties defaults() {
-        return new SourceProperties(5000, null, null, null, null);
+        return new SourceProperties(5000, null, null, null, null, null);
     }
 
     /**
@@ -125,6 +135,71 @@ public record SourceProperties(
 
         public static Ashby defaults() {
             return new Ashby(URI.create("https://api.ashbyhq.com"));
+        }
+    }
+
+    /**
+     * Adzuna search API (§4.2.4, §4.3, decision c). The keys travel in the URL query, so
+     * {@link #toString()} masks the key and no log line ever holds a full URL.
+     *
+     * @param baseUrl            API host
+     * @param appId              {@code ADZUNA_APP_ID}; blank = the aggregator is not configured
+     * @param appKey             {@code ADZUNA_APP_KEY} (secret); blank = not configured
+     * @param country            Adzuna country code of every query, e.g. {@code za}
+     * @param resultsPerPage     results per request (1..50)
+     * @param maxDaysOld         only ads at most this many days old (1..30)
+     * @param dailyRequestBudget requests per UTC day across all Adzuna sources, probes included (1..10000)
+     * @param derivedQueries     at most this many queries derived from the target titles (0..10)
+     * @param unseenCloseAfter   an Adzuna posting not seen for this long is closed (1d..90d)
+     */
+    public record Adzuna(
+            @DefaultValue("https://api.adzuna.com") URI baseUrl,
+            @DefaultValue("") String appId,
+            @DefaultValue("") String appKey,
+            @DefaultValue("za") String country,
+            @DefaultValue("50") int resultsPerPage,
+            @DefaultValue("2") int maxDaysOld,
+            @DefaultValue("200") int dailyRequestBudget,
+            @DefaultValue("3") int derivedQueries,
+            @DefaultValue("14d") Duration unseenCloseAfter) {
+
+        public Adzuna {
+            baseUrl = requireBaseUrl("talentmatch.feed.adzuna.base-url", baseUrl == null
+                    ? URI.create("https://api.adzuna.com") : baseUrl);
+            appId = appId == null ? "" : appId.strip();
+            appKey = appKey == null ? "" : appKey.strip();
+            country = country == null ? "" : country.strip().toLowerCase(Locale.ROOT);
+            if (!country.matches("^[a-z]{2}$")) {
+                throw new IllegalArgumentException("talentmatch.feed.adzuna.country is '" + country
+                        + "' but must be a two-letter Adzuna country code, e.g. za");
+            }
+            requireRange("talentmatch.feed.adzuna.results-per-page", resultsPerPage, 1, 50);
+            requireRange("talentmatch.feed.adzuna.max-days-old", maxDaysOld, 1, 30);
+            requireRange("talentmatch.feed.adzuna.daily-request-budget", dailyRequestBudget, 1, 10_000);
+            requireRange("talentmatch.feed.adzuna.derived-queries", derivedQueries, 0, 10);
+            unseenCloseAfter = unseenCloseAfter == null ? Duration.ofDays(14) : unseenCloseAfter;
+            if (unseenCloseAfter.compareTo(Duration.ofDays(1)) < 0 || unseenCloseAfter.compareTo(Duration.ofDays(90)) > 0) {
+                throw new IllegalArgumentException("talentmatch.feed.adzuna.unseen-close-after is " + unseenCloseAfter
+                        + " but must be between P1D and P90D");
+            }
+        }
+
+        public static Adzuna defaults() {
+            return new Adzuna(URI.create("https://api.adzuna.com"), "", "", "za", 50, 2, 200, 3, Duration.ofDays(14));
+        }
+
+        /** Both keys are set. */
+        public boolean configured() {
+            return !appId.isEmpty() && !appKey.isEmpty();
+        }
+
+        /** Never prints the key (it is a secret) and prints the id only as set / not set. */
+        @Override
+        public String toString() {
+            return "Adzuna[baseUrl=" + baseUrl + ", appId=" + (appId.isEmpty() ? "" : "****") + ", appKey="
+                    + (appKey.isEmpty() ? "" : "****") + ", country=" + country + ", resultsPerPage=" + resultsPerPage
+                    + ", maxDaysOld=" + maxDaysOld + ", dailyRequestBudget=" + dailyRequestBudget
+                    + ", derivedQueries=" + derivedQueries + ", unseenCloseAfter=" + unseenCloseAfter + "]";
         }
     }
 

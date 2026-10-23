@@ -222,4 +222,88 @@ class FeedPropertiesTest {
         assertThatThrownBy(() -> new FeedProperties.Processor(null, 50, Duration.ofHours(1).plusSeconds(1)))
                 .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("processor.retry-delay");
     }
+
+    @Test
+    void aggregatorIntervalSharesTheDailyBudget() {
+        FeedProperties.Intervals i = FeedProperties.Intervals.defaults();
+        assertThat(FeedProperties.Intervals.budgetSeconds(0, 200)).isZero();
+        assertThat(FeedProperties.Intervals.budgetSeconds(3, 200)).isEqualTo(1296);       // 21.6 min
+        assertThat(FeedProperties.Intervals.budgetSeconds(1, 7)).isEqualTo(12_343);        // rounded up
+        assertThat(FeedProperties.Intervals.budgetSeconds(500, 1)).isEqualTo(86_400);      // capped at 24h
+        assertThat(i.effectiveSeconds(SourceKind.ADZUNA, null, 1, 200)).isEqualTo(900);   // default wins
+        assertThat(i.effectiveSeconds(SourceKind.ADZUNA, null, 4, 200)).isEqualTo(1728);
+        assertThat(i.effectiveSeconds(SourceKind.ADZUNA, 3600, 4, 200)).isEqualTo(3600);
+        assertThat(i.effectiveSeconds(SourceKind.LEVER, null, 50, 1)).isEqualTo(300);     // ATS never shares
+    }
+
+    // ------------------------------------------------------------------ step 12: lookup
+
+    @Test
+    void lookupDefaultsWithEveryConstructor() {
+        FeedProperties.Lookup d = FeedProperties.Lookup.defaults();
+        assertThat(d.budget()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(d.minInterval()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(d.maxCandidates()).isEqualTo(3);
+        assertThat(FeedProperties.defaults().lookup()).isEqualTo(d);
+        assertThat(new FeedProperties(Intervals.defaults(), Duration.ofSeconds(10)).lookup()).isEqualTo(d);
+        assertThat(new FeedProperties(true, null, null, Duration.ofSeconds(10), null, null, null).lookup())
+                .as("step-6 constructor").isEqualTo(d);
+        FeedProperties.Processor custom = new FeedProperties.Processor(Duration.ofSeconds(5), 10, Duration.ofSeconds(2));
+        FeedProperties eight = new FeedProperties(true, null, null, Duration.ofSeconds(10), null, null, null, custom);
+        assertThat(eight.lookup()).as("step-7 (8-arg) constructor").isEqualTo(d);
+        assertThat(eight.processor()).isEqualTo(custom);
+        assertThat(new FeedProperties(true, null, null, Duration.ofSeconds(10), null, null, null, null, null).lookup())
+                .as("canonical, null lookup").isEqualTo(d);
+        FeedProperties.Lookup l = new FeedProperties.Lookup(Duration.ofSeconds(3), Duration.ZERO, 5);
+        assertThat(new FeedProperties(true, null, null, Duration.ofSeconds(10), null, null, null, null, l).lookup())
+                .isEqualTo(l);
+        FeedProperties.Lookup nulls = new FeedProperties.Lookup(null, null, 2);
+        assertThat(nulls.budget()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(nulls.minInterval()).isEqualTo(Duration.ofSeconds(10));
+        assertThat(nulls.maxCandidates()).isEqualTo(2);
+    }
+
+    @Test
+    void lookupRanges() {
+        // inclusive bounds
+        FeedProperties.Lookup low = new FeedProperties.Lookup(Duration.ofSeconds(1), Duration.ZERO, 1);
+        assertThat(low.budget()).isEqualTo(Duration.ofSeconds(1));
+        FeedProperties.Lookup high = new FeedProperties.Lookup(Duration.ofSeconds(60), Duration.ofMinutes(10), 5);
+        assertThat(high.minInterval()).isEqualTo(Duration.ofMinutes(10));
+        assertThatThrownBy(() -> new FeedProperties.Lookup(Duration.ofMillis(999), null, 3))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("talentmatch.feed.lookup.budget");
+        assertThatThrownBy(() -> new FeedProperties.Lookup(Duration.ofSeconds(61), null, 3))
+                .isInstanceOf(IllegalArgumentException.class).hasMessageContaining("talentmatch.feed.lookup.budget");
+        assertThatThrownBy(() -> new FeedProperties.Lookup(null, Duration.ofSeconds(-1), 3))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("talentmatch.feed.lookup.min-interval");
+        assertThatThrownBy(() -> new FeedProperties.Lookup(null, Duration.ofMinutes(10).plusSeconds(1), 3))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("talentmatch.feed.lookup.min-interval");
+        assertThatThrownBy(() -> new FeedProperties.Lookup(null, null, 0))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("talentmatch.feed.lookup.max-candidates");
+        assertThatThrownBy(() -> new FeedProperties.Lookup(null, null, 6))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("talentmatch.feed.lookup.max-candidates");
+    }
+
+    private static FeedProperties bind(java.util.Map<String, String> values) {
+        return new org.springframework.boot.context.properties.bind.Binder(
+                new org.springframework.boot.context.properties.source.MapConfigurationPropertySource(values))
+                .bindOrCreate("talentmatch.feed", FeedProperties.class);
+    }
+
+    @Test
+    void lookupBindsFromKebabCaseAndDefaultsWhenAbsent() {
+        assertThat(bind(java.util.Map.of()).lookup()).isEqualTo(FeedProperties.Lookup.defaults());
+        FeedProperties p = bind(java.util.Map.of("talentmatch.feed.lookup.budget", "3s",
+                "talentmatch.feed.lookup.min-interval", "0s", "talentmatch.feed.lookup.max-candidates", "5"));
+        assertThat(p.lookup()).isEqualTo(new FeedProperties.Lookup(Duration.ofSeconds(3), Duration.ZERO, 5));
+        FeedProperties partial = bind(java.util.Map.of("talentmatch.feed.lookup.budget", "4s"));
+        assertThat(partial.lookup()).isEqualTo(new FeedProperties.Lookup(Duration.ofSeconds(4), Duration.ofSeconds(10), 3));
+        assertThatThrownBy(() -> bind(java.util.Map.of("talentmatch.feed.lookup.max-candidates", "9")))
+                .hasRootCauseInstanceOf(IllegalArgumentException.class)
+                .rootCause().hasMessageContaining("talentmatch.feed.lookup.max-candidates");
+    }
 }

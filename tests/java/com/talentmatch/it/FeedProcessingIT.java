@@ -4,7 +4,6 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.within;
 
 import com.talentmatch.support.AbstractFeedProcessingIT;
-import com.talentmatch.support.StubNotifier;
 import java.sql.Timestamp;
 import java.time.Duration;
 import java.time.Instant;
@@ -220,7 +219,7 @@ class FeedProcessingIT extends AbstractFeedProcessingIT {
 
     @Test
     void unconfiguredChannelQueuesNothingAndLogsOneLine(CapturedOutput output) {
-        StubNotifier.CONFIGURED.set(false);
+        emailNotConfigured();
         skills("Java", "SQL");
         profile("Java", "SQL");
         notifications(true, 0.6);

@@ -4,6 +4,7 @@ import com.talentmatch.domain.scoring.MatchEvaluation;
 import com.talentmatch.feed.skills.SkillDictionary;
 import com.talentmatch.notify.Channel;
 import com.talentmatch.notify.NotificationChannels;
+import com.talentmatch.notify.NotificationDispatcher;
 import com.talentmatch.notify.NotificationRepository;
 import com.talentmatch.notify.NotificationSettingsRepository;
 import com.talentmatch.preferences.FeedFacts;
@@ -42,8 +43,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  *   <li>{@link FeedScorer}: the owner's score with the existing scoring, when an owner profile exists
  *       and the job has skills;</li>
  *   <li>the notifiable rule ({@link Notifiability}): a PENDING {@code feed_notification} row
- *       ({@code ON CONFLICT DO NOTHING}, at most one per job, ever). Sending is the dispatcher's job
- *       (step 8);</li>
+ *       ({@code ON CONFLICT DO NOTHING}, at most one per job, ever). Sending is the
+ *       {@link NotificationDispatcher}'s job; it is woken after the job's transaction commits;</li>
  *   <li>{@code process_after = NULL}, with the versions evaluated against.</li>
  * </ol>
  * Jobs are claimed with {@code FOR NO KEY UPDATE SKIP LOCKED}, so a poll writing a job, or a second
@@ -82,6 +83,8 @@ public class FeedProcessor {
     private final NotificationSettingsRepository settings;
     private final NotificationRepository notifications;
     private final NotificationChannels channels;
+    private final NotificationDispatcher dispatcher;
+    private final JobSkillEnrichmentService enrichment;
     private final FeedProperties properties;
     private final TransactionTemplate tx;
     private final ThreadPoolTaskExecutor executor;
@@ -91,9 +94,12 @@ public class FeedProcessor {
                          PreferencesRepository preferences, OwnerProfileRepository profiles, FeedScorer scorer,
                          MatchJdbcRepository matches,
                          NotificationSettingsRepository settings, NotificationRepository notifications,
-                         NotificationChannels channels, FeedProperties properties,
+                         NotificationChannels channels, NotificationDispatcher dispatcher,
+                         JobSkillEnrichmentService enrichment, FeedProperties properties,
                          PlatformTransactionManager transactionManager,
                          @Qualifier(FeedConfig.PROCESSOR_EXECUTOR) ThreadPoolTaskExecutor executor, Clock clock) {
+        this.dispatcher = dispatcher;
+        this.enrichment = enrichment;
         this.jobs = jobs;
         this.dictionary = dictionary;
         this.refresh = refresh;
@@ -180,6 +186,7 @@ public class FeedProcessor {
         }
         if (total > 0) {
             log.info("Feed processor: processed={}", total);
+            enrichment.wake();                                  // step 6: new or changed jobs wait for the AI stage
         }
         return total;
     }
@@ -270,7 +277,7 @@ public class FeedProcessor {
         }
         if (outcome.queued()) {
             log.info("Feed notification queued job={} score={}", jobId, format(outcome.score()));
-            // Step 8: the notification dispatcher is woken here.
+            dispatcher.wake();                                 // after the commit; a no-op while the scheduler is off
         } else if (outcome.decision().reason() == Notifiability.Reason.CHANNEL_NOT_CONFIGURED) {
             log.info("Feed notification skipped job={} score={} reason={}_not_configured", jobId,
                     format(outcome.score()), outcome.channel().name().toLowerCase(Locale.ROOT));
@@ -319,7 +326,7 @@ public class FeedProcessor {
                 notifications.existsForJob(jobId)), now, properties.freshWindow());
         boolean queued = decision.shouldNotify() && notifications.insertIfAbsent(jobId, channel, score, now);
 
-        // 6: AI enrichment of PENDING jobs is woken here with step 10.
+        // 6: AI enrichment of PENDING jobs is woken once the run ends (processDue).
 
         jobs.markProcessed(jobId, new FeedJobRepository.Processed(
                 FeedJobJson.write(result.dictionarySkills()),

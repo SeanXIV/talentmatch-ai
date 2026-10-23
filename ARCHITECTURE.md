@@ -12,7 +12,7 @@ a frontend that presents everything to a user.
 ```mermaid
 flowchart TB
     subgraph Ingestion["Data Ingestion"]
-        GEN["Source adapter\ngenerate_synthetic.py\n(real jobs feed later)"]
+        GEN["Source adapter\ngenerate_synthetic.py\n(real jobs: the Phase 5 job feed)"]
         RAW["Contract CSVs\n(skills, candidates, jobs,\ncandidate_skills, job_skills)"]
         ETL["Python ETL\nclean_and_load.py"]
         GEN --> RAW
@@ -27,6 +27,7 @@ flowchart TB
         API["REST Controllers"]
         SVC["Match Service\n(skill-overlap scoring)"]
         AI["AI Explanation Service\n(LangChain4j)"]
+        FEED["Job feed\n(poller, processor,\nenrichment, notifier)"]
         API --> SVC
         SVC --> AI
     end
@@ -35,6 +36,13 @@ flowchart TB
         OLLAMA["Ollama\n(local model — default, free)"]
         HOSTED["OpenAI / Claude API\n(optional, paid)"]
     end
+
+    subgraph Boards["Job sources (official APIs)"]
+        ATS["Greenhouse / Lever / Ashby\njob-board APIs"]
+        ADZ["Adzuna search API"]
+    end
+
+    SMTP["SMTP server\n(email alerts)"]
 
     subgraph Frontend["Frontend — React"]
         UI["Dashboard\ncandidates / jobs / matches"]
@@ -45,6 +53,11 @@ flowchart TB
     AI <--> OLLAMA
     AI -.-> HOSTED
     UI <--> API
+    FEED --> ATS
+    FEED --> ADZ
+    FEED --> SMTP
+    FEED <--> DB
+    FEED <--> OLLAMA
 
     subgraph Infra["Infrastructure"]
         DOCKER["Docker + docker-compose"]
@@ -62,6 +75,8 @@ flowchart TB
 | Spring Boot API | Expose REST endpoints, run matching logic, orchestrate AI calls | Business logic |
 | AI Explanation Service | Use LangChain4j's `AiServices` to call the configured LLM provider and return a typed response for storage/display | Match explanations |
 | LLM Provider | Ollama (local, free) by default; OpenAI/Claude API optional, swappable via config for higher-quality output | Natural-language generation |
+| Job feed (Phase 5) | Poll watched job boards and Adzuna searches, deduplicate postings into feed jobs, extract skills (dictionary, then AI enrichment), filter by preferences and score against the owner's profile | Fresh jobs |
+| Notifier (Phase 5) | Send one email per new, matching job over SMTP (at least once, hourly cap, backoff) | Job alerts |
 | React Frontend | Present candidates, jobs, and match results to a user | User interface |
 | Docker / AWS | Package and run every component consistently, locally and in the cloud | Deployment |
 
@@ -97,6 +112,11 @@ cleaner or loader.
 | `ai` | AI explanation layer: prompt builder + hasher, LangChain4j `ExplanationAssistant`, generator, validator, template renderer, single-flight/backoff (`ExplanationService`), circuit breaker, regenerate rate limiter, `ai` health indicator | `repository`, `domain.scoring`, `ai.config` |
 | `ai.config` | `AiConfiguration` (model info, `aiExecutor`, assistant, generator, `Clock`), one `ChatModel` config per provider (each also builds the CV `ResumeExtractionModel`; Ollama also the `LocalModelGate`), startup failure analyzer | `ai`, `profile` (properties, model holder) |
 | `profile` | owner's master profile (Phase 4): PDF upload and text extraction (`ResumeService`, `ResumeTextExtractor`, PDFBox), background AI extraction (`ResumeExtractionService`, hand-built `ProfileJsonSchema`), cleaning (`ProfileNormalizer`), never-invent checks (`ResumeGrounding`), saving the confirmed profile (`ProfileService`), restart recovery (`ProfileRecovery`), JDBC repositories for `resume` / `owner_profile` | `service`, `repository`, `ai` (`FailureKind`, `LocalModelGate`) |
+| `feed` | job feed (Phase 5): sources and leases (`FeedSourceService`, `FeedScheduler`, `SourcePoller`, `PollWriter`), dedup and canonical jobs, processing (`FeedProcessor`, `FeedScorer`), refresh triggers, AI enrichment (`JobSkillEnrichmentService`; in `feed` rather than `feed.skills` because it needs the processor), status, health, metrics, restart recovery (`FeedRecovery`) | `feed.source`, `feed.skills`, `preferences`, `notify`, `profile` (read-only, events), `repository`, `domain.scoring`, `service`, `ai` |
+| `feed.source` | provider adapters (Greenhouse, Lever, Ashby, Adzuna), `SourceHttpClient`, HTML to text; pure HTTP and parsing, no database | `preferences` (enums, gazetteer) |
+| `feed.skills` | skill dictionary and matcher, requirement heuristic, AI enrichment prompts, schema, validator and model holder | `ai` (`FailureKind`), `service` (`TextNormalizer`) |
+| `preferences` | the owner's hand-entered job preferences: record, validator, repository, pure `PreferenceFilter` | `service` (normalization, errors) |
+| `notify` | `Notifier` SPI and `EmailNotifier`, `NotificationDispatcher`, settings, history, test email, metrics; never imports `feed` (job facts arrive through `NotificationContentSource`) | `service` (paging, exceptions), `web.error` (`FieldErrorDto`), `ai.config` (`MdcTaskDecorator`) |
 
 The schema is owned by Flyway; Hibernate only validates it. `job_match` is read through
 JDBC/JPA; scores are written only by one SQL upsert, and explanations only by one guarded
@@ -279,6 +299,47 @@ startup (ProfileRecovery): RUNNING → PENDING, re-queue all PENDING
   row and its skills, so the Phase 2 scoring and matching see the owner like any candidate. The
   candidates API refuses to change (`PUT`) or delete that candidate (`409`); it is edited only
   through `PUT /api/profile`.
+
+### Job feed (Phase 5)
+
+```
+FeedScheduler (tick 15 s, only while feed + scheduler are enabled)
+  claimDue: lease due ACTIVE sources (UPDATE … FOR UPDATE SKIP LOCKED), at most one per free poll thread
+  → feedPollExecutor (2 threads)
+SourcePoller.poll(source)                        [no transaction during HTTP]
+  adapter.fetch (ETag / body hash → NOT_MODIFIED; failure → Backoff; Adzuna: daily budget first)
+  Greenhouse details, normalize (one bad posting skipped; > 50 % skipped → INVALID_RESPONSE)
+  PollWriter: one transaction per source, guarded by the lease
+    upsert job_posting → attach to the open feed_job with the same dedup key, or create job(FEED)
+    → canonical fields, closing, baseline → feed_job.process_after = now  → wake processor
+FeedProcessor (one job per transaction, FOR NO KEY UPDATE SKIP LOCKED)
+  dictionary skills (+ AI skills) → job_skill diff → PreferenceFilter → FeedScorer (owner's job_match)
+  notifiable? → INSERT feed_notification PENDING (ON CONFLICT (job_id) DO NOTHING) → wake dispatcher
+  new or changed description → wake JobSkillEnrichmentService
+JobSkillEnrichmentService (one feed-ai thread, ≤ 30 calls/h, shared LocalModelGate)
+  claim PENDING → model → JobSkillValidator (grounded in the posting) → ai_skills → process_after = now
+NotificationDispatcher (one notify thread)
+  expire > 24 h → hourly cap → claim PENDING → SENDING → SMTP (no tx, no connection) → SENT / retry / FAILED
+FeedRecovery (ApplicationReadyEvent): drop leases, RUNNING enrichment → PENDING, SENDING → PENDING,
+  compare profile / preferences / vocabulary versions, re-sync Adzuna searches, wake every stage
+```
+
+- **Stages hand off through database state**, never in-memory queues: `job_posting` →
+  `feed_job.process_after` → `feed_notification`. A wake-up only shortens the wait; each stage also
+  sweeps on its own and picks up whatever is due, so a restart or a lost wake-up loses nothing.
+- **Dictionary first, AI enrichment later** (decision f). The dictionary is deterministic, fast and
+  never invents a skill, so it decides the first score and the first email. The AI stage runs in
+  the background (minutes per posting on a CPU) and only adds skills it can quote from the
+  posting; a job it changes is re-scored and can still be notified once while it is fresh.
+- **Filters drop a job only on evidence** (decision j). Missing data (no location, no salary)
+  passes with a flag; the owner reviews every email anyway.
+- **At-least-once email**, at most one notification row per job ever. A crash between the mail
+  server's reply and the `SENT` write sends the same email again with the same `Message-ID`.
+- **Single instance.** Leases and `SKIP LOCKED` keep two instances from polling or processing the
+  same row at once, but pauses, hourly caps and startup recovery are per instance
+  (PRODUCTION_READINESS section 10, "Always-on poller").
+- **`notify` never imports `feed`**: the dispatcher loads job facts through the
+  `NotificationContentSource` interface, implemented in `feed` (`FeedNotificationContent`).
 
 ### AI explains, never scores
 

@@ -320,6 +320,19 @@ public class FeedSourceRepository {
                         instant(rs, "last_success")));
     }
 
+    /** ACTIVE sources of one kind (they share a provider's daily budget). */
+    public int countActive(SourceKind kind) {
+        Integer n = jdbc.queryForObject("SELECT count(*) FROM feed_source WHERE kind = :kind AND state = 'ACTIVE'",
+                new MapSqlParameterSource("kind", kind.name()), Integer.class);
+        return n == null ? 0 : n;
+    }
+
+    /** Sources managed by the job preferences (derived Adzuna queries), oldest first. */
+    public List<FeedSource> findManagedByPreferences() {
+        return jdbc.query("SELECT " + COLUMNS + " FROM feed_source WHERE managed_by = 'PREFERENCES' "
+                + "ORDER BY created_at, id", new MapSqlParameterSource(), ROW);
+    }
+
     /** Every ACTIVE source (health check; a personal watchlist is small). */
     public List<FeedSource> findActive() {
         return jdbc.query("SELECT " + COLUMNS + " FROM feed_source WHERE state = 'ACTIVE' ORDER BY created_at, id",

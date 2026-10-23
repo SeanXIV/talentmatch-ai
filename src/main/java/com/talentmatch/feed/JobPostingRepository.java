@@ -115,6 +115,14 @@ public class JobPostingRepository {
         return jobIds;
     }
 
+    /** External ids of the source's open postings last seen before {@code before} (aggregator closing). */
+    public List<String> findOpenUnseenSince(UUID sourceId, Instant before) {
+        return jdbc.queryForList("SELECT external_id FROM job_posting WHERE source_id = :sid AND closed_at IS NULL "
+                        + "AND last_seen_at < :before",
+                new MapSqlParameterSource("sid", sourceId).addValue("before", ts(before), Types.TIMESTAMP),
+                String.class);
+    }
+
     public int countOpen(UUID sourceId) {
         Integer count = jdbc.queryForObject("SELECT count(*)::int FROM job_posting WHERE source_id = :sid "
                 + "AND closed_at IS NULL", new MapSqlParameterSource("sid", sourceId), Integer.class);

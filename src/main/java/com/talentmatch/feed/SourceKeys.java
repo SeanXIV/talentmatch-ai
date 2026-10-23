@@ -38,7 +38,7 @@ public final class SourceKeys {
     public static final String LEVER_EU = "eu";
     public static final String LEVER_GLOBAL = "global";
 
-    /** Adzuna options (step 9). */
+    /** Adzuna options. */
     public static final String ADZUNA_COUNTRY = "country";
     public static final String ADZUNA_WHAT = "what";
     public static final String ADZUNA_WHERE = "where";

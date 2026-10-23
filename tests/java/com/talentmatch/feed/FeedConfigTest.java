@@ -4,6 +4,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 
+import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.feed.source.SourceProperties;
 import java.time.Duration;
 import java.util.List;
@@ -23,6 +24,7 @@ class FeedConfigTest {
             .withUserConfiguration(FeedConfig.class)
             .withBean(SourceProperties.class, SourceProperties::defaults)
             .withBean(FeedProperties.class, FeedProperties::defaults)
+            .withBean(SkillsProperties.class, SkillsProperties::defaults)
             .withBean(FeedScheduler.class, () -> mock(FeedScheduler.class));
 
     @Test
@@ -118,5 +120,26 @@ class FeedConfigTest {
         runner.withBean(FeedProcessor.class, () -> processor)
                 .withPropertyValues("talentmatch.feed.enabled=false", "talentmatch.feed.scheduler.enabled=true")
                 .run(ctx -> assertThat(ctx).doesNotHaveBean(FeedConfig.FeedSchedulingConfig.class));
+    }
+
+    @Test
+    void enrichmentSweepIsRegisteredAndItsExecutorHasOneThread() {
+        JobSkillEnrichmentService enrichment = mock(JobSkillEnrichmentService.class);
+        runner.withBean(JobSkillEnrichmentService.class, () -> enrichment)
+                .withPropertyValues("talentmatch.feed.enabled=true", "talentmatch.feed.scheduler.enabled=true")
+                .run(ctx -> {
+                    assertThat(ctx).hasNotFailed();
+                    ScheduledTaskRegistrar registrar = new ScheduledTaskRegistrar();
+                    ctx.getBean(FeedConfig.FeedSchedulingConfig.class).configureTasks(registrar);
+                    List<IntervalTask> tasks = registrar.getFixedDelayTaskList();
+                    assertThat(tasks).hasSize(2);
+                    assertThat(tasks.get(0).getIntervalDuration()).isEqualTo(Duration.ofSeconds(15));
+                    assertThat(tasks.get(1).getIntervalDuration()).isEqualTo(Duration.ofSeconds(60));
+                    tasks.get(1).getRunnable().run();
+                    verify(enrichment).wake();
+                    ThreadPoolTaskExecutor ai = ctx.getBean(FeedConfig.AI_EXECUTOR, ThreadPoolTaskExecutor.class);
+                    assertThat(ai.getMaxPoolSize()).isEqualTo(1);
+                    assertThat(ai.getThreadNamePrefix()).isEqualTo("feed-ai-");
+                });
     }
 }

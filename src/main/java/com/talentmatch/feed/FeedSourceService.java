@@ -4,12 +4,14 @@ import com.talentmatch.feed.source.BoardInfo;
 import com.talentmatch.feed.source.LeverAdapter;
 import com.talentmatch.feed.source.SourceFailure;
 import com.talentmatch.feed.source.SourceKind;
+import com.talentmatch.feed.source.SourceProperties;
 import com.talentmatch.service.FieldErrors;
 import com.talentmatch.service.Paging;
 import com.talentmatch.service.exception.ConflictException;
 import com.talentmatch.service.exception.NotFoundException;
 import com.talentmatch.web.error.ErrorCode;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -33,8 +35,12 @@ import org.springframework.transaction.annotation.Transactional;
  *       be checked (network, timeout, 5xx, rate limit, odd answer) is saved with a warning; the first
  *       poll checks it again.</li>
  *   <li>Edits and deletes lock the row; sources managed by the job preferences (derived Adzuna
- *       queries, step 9) can't be changed here (409 DATA_CONFLICT).</li>
- *   <li>Adzuna sources can't be added yet (step 9): 400 on {@code kind}.</li>
+ *       queries, {@link AggregatorQueries}) can't be changed here (409 DATA_CONFLICT).</li>
+ *   <li>An Adzuna search ({@code kind=ADZUNA}, {@code options.what}, optional {@code options.where};
+ *       no board token) needs the Adzuna keys (400 on {@code kind} without them). Its check runs the
+ *       search once and counts against the daily budget; keys Adzuna rejects are a 400 on
+ *       {@code kind}.</li>
+ *   <li>{@code effectivePollIntervalSeconds} includes the Adzuna budget share ({@link PollIntervals}).</li>
  * </ul>
  */
 @Service
@@ -43,17 +49,26 @@ public class FeedSourceService {
     private static final Logger log = LoggerFactory.getLogger(FeedSourceService.class);
 
     static final int MAX_COMPANY_NAME_LENGTH = 200;
+    /** Longest {@code options.what} / {@code options.where} of an Adzuna search. */
+    static final int MAX_QUERY_LENGTH = 100;
     private static final Pattern WHITESPACE_RUN = Pattern.compile("\\s+");
     private static final Pattern CONTROL = Pattern.compile("\\p{Cntrl}");
 
     private final FeedSourceRepository repository;
     private final SourceProber prober;
     private final FeedProperties properties;
+    private final PollIntervals intervals;
+    private final FeedApiUsage usage;
+    private final SourceProperties.Adzuna adzuna;
 
-    public FeedSourceService(FeedSourceRepository repository, SourceProber prober, FeedProperties properties) {
+    public FeedSourceService(FeedSourceRepository repository, SourceProber prober, FeedProperties properties,
+                             PollIntervals intervals, FeedApiUsage usage, SourceProperties sourceProperties) {
         this.repository = repository;
         this.prober = prober;
         this.properties = properties;
+        this.intervals = intervals;
+        this.usage = usage;
+        this.adzuna = sourceProperties.adzuna();
     }
 
     /** Provider options as sent: {@code leverInstance} (Lever); {@code what}, {@code where} (Adzuna). */
@@ -75,9 +90,12 @@ public class FeedSourceService {
     public Page<FeedSourceView> list(SourceKind kind, FeedSourceState state, int page, int size) {
         Pageable pageable = Paging.of(page, size);
         long total = repository.count(kind, state);
-        List<FeedSourceView> content = total == 0 ? List.of()
-                : repository.findPage(kind, state, pageable.getOffset(), pageable.getPageSize()).stream()
-                        .map(source -> view(source, List.of())).toList();
+        if (total == 0) {
+            return new PageImpl<>(List.of(), pageable, total);
+        }
+        int aggregators = intervals.activeAggregatorSources();
+        List<FeedSourceView> content = repository.findPage(kind, state, pageable.getOffset(), pageable.getPageSize())
+                .stream().map(source -> view(source, aggregators, List.of())).toList();
         return new PageImpl<>(content, pageable, total);
     }
 
@@ -104,10 +122,18 @@ public class FeedSourceService {
 
         FieldErrors errors = new FieldErrors();
         if (kind == null) {
-            errors.add("kind", "kind is required: GREENHOUSE, LEVER or ASHBY.");
+            errors.add("kind", "kind is required: GREENHOUSE, LEVER, ASHBY or ADZUNA.");
         } else if (kind == SourceKind.ADZUNA) {
-            errors.add("kind", "Adzuna sources can't be added yet. Add a company job board instead: "
-                    + "GREENHOUSE, LEVER or ASHBY.");
+            if (!adzuna.configured()) {
+                errors.add("kind", "Set ADZUNA_APP_ID and ADZUNA_APP_KEY (free keys from developer.adzuna.com) and "
+                        + "restart to add Adzuna searches.");
+            }
+            if (token != null && !token.isEmpty()) {
+                errors.add("boardToken", "Adzuna searches have no boardToken; put the search in options.what (and "
+                        + "optionally options.where).");
+            }
+            validateSearch(errors, options);
+            validateInterval(errors, kind, in.pollIntervalSeconds());
         } else {
             validateToken(errors, kind, token);
             validateOptions(errors, kind, options);
@@ -116,6 +142,9 @@ public class FeedSourceService {
         validateCompanyName(errors, companyName);
         errors.throwIfAny();
 
+        if (kind == SourceKind.ADZUNA) {
+            token = null;
+        }
         Map<String, String> storedOptions = storedOptions(kind, options);
         String key = SourceKeys.sourceKey(kind, token, storedOptions);
         repository.findByKey(key).ifPresent(existing -> {
@@ -124,8 +153,16 @@ public class FeedSourceService {
 
         List<String> warnings = new ArrayList<>();
         boolean verify = in.verify() == null || in.verify();
-        if (verify) {
+        if (verify && kind == SourceKind.ADZUNA && !usage.tryConsume(SourceKind.ADZUNA, adzuna.dailyRequestBudget())) {
+            warnings.add("Today's Adzuna request budget is used up, so the search wasn't checked; it runs after "
+                    + "midnight UTC.");
+        } else if (verify) {
             SourceProber.Result result = prober.probe(kind, token, storedOptions);
+            if (kind == SourceKind.ADZUNA && result instanceof SourceProber.Unchecked unchecked
+                    && unchecked.failure() == SourceFailure.Kind.UNAUTHORIZED) {
+                new FieldErrors().add("kind", "Adzuna rejected ADZUNA_APP_ID / ADZUNA_APP_KEY. Check the keys at "
+                        + "developer.adzuna.com and restart.").throwIfAny();
+            }
             if (result instanceof SourceProber.NotFound) {
                 new FieldErrors().add("boardToken", notFoundMessage(kind, token, storedOptions)).throwIfAny();
             } else if (result instanceof SourceProber.Found found) {
@@ -139,6 +176,8 @@ public class FeedSourceService {
             } else if (result instanceof SourceProber.Unchecked unchecked) {
                 warnings.add(uncheckedWarning(kind, unchecked.failure()));
             }
+        } else if (kind == SourceKind.ADZUNA) {
+            warnings.add("The search wasn't checked (verify=false). The first poll reports any problem in lastStatus.");
         } else {
             warnings.add("The board wasn't checked (verify=false). If the token is wrong, the first poll "
                     + "reports NOT_FOUND in lastStatus.");
@@ -195,8 +234,11 @@ public class FeedSourceService {
     // ------------------------------------------------------------------ helpers
 
     private FeedSourceView view(FeedSource source, List<String> warnings) {
-        return new FeedSourceView(source,
-                properties.intervals().effectiveSeconds(source.kind(), source.pollIntervalSeconds()), warnings);
+        return new FeedSourceView(source, intervals.seconds(source), warnings);
+    }
+
+    private FeedSourceView view(FeedSource source, int activeAggregators, List<String> warnings) {
+        return new FeedSourceView(source, intervals.seconds(source, activeAggregators), warnings);
     }
 
     private static void requireOwnerManaged(FeedSource source) {
@@ -238,6 +280,28 @@ public class FeedSourceService {
         }
     }
 
+    private static void validateSearch(FieldErrors errors, SourceOptions options) {
+        if (options.leverInstance() != null) {
+            errors.add("options.leverInstance", "options.leverInstance is only for LEVER sources.");
+        }
+        String what = searchTerm(options.what());
+        if (what == null) {
+            errors.add("options.what", "options.what is required for ADZUNA sources: the search terms, e.g. "
+                    + "\"java developer\".");
+        } else if (what.length() > MAX_QUERY_LENGTH) {
+            errors.add("options.what", "options.what must be at most " + MAX_QUERY_LENGTH + " characters.");
+        }
+        String where = searchTerm(options.where());
+        if (where != null && where.length() > MAX_QUERY_LENGTH) {
+            errors.add("options.where", "options.where must be at most " + MAX_QUERY_LENGTH + " characters.");
+        }
+    }
+
+    /** One line, whitespace collapsed, control characters removed; null when blank. */
+    static String searchTerm(String raw) {
+        return companyName(raw);
+    }
+
     private void validateInterval(FieldErrors errors, SourceKind kind, Integer seconds) {
         if (seconds == null) {
             return;
@@ -254,12 +318,31 @@ public class FeedSourceService {
         errors.maxLength("companyName", normalized, MAX_COMPANY_NAME_LENGTH, "companyName");
     }
 
-    /** Only the EU Lever instance is stored as an option; the global instance is the default. */
-    private static Map<String, String> storedOptions(SourceKind kind, SourceOptions options) {
+    /**
+     * Only the EU Lever instance is stored as an option (the global instance is the default); an
+     * Adzuna search stores the configured country and its terms.
+     */
+    private Map<String, String> storedOptions(SourceKind kind, SourceOptions options) {
         if (kind == SourceKind.LEVER && SourceKeys.isLeverEu(options.leverInstance())) {
             return Map.of(LeverAdapter.INSTANCE_OPTION, SourceKeys.LEVER_EU);
         }
+        if (kind == SourceKind.ADZUNA) {
+            return adzunaOptions(adzuna.country(), searchTerm(options.what()), searchTerm(options.where()));
+        }
         return Map.of();
+    }
+
+    /** The stored options of an Adzuna search ({@code where} only when set). */
+    static Map<String, String> adzunaOptions(String country, String what, String where) {
+        Map<String, String> stored = new LinkedHashMap<>();
+        stored.put(SourceKeys.ADZUNA_COUNTRY, country);
+        if (what != null) {
+            stored.put(SourceKeys.ADZUNA_WHAT, what);
+        }
+        if (where != null) {
+            stored.put(SourceKeys.ADZUNA_WHERE, where);
+        }
+        return stored;
     }
 
     /** Trimmed, whitespace runs (line breaks included) collapsed, other control characters removed. */
@@ -286,7 +369,9 @@ public class FeedSourceService {
             case GREENHOUSE -> "Greenhouse board '" + source.boardToken() + "'";
             case LEVER -> "Lever " + (eu ? "(EU) " : "") + "site '" + source.boardToken() + "'";
             case ASHBY -> "Ashby board '" + source.boardToken() + "'";
-            case ADZUNA -> "This Adzuna search";
+            case ADZUNA -> "The Adzuna search \"" + source.options().getOrDefault(SourceKeys.ADZUNA_WHAT, "")
+                    + "\"" + (source.options().containsKey(SourceKeys.ADZUNA_WHERE)
+                            ? " in \"" + source.options().get(SourceKeys.ADZUNA_WHERE) + "\"" : "");
         };
     }
 
@@ -306,16 +391,17 @@ public class FeedSourceService {
 
     static String uncheckedWarning(SourceKind kind, SourceFailure.Kind failure) {
         String name = display(kind);
+        String what = kind == SourceKind.ADZUNA ? "search" : "board";
         String then = " it will be checked on the first poll.";
         if (failure == null) {
-            return "Couldn't check the " + name + " board right now;" + then;
+            return "Couldn't check the " + name + " " + what + " right now;" + then;
         }
         return switch (failure) {
-            case RATE_LIMITED -> name + " is limiting requests right now, so the board wasn't checked;" + then;
-            case UNAUTHORIZED -> name + " refused access to the board, so it wasn't checked;" + then;
-            case INVALID_RESPONSE, TOO_LARGE -> name + " gave an unexpected answer, so the board wasn't checked;"
-                    + then;
-            case NOT_FOUND, SERVER_ERROR, NETWORK, TIMEOUT -> "Couldn't reach " + name + " to check the board;"
+            case RATE_LIMITED -> name + " is limiting requests right now, so the " + what + " wasn't checked;" + then;
+            case UNAUTHORIZED -> name + " refused access to the " + what + ", so it wasn't checked;" + then;
+            case INVALID_RESPONSE, TOO_LARGE -> name + " gave an unexpected answer, so the " + what
+                    + " wasn't checked;" + then;
+            case NOT_FOUND, SERVER_ERROR, NETWORK, TIMEOUT -> "Couldn't reach " + name + " to check the " + what + ";"
                     + then;
         };
     }

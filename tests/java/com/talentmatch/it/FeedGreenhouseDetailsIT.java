@@ -27,7 +27,8 @@ class FeedGreenhouseDetailsIT extends AbstractFeedIT {
         SourceProperties sp = sourceProperties;
         SourceProperties custom = new SourceProperties(sp.maxPostingsPerSource(), sp.http(),
                 new SourceProperties.Greenhouse(sp.greenhouse().baseUrl(), budget), sp.lever(), sp.ashby());
-        return new SourcePoller(adapters, writer, sources, postingRepository, feedProperties, custom, clock);
+        return new SourcePoller(adapters, writer, sources, postingRepository, feedProperties, custom, pollIntervals,
+                apiUsage, clock);
     }
 
     private int detailRequests(String token, String id) {

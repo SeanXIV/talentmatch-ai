@@ -2,6 +2,7 @@ package com.talentmatch.profile;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.talentmatch.ai.FailureKind;
+import com.talentmatch.ai.Interrupts;
 import com.talentmatch.ai.LocalModelGate;
 import com.talentmatch.config.ProfileConfig;
 import dev.langchain4j.data.message.SystemMessage;
@@ -13,8 +14,6 @@ import dev.langchain4j.model.output.TokenUsage;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Metrics;
 import io.micrometer.core.instrument.Timer;
-import java.io.InterruptedIOException;
-import java.nio.channels.ClosedByInterruptException;
 import java.sql.SQLException;
 import java.time.Clock;
 import java.util.ArrayList;
@@ -118,7 +117,7 @@ public class ResumeExtractionService {
             }
             extract(resumeId, m);
         } catch (RuntimeException e) {
-            if (interrupted(e)) {
+            if (Interrupts.interrupted(e)) {
                 logInterrupted(resumeId);
                 return;
             }
@@ -158,7 +157,7 @@ public class ResumeExtractionService {
             usage = response == null ? null : response.tokenUsage();
             outcome = finish(resumeId, m, response, text, warnings);
         } catch (RuntimeException e) {
-            if (interrupted(e)) {
+            if (Interrupts.interrupted(e)) {
                 logInterrupted(resumeId);
                 return;
             }
@@ -256,22 +255,6 @@ public class ResumeExtractionService {
     private static boolean isEmpty(ProfileDocument d) {
         return d.fullName() == null && d.experience().isEmpty() && d.skills().isEmpty() && d.education().isEmpty()
                 && d.projects().isEmpty();
-    }
-
-    /** A shutdown interrupted the worker (flag set, or an interrupt in the cause chain). */
-    static boolean interrupted(Throwable failure) {
-        if (Thread.currentThread().isInterrupted()) {
-            return true;
-        }
-        Set<Throwable> seen = Collections.newSetFromMap(new IdentityHashMap<>());
-        int depth = 0;
-        for (Throwable t = failure; t != null && depth < MAX_CAUSE_DEPTH && seen.add(t); t = t.getCause(), depth++) {
-            if (t instanceof InterruptedException || t instanceof ClosedByInterruptException
-                    || (t instanceof InterruptedIOException && !(t instanceof java.net.SocketTimeoutException))) {
-                return true;
-            }
-        }
-        return false;
     }
 
     private static void logInterrupted(UUID resumeId) {

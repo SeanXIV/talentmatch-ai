@@ -200,4 +200,73 @@ class SourceProberTest {
         assertThat(adapters.supports(SourceKind.ADZUNA)).isFalse();
         assertThat(adapters.find(SourceKind.LEVER)).containsSame(a);
     }
+
+    // ------------------------------------------------------------------ step 12: timeout overload
+
+    private static ProbeFn sleeper(CountDownLatch interrupted) {
+        return (t, o) -> {
+            try {
+                Thread.sleep(20_000);
+            } catch (InterruptedException e) {
+                interrupted.countDown();
+                throw e;
+            }
+            return Optional.empty();
+        };
+    }
+
+    private static long timed(Runnable r) {
+        long start = System.nanoTime();
+        r.run();
+        return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start);
+    }
+
+    @Test
+    void shorterTimeoutIsHonoured() throws Exception {
+        CountDownLatch interrupted = new CountDownLatch(1);
+        SourceProber p = prober(Duration.ofSeconds(10), sleeper(interrupted));
+        AtomicReference<SourceProber.Result> r = new AtomicReference<>();
+        long ms = timed(() -> r.set(p.probe(SourceKind.GREENHOUSE, "acme", Map.of(), Duration.ofMillis(300))));
+        assertThat(r.get()).isEqualTo(new SourceProber.Unchecked(SourceFailure.Kind.TIMEOUT));
+        assertThat(ms).isBetween(250L, 3_000L);
+        assertThat(interrupted.await(5, TimeUnit.SECONDS)).isTrue();
+    }
+
+    @Test
+    void longerTimeoutIsCappedAtProbeTimeout() throws Exception {
+        CountDownLatch interrupted = new CountDownLatch(1);
+        SourceProber p = prober(Duration.ofSeconds(1), sleeper(interrupted));
+        AtomicReference<SourceProber.Result> r = new AtomicReference<>();
+        long ms = timed(() -> r.set(p.probe(SourceKind.GREENHOUSE, "acme", Map.of(), Duration.ofSeconds(30))));
+        assertThat(r.get()).isEqualTo(new SourceProber.Unchecked(SourceFailure.Kind.TIMEOUT));
+        assertThat(ms).isBetween(900L, 4_000L);
+    }
+
+    @Test
+    void nullTimeoutUsesProbeTimeout() {
+        SourceProber p = prober(Duration.ofSeconds(1), sleeper(new CountDownLatch(1)));
+        AtomicReference<SourceProber.Result> r = new AtomicReference<>();
+        long ms = timed(() -> r.set(p.probe(SourceKind.GREENHOUSE, "acme", Map.of(), null)));
+        assertThat(r.get()).isEqualTo(new SourceProber.Unchecked(SourceFailure.Kind.TIMEOUT));
+        assertThat(ms).isBetween(900L, 4_000L);
+    }
+
+    @Test
+    void zeroOrNegativeTimeoutIsFlooredNotInfinite() {
+        SourceProber p = prober(Duration.ofSeconds(5), sleeper(new CountDownLatch(1)));
+        for (Duration d : List.of(Duration.ZERO, Duration.ofSeconds(-3), Duration.ofNanos(10))) {
+            AtomicReference<SourceProber.Result> r = new AtomicReference<>();
+            long ms = timed(() -> r.set(p.probe(SourceKind.GREENHOUSE, "acme", Map.of(), d)));
+            assertThat(r.get()).as("%s", d).isEqualTo(new SourceProber.Unchecked(SourceFailure.Kind.TIMEOUT));
+            assertThat(ms).as("%s", d).isLessThan(1_500L);
+        }
+    }
+
+    @Test
+    void fastAnswerWithinShortTimeoutIsFound() {
+        BoardInfo info = new BoardInfo("Acme", null, null);
+        SourceProber p = prober(Duration.ofSeconds(5), (t, o) -> Optional.of(info));
+        assertThat(p.probe(SourceKind.GREENHOUSE, "acme", Map.of(), Duration.ofSeconds(2)))
+                .isEqualTo(new SourceProber.Found(info));
+    }
 }

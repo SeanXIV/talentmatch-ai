@@ -30,8 +30,9 @@ import org.springframework.stereotype.Component;
  * (10s), shorter than the HTTP client's own connect + read deadline. On timeout the worker is
  * interrupted, which cancels its HTTP exchange.
  *
- * <p>Never throws for provider trouble: every outcome is a {@link Result}. Logs the kind, the outcome
- * and the {@link SourceException} message, which by contract holds no body, query or key.
+ * <p>Never throws for provider trouble: every outcome is a {@link Result}. Logs the kind, the outcome,
+ * the failure kind and HTTP status only, never the board token: a {@link SourceException} message names
+ * the request host and path, which hold the token (and, from a company lookup, a guess at the company).
  */
 @Component
 public class SourceProber implements DisposableBean {
@@ -85,16 +86,29 @@ public class SourceProber implements DisposableBean {
      * @throws IllegalArgumentException when no adapter supports the kind
      */
     public Result probe(SourceKind kind, String boardToken, Map<String, String> options) {
+        return probe(kind, boardToken, options, timeout);
+    }
+
+    /**
+     * {@link #probe(SourceKind, String, Map)} with a shorter wait, for callers with their own deadline
+     * (the company lookup). The wait is capped at {@code talentmatch.feed.probe-timeout}.
+     *
+     * @param timeout how long to wait for the board check (at least 1 ms)
+     */
+    public Result probe(SourceKind kind, String boardToken, Map<String, String> options, Duration timeout) {
         SourceAdapter adapter = adapters.find(kind)
                 .orElseThrow(() -> new IllegalArgumentException("No source adapter for " + kind));
+        Duration wait = timeout == null || timeout.compareTo(this.timeout) > 0 ? this.timeout
+                : timeout.compareTo(Duration.ofMillis(1)) < 0 ? Duration.ofMillis(1) : timeout;
         long started = System.nanoTime();
-        Result result = run(adapter, kind, boardToken, options);
+        Result result = run(adapter, kind, boardToken, options, wait);
         log.info("Feed probe kind={} outcome={} latencyMs={}", kind, describe(result),
                 TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started));
         return result;
     }
 
-    private Result run(SourceAdapter adapter, SourceKind kind, String boardToken, Map<String, String> options) {
+    private Result run(SourceAdapter adapter, SourceKind kind, String boardToken, Map<String, String> options,
+                       Duration timeout) {
         FutureTask<Optional<BoardInfo>> task = new FutureTask<>(() -> adapter.probe(boardToken, options));
         try {
             executor.execute(mdc.decorate(task));
@@ -119,7 +133,9 @@ public class SourceProber implements DisposableBean {
                 if (se.kind() == SourceFailure.Kind.NOT_FOUND) {
                     return new NotFound();
                 }
-                log.info("Feed probe kind={} failed: {}", kind, se.getMessage());
+                // Failure kind and status only: the message names the request path, i.e. the board token.
+                log.info("Feed probe kind={} failed: failure={} httpStatus={}", kind, se.kind(),
+                        se.failure().httpStatus());
                 return new Unchecked(se.kind());
             }
             // Class name only: an unexpected exception's message could hold anything.

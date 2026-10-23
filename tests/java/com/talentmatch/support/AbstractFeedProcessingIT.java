@@ -1,6 +1,9 @@
 package com.talentmatch.support;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.doReturn;
 
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -18,15 +21,24 @@ import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.context.annotation.Import;
+import com.talentmatch.notify.EmailNotifier;
+import com.talentmatch.notify.NotificationMessage;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 
 /**
- * Base for the step-7 processing ITs: {@link AbstractFeedIT} plus a stub EMAIL notifier (configured
- * unless a test switches it off), the processor, and fixtures for the owner profile, preferences,
- * notification settings and Lever postings with any location.
+ * Base for the processing ITs: {@link AbstractFeedIT} plus a Mockito spy on the real
+ * {@link EmailNotifier} bean (a spy keeps {@code channel()} = EMAIL, so it stays the one EMAIL notifier),
+ * the processor, and fixtures for the owner profile, preferences, notification settings and Lever
+ * postings with any location.
+ *
+ * <p>By default the spy reports "configured" and {@code send} does nothing (the step-7 ITs never reach
+ * SMTP). Subclasses with a real SMTP server (GreenMail) override {@link #stubEmailNotifier()} to keep
+ * the real behaviour. Spies are reset after each test, so the stubbing is applied before each.
  */
-@Import(StubNotifier.Config.class)
 public abstract class AbstractFeedProcessingIT extends AbstractFeedIT {
+
+    @MockitoSpyBean
+    protected EmailNotifier emailNotifier;
 
     @Autowired
     protected FeedProcessor processor;
@@ -37,8 +49,21 @@ public abstract class AbstractFeedProcessingIT extends AbstractFeedIT {
     protected final Instant start = Instant.now().truncatedTo(ChronoUnit.SECONDS);
 
     @BeforeEach
-    void notifierConfigured() {
-        StubNotifier.CONFIGURED.set(true);
+    void notifierConfigured() throws Exception {
+        if (stubEmailNotifier()) {
+            doReturn(true).when(emailNotifier).configured();
+            doNothing().when(emailNotifier).send(any(NotificationMessage.class));
+        }
+    }
+
+    /** True (default): the email channel is a configured no-op. False: the real notifier is used. */
+    protected boolean stubEmailNotifier() {
+        return true;
+    }
+
+    /** Switches the (stubbed) email channel to "not configured" for this test. */
+    protected void emailNotConfigured() {
+        doReturn(false).when(emailNotifier).configured();
     }
 
     // ------------------------------------------------------------------ owner side

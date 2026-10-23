@@ -12,6 +12,8 @@ import com.talentmatch.ai.ExplanationRateLimiter;
 import com.talentmatch.ai.ExplanationService;
 import com.talentmatch.ai.LocalModelGate;
 import com.talentmatch.config.ProfileConfig;
+import com.talentmatch.feed.skills.JobSkillExtractionModel;
+import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.profile.ResumeExtractionModel;
 import com.talentmatch.repository.MatchJdbcRepository;
 import dev.langchain4j.model.anthropic.AnthropicChatModel;
@@ -22,6 +24,7 @@ import dev.langchain4j.model.openai.OpenAiChatModel;
 import java.time.Clock;
 import java.util.List;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.context.properties.bind.BindException;
 import org.springframework.boot.diagnostics.FailureAnalysis;
 import org.springframework.boot.diagnostics.FailureAnalyzer;
@@ -31,9 +34,14 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 /** Spec §2 provider wiring / §7 / §10 unit 8. No network: building a model never connects. */
 class AiProviderWiringTest {
 
+    /** {@code talentmatch.feed.skills.*} (bound by the app's properties scan). */
+    @EnableConfigurationProperties(SkillsProperties.class)
+    static class SkillsConfig {
+    }
+
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
             .withUserConfiguration(AiConfiguration.class, AiCircuitBreaker.class, ExplanationRateLimiter.class,
-                    ExplanationService.class, AiHealthIndicator.class, ProfileConfig.class)
+                    ExplanationService.class, AiHealthIndicator.class, ProfileConfig.class, SkillsConfig.class)
             .withBean(MatchJdbcRepository.class, () -> mock(MatchJdbcRepository.class))
             // never reach a real local Ollama
             .withPropertyValues("talentmatch.ai.ollama.base-url=http://localhost:1");
@@ -81,6 +89,59 @@ class AiProviderWiringTest {
             assertThat(profile.getMaxPoolSize()).isEqualTo(1);
             assertThat(profile.getThreadNamePrefix()).isEqualTo("profile-");
         });
+    }
+
+    /** Phase 5 step 10: one enrichment model per provider, sharing num_ctx; still one ChatModel bean. */
+    @Test
+    void everyProviderHasOneJobSkillModel() {
+        runner.run(ctx -> {
+            assertThat(ctx).hasNotFailed();
+            assertThat(ctx.getBeansOfType(ChatModel.class)).hasSize(1);
+            JobSkillExtractionModel m = ctx.getBean(JobSkillExtractionModel.class);
+            assertThat(m.chatModel()).isInstanceOf(OllamaChatModel.class).isNotSameAs(ctx.getBean(ChatModel.class));
+            assertThat(m.contextTokens()).isEqualTo(12288);
+            assertThat(m.local()).isTrue();
+            assertThat(m.label()).isEqualTo("ollama/qwen2.5:7b-instruct");
+        });
+        runner.withPropertyValues("talentmatch.ai.provider=openai", "talentmatch.ai.openai.api-key=sk-test-123")
+                .run(ctx -> {
+                    JobSkillExtractionModel m = ctx.getBean(JobSkillExtractionModel.class);
+                    assertThat(m.chatModel()).isInstanceOf(OpenAiChatModel.class);
+                    assertThat(m.local()).isFalse();
+                    assertThat(m.contextTokens()).isNull();
+                });
+        runner.withPropertyValues("talentmatch.ai.provider=claude", "talentmatch.ai.claude.api-key=sk-ant-test")
+                .run(ctx -> {
+                    JobSkillExtractionModel m = ctx.getBean(JobSkillExtractionModel.class);
+                    assertThat(m.chatModel()).isInstanceOf(AnthropicChatModel.class);
+                    assertThat(m.local()).isFalse();
+                });
+        runner.withPropertyValues("talentmatch.ai.enabled=false")
+                .run(ctx -> assertThat(ctx).doesNotHaveBean(JobSkillExtractionModel.class));
+    }
+
+    @Test
+    void ollamaContextTooSmallForTheEnrichmentBudgetFailsStartup() {
+        // 30000/3 + 800 + 600 = 11400 fits 12288; 40000/3 → 13334 + 1400 = 14734 doesn't
+        runner.withPropertyValues("talentmatch.feed.skills.max-description-chars=40000").run(ctx -> {
+            assertThat(ctx).hasFailed();
+            FailureAnalysis a = analyze(ctx.getStartupFailure());
+            assertThat(a.getDescription()).contains("job-skill enrichment").contains("14734");
+            assertThat(a.getAction()).contains("Raise talentmatch.ai.ollama.context-tokens to at least 14734");
+        });
+        runner.withPropertyValues("talentmatch.feed.skills.max-description-chars=30000")
+                .run(ctx -> assertThat(ctx).hasNotFailed());
+    }
+
+    @Test
+    void enrichmentDisabledSkipsTheEnrichmentBudgetCheck() {
+        // L5: the same too-small budget as above, but enrichment is off: the model is never called
+        runner.withPropertyValues("talentmatch.feed.skills.max-description-chars=40000",
+                        "talentmatch.feed.skills.enrichment.enabled=false")
+                .run(ctx -> {
+                    assertThat(ctx).hasNotFailed();
+                    assertThat(ctx).hasSingleBean(JobSkillExtractionModel.class);
+                });
     }
 
     @Test
