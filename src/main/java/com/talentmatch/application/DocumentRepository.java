@@ -2,7 +2,12 @@ package com.talentmatch.application;
 
 import com.talentmatch.application.content.DocumentKind;
 import com.talentmatch.application.content.DocumentSource;
+import com.talentmatch.application.content.Finding;
+import java.sql.Timestamp;
+import java.sql.Types;
+import java.time.Instant;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.UUID;
 import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
@@ -12,9 +17,9 @@ import org.springframework.stereotype.Repository;
 /**
  * JDBC access to {@code application_document} (V7; not mapped in JPA).
  *
- * <p>Phase 7 step 1 has the read side the tracker needs (version summaries for the application view,
- * sent-version checks and defaults). Inserting versions, approval and files arrive with steps 5 and 6.
- * Never reads {@code content} here, and never logs findings.
+ * <p>The read side the tracker needs (version summaries for the application view, sent-version checks
+ * and defaults) and the insert of new versions ({@link #insertVersion}, used by generations and, in step 6,
+ * by owner edits). Approval and files arrive with step 6. Never logs content or findings.
  */
 @Repository
 public class DocumentRepository {
@@ -35,6 +40,71 @@ public class DocumentRepository {
 
     /** The identifying fields of one version. */
     public record DocumentRef(UUID id, DocumentKind kind, int version, boolean approved) {
+    }
+
+    /**
+     * A version to insert. V7's {@code ck_application_document_source} pins the combinations: AI versions
+     * have a {@code model} and an {@code inputHash} and no base; EDIT versions have a base and neither.
+     *
+     * @param basedOnId      the edited version (EDIT only; same application and kind)
+     * @param profileVersion the owner profile version the content was built from
+     * @param jobUpdatedAt   the job's {@code updated_at} the version was built against; null when the job is gone
+     * @param content        a {@code TailoredCvContent} (CV) or a {@code CoverLetterContent} (COVER_LETTER)
+     * @param findings       grounding findings at creation time (stored, never logged)
+     * @param model          the model label (AI only)
+     * @param inputHash      sha256 of the prompt (AI only)
+     */
+    public record NewVersion(UUID applicationId, DocumentKind kind, DocumentSource source, UUID basedOnId,
+                             int profileVersion, Instant jobUpdatedAt, Object content, List<Finding> findings,
+                             String model, String inputHash) {
+
+        public NewVersion {
+            Objects.requireNonNull(applicationId, "applicationId");
+            Objects.requireNonNull(kind, "kind");
+            Objects.requireNonNull(source, "source");
+            Objects.requireNonNull(content, "content");
+            findings = findings == null ? List.of() : List.copyOf(findings);
+        }
+
+        /** An AI-generated version. */
+        public static NewVersion ai(UUID applicationId, DocumentKind kind, int profileVersion, Instant jobUpdatedAt,
+                                    Object content, List<Finding> findings, String model, String inputHash) {
+            return new NewVersion(applicationId, kind, DocumentSource.AI, null, profileVersion, jobUpdatedAt,
+                    content, findings, model, inputHash);
+        }
+    }
+
+    /**
+     * Inserts the next version of the application's documents of that kind ({@code MAX(version) + 1}).
+     * Call under the application row lock, which serializes version numbers per application; the unique
+     * constraint {@code uq_application_document_version} is the backstop.
+     *
+     * @return the new version (not approved)
+     */
+    public DocumentRef insertVersion(NewVersion v) {
+        MapSqlParameterSource params = new MapSqlParameterSource("applicationId", v.applicationId())
+                .addValue("kind", v.kind().name())
+                .addValue("source", v.source().name())
+                .addValue("basedOn", v.basedOnId(), Types.OTHER)
+                .addValue("profileVersion", v.profileVersion())
+                .addValue("jobUpdatedAt", v.jobUpdatedAt() == null ? null : Timestamp.from(v.jobUpdatedAt()),
+                        Types.TIMESTAMP)
+                .addValue("content", DocumentJson.write(v.content()))
+                .addValue("findings", DocumentJson.write(v.findings()))
+                .addValue("model", v.model(), Types.VARCHAR)
+                .addValue("inputHash", v.inputHash(), Types.VARCHAR);
+        return jdbc.queryForObject("INSERT INTO application_document (application_id, kind, version, source, "
+                        + "based_on_id, profile_version, job_updated_at, content, findings, model, input_hash) "
+                        // Explicit casts: in a SELECT list, untyped parameters (a null uuid, a timestamp) would
+                        // resolve to text and fail the insert.
+                        + "SELECT CAST(:applicationId AS uuid), :kind, COALESCE(MAX(d.version), 0) + 1, :source, "
+                        + "CAST(:basedOn AS uuid), :profileVersion, CAST(:jobUpdatedAt AS timestamptz), "
+                        + "CAST(:content AS jsonb), CAST(:findings AS jsonb), :model, :inputHash "
+                        + "FROM application_document d "
+                        + "WHERE d.application_id = :applicationId AND d.kind = :kind "
+                        + "RETURNING id, version",
+                params, (rs, n) -> new DocumentRef(rs.getObject("id", UUID.class), v.kind(), rs.getInt("version"),
+                        false));
     }
 
     /** One version of this application (any kind), if it exists. */

@@ -33,6 +33,12 @@ public class ApplicationRepository {
 
     private static final String SQL_SET_LOCK_TIMEOUT = "SET LOCAL lock_timeout = '" + LOCK_TIMEOUT + "'";
 
+    /** Longest wait of the generation worker for the application row lock (see {@link #lockForWorker}). */
+    static final String WORKER_LOCK_TIMEOUT = "120s";
+
+    private static final String SQL_SET_WORKER_LOCK_TIMEOUT =
+            "SET LOCAL lock_timeout = '" + WORKER_LOCK_TIMEOUT + "'";
+
     private static final String COLUMNS = "a.id, a.job_id, a.job_title, a.job_company, a.job_url, "
             + "j.origin AS job_origin, (f.closed_at IS NOT NULL) AS job_closed, a.status, a.status_changed_at, "
             + "a.applied_on, a.notes, a.sent_cv_id, a.sent_cover_letter_id, a.created_at, a.updated_at";
@@ -141,6 +147,20 @@ public class ApplicationRepository {
             }
             throw e;
         }
+    }
+
+    /**
+     * Locks the application row for a background writer (the generation worker storing a version) until
+     * the transaction ends. Waits up to {@value #WORKER_LOCK_TIMEOUT}, longer than a request would: request
+     * transactions hold the row briefly, and giving up would throw away minutes of model work. Must run
+     * inside a transaction.
+     *
+     * @return false when the application no longer exists (deleted meanwhile)
+     */
+    public boolean lockForWorker(UUID id) {
+        jdbc.getJdbcOperations().execute(SQL_SET_WORKER_LOCK_TIMEOUT);
+        return !jdbc.queryForList("SELECT id FROM application WHERE id = :id FOR UPDATE",
+                new MapSqlParameterSource("id", id), UUID.class).isEmpty();
     }
 
     private static String sqlState(Throwable t) {

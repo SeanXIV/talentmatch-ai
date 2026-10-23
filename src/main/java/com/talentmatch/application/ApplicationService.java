@@ -34,7 +34,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * The application tracker (Phase 7 §4.1): create, list, read, update and delete.
  * <ul>
  *   <li><b>Create</b> tracks one job (at most one application per job, decision n), starting as NEW or
- *       SHORTLISTED, with a snapshot of the job's title, company and URL.</li>
+ *       SHORTLISTED, with a snapshot of the job's title, company and URL. With {@code generate=true} it
+ *       also queues a generation ({@link GenerationService}).</li>
  *   <li><b>Update</b> runs under the application row lock (10 s lock wait, then 503 SERVICE_BUSY).
  *       Status moves follow {@link ApplicationStatus}'s table unless {@code force=true}. Entering an
  *       applied status sets {@code appliedOn} (default: today in {@code talentmatch.applications.zone})
@@ -62,24 +63,36 @@ public class ApplicationService {
 
     private final ApplicationRepository repository;
     private final DocumentRepository documents;
+    private final GenerationService generations;
     private final OwnerProfileRepository profiles;
     private final ApplicationProperties properties;
     private final Clock clock;
     private final TransactionTemplate tx;
 
     public ApplicationService(ApplicationRepository repository, DocumentRepository documents,
-                              OwnerProfileRepository profiles, ApplicationProperties properties, Clock clock,
+                              GenerationService generations, OwnerProfileRepository profiles,
+                              ApplicationProperties properties, Clock clock,
                               PlatformTransactionManager transactionManager) {
         this.repository = repository;
         this.documents = documents;
+        this.generations = generations;
         this.profiles = profiles;
         this.properties = properties;
         this.clock = clock;
         this.tx = new TransactionTemplate(transactionManager);
     }
 
-    /** A job to track. {@code status} null means NEW. */
-    public record NewApplication(UUID jobId, String status, String notes) {
+    /**
+     * A job to track. {@code status} null means NEW. With {@code generate=true} a generation of
+     * {@code kinds} (null: both) is queued in the same transaction.
+     */
+    public record NewApplication(UUID jobId, String status, String notes, Boolean generate, List<String> kinds,
+                                 Boolean mentionNoticePeriod) {
+
+        /** Tracking only, no generation. */
+        public NewApplication(UUID jobId, String status, String notes) {
+            this(jobId, status, notes, null, null, null);
+        }
     }
 
     /**
@@ -115,10 +128,11 @@ public class ApplicationService {
     // ------------------------------------------------------------------ create
 
     /**
-     * Tracks a job.
+     * Tracks a job, and with {@code generate=true} queues a generation of its documents (§1.2): the
+     * profile check comes first, so nothing is created without one; the generation is queued after commit.
      *
      * @throws com.talentmatch.service.exception.RequestValidationException 400 for invalid fields
-     * @throws NotFoundException  404 JOB_NOT_FOUND
+     * @throws NotFoundException  404 JOB_NOT_FOUND, or PROFILE_NOT_FOUND with {@code generate}
      * @throws ConflictException  409 APPLICATION_ALREADY_EXISTS naming the existing application
      */
     public ApplicationView create(NewApplication request) {
@@ -135,19 +149,29 @@ public class ApplicationService {
             }
         }
         String notes = notes(in.notes(), errors);
+        GenerationService.Kinds kinds = GenerationService.kinds(in.kinds(), errors);
         errors.throwIfAny();
 
         UUID jobId = in.jobId();
         ApplicationStatus initial = status;
+        boolean generate = Boolean.TRUE.equals(in.generate());
+        boolean mention = Boolean.TRUE.equals(in.mentionNoticePeriod());
         ApplicationView created;
         try {
             created = tx.execute(s -> {
+                if (generate && profiles.findRef().isEmpty()) {
+                    throw NotFoundException.profile();
+                }
                 JobSnapshot job = repository.findJobForSnapshot(jobId).orElseThrow(() -> NotFoundException.job(jobId));
                 repository.findIdByJob(jobId).ifPresent(existing -> {
                     throw alreadyExists(existing);
                 });
                 UUID id = repository.insert(job, initial, notes);
                 repository.insertEvent(id, null, initial, false);
+                if (generate) {
+                    // The new row isn't visible to anyone else yet, so no lock is needed for the insert.
+                    generations.insertLocked(id, kinds, mention);
+                }
                 return view(repository.find(id).orElseThrow(() -> NotFoundException.application(id)));
             });
         } catch (DuplicateKeyException e) {
@@ -158,6 +182,11 @@ public class ApplicationService {
                             "The job changed while it was being tracked. Reload and try again."));
         }
         log.info("Application created id={} job={} status={}", created.id(), jobId, initial);
+        if (generate && created.latestGeneration() != null) {
+            log.info("Generation queued application={} generation={} cv={} coverLetter={}", created.id(),
+                    created.latestGeneration().id(), kinds.cv(), kinds.coverLetter());
+            generations.enqueue(created.latestGeneration().id());   // after commit, so the worker sees the row
+        }
         return created;
     }
 
@@ -271,7 +300,7 @@ public class ApplicationService {
                 sentVersion(versions, row.sentCoverLetterId()),
                 new ApplicationView.Documents(kindDocuments(versions, DocumentKind.CV),
                         kindDocuments(versions, DocumentKind.COVER_LETTER)),
-                null,   // generations arrive with the pipeline (step 5)
+                generations.latest(row.id()),
                 repository.events(row.id()),
                 row.createdAt(),
                 row.updatedAt());

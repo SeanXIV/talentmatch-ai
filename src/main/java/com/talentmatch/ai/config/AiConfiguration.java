@@ -8,6 +8,7 @@ import com.talentmatch.ai.ExplanationGroundingCheck;
 import com.talentmatch.ai.LocalModelGate;
 import com.talentmatch.ai.MatchExplanationValidator;
 import com.talentmatch.ai.SeekerExplanationAssistant;
+import com.talentmatch.application.tailoring.ApplicationProperties;
 import com.talentmatch.repository.MatchJdbcRepository;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.service.AiServices;
@@ -34,7 +35,9 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
  * Nothing here touches the network at startup.
  */
 @Configuration(proxyBeanMethods = false)
-@EnableConfigurationProperties(AiProperties.class)
+// ApplicationProperties: read by the provider configs' TailoringModel beans. Also found by the app's
+// properties scan; registering it here too is a no-op there and keeps provider-config contexts complete.
+@EnableConfigurationProperties({AiProperties.class, ApplicationProperties.class})
 @Import({OllamaChatModelConfig.class, OpenAiChatModelConfig.class, ClaudeChatModelConfig.class})
 public class AiConfiguration {
 

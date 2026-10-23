@@ -6,8 +6,8 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * An AI generation of an application's documents (§5.1 {@code Generation}). Generations arrive with
- * the pipeline (Phase 7 step 5); until then no application has one.
+ * An AI generation of an application's documents (§5.1 {@code Generation}), built by
+ * {@link GenerationRepository.GenerationRow#view()}.
  *
  * @param status        PENDING, RUNNING, SUCCEEDED or FAILED
  * @param failureReason the generation's failure (FAILED only)
