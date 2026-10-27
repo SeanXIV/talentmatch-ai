@@ -4,14 +4,19 @@ import com.talentmatch.ai.AiCircuitBreaker;
 import com.talentmatch.ai.AiProperties;
 import com.talentmatch.ai.ExplanationAssistant;
 import com.talentmatch.ai.ExplanationGenerator;
+import com.talentmatch.ai.ExplanationGroundingCheck;
 import com.talentmatch.ai.LocalModelGate;
 import com.talentmatch.ai.MatchExplanationValidator;
+import com.talentmatch.ai.SeekerExplanationAssistant;
+import com.talentmatch.application.tailoring.ApplicationProperties;
 import com.talentmatch.repository.MatchJdbcRepository;
 import dev.langchain4j.model.chat.ChatModel;
 import dev.langchain4j.service.AiServices;
 import io.micrometer.core.instrument.MeterRegistry;
 import java.time.Clock;
 import java.util.concurrent.ThreadPoolExecutor;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnBooleanProperty;
@@ -30,9 +35,13 @@ import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
  * Nothing here touches the network at startup.
  */
 @Configuration(proxyBeanMethods = false)
-@EnableConfigurationProperties(AiProperties.class)
+// ApplicationProperties: read by the provider configs' TailoringModel beans. Also found by the app's
+// properties scan; registering it here too is a no-op there and keeps provider-config contexts complete.
+@EnableConfigurationProperties({AiProperties.class, ApplicationProperties.class})
 @Import({OllamaChatModelConfig.class, OpenAiChatModelConfig.class, ClaudeChatModelConfig.class})
 public class AiConfiguration {
+
+    private static final Logger log = LoggerFactory.getLogger(AiConfiguration.class);
 
     public static final String AI_EXECUTOR = "aiExecutor";
     private static final String ENABLED = "talentmatch.ai.enabled";
@@ -78,9 +87,28 @@ public class AiConfiguration {
                 .build();
     }
 
+    /**
+     * Seeker-facing AI service (Phase 6): a second proxy over the same {@code ChatModel} bean, with its
+     * own system prompt. Stateless (no chat memory, no tools), so it shares nothing with
+     * {@link #explanationAssistant} except the model client.
+     */
+    @Bean
+    @ConditionalOnBooleanProperty(name = ENABLED, matchIfMissing = true)
+    public SeekerExplanationAssistant seekerExplanationAssistant(ChatModel chatModel) {
+        return AiServices.builder(SeekerExplanationAssistant.class)
+                .chatModel(chatModel)
+                .build();
+    }
+
+    /**
+     * The grounding check comes from outside {@code ai} ({@code seeker.SeekerGroundingCheck}); if no
+     * unique bean is available, every SEEKER output is rejected (fail closed).
+     */
     @Bean
     @ConditionalOnBooleanProperty(name = ENABLED, matchIfMissing = true)
     public ExplanationGenerator explanationGenerator(ExplanationAssistant assistant,
+                                                     SeekerExplanationAssistant seekerAssistant,
+                                                     ObjectProvider<ExplanationGroundingCheck> groundingCheck,
                                                      MatchJdbcRepository matchJdbcRepository,
                                                      AiCircuitBreaker circuitBreaker,
                                                      ModelInfo modelInfo,
@@ -88,8 +116,12 @@ public class AiConfiguration {
                                                      Clock clock,
                                                      ObjectProvider<MeterRegistry> meterRegistry,
                                                      ObjectProvider<LocalModelGate> localModelGate) {
-        return new ExplanationGenerator(assistant, new MatchExplanationValidator(), matchJdbcRepository,
-                circuitBreaker, modelInfo, aiExecutor, clock, meterRegistry.getIfAvailable(),
+        ExplanationGroundingCheck check = groundingCheck.getIfUnique();
+        if (check == null) {
+            log.warn("No unique ExplanationGroundingCheck bean: seeker explanations will always use templates");
+        }
+        return new ExplanationGenerator(assistant, seekerAssistant, check, new MatchExplanationValidator(),
+                matchJdbcRepository, circuitBreaker, modelInfo, aiExecutor, clock, meterRegistry.getIfAvailable(),
                 localModelGate.getIfAvailable());
     }
 }

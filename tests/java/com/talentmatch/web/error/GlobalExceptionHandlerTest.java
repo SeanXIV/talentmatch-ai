@@ -226,4 +226,42 @@ class GlobalExceptionHandlerTest {
             assertThat(res.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).as(uri).isEqualTo("2");
         }
     }
+
+    // ------------------------------------------------------------------ Phase 6 §12.3: candidate-side matches paths
+
+    private static boolean matchesEndpoint(String uri) {
+        return GlobalExceptionHandler.isMatchesEndpoint(new MockHttpServletRequest("GET", uri));
+    }
+
+    @Test
+    void isMatchesEndpointCoversTheCandidateAndProfileMatchesPaths() {
+        for (String uri : new String[] {"/api/jobs/x/matches", "/api/matches", "/api/matches/recompute",
+                "/api/candidates/3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6/matches", "/api/candidates/x/matches/",
+                "/api/candidates/not-a-uuid/matches", "/api/profile/matches", "/api/profile/matches/"}) {
+            assertThat(matchesEndpoint(uri)).as(uri).isTrue();
+        }
+        for (String uri : new String[] {"/api/candidates", "/api/candidates/x", "/api/candidates//matches",
+                "/api/candidates/x/y/matches", "/api/candidates/x/matchesx", "/api/profile", "/api/profilex/matches",
+                "/api/profile/matchesx", "/api/profile/x/matches", "/x/api/candidates/y/matches", "/api/jobs/x"}) {
+            assertThat(matchesEndpoint(uri)).as(uri).isFalse();
+        }
+        MockHttpServletRequest noUri = new MockHttpServletRequest();
+        noUri.setRequestURI(null);
+        assertThat(GlobalExceptionHandler.isMatchesEndpoint(noUri)).isFalse();
+    }
+
+    @Test
+    void lockFailureOnCandidateMatchesIsMatchesBusyButCandidateEditsAreServiceBusy() {
+        for (String uri : new String[] {"/api/candidates/3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6/matches",
+                "/api/profile/matches"}) {
+            ResponseEntity<ApiError> res = lockFailure("GET", uri);
+            assertThat(res.getBody().code()).as(uri).isEqualTo("MATCHES_BUSY");
+            assertThat(res.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).as(uri).isEqualTo("2");
+        }
+        for (String uri : new String[] {"/api/candidates/3f2c0e9a-1b2c-4d5e-8f90-a1b2c3d4e5f6", "/api/profile"}) {
+            ResponseEntity<ApiError> res = lockFailure("PUT", uri);
+            assertThat(res.getBody().code()).as(uri).isEqualTo("SERVICE_BUSY");
+            assertThat(res.getHeaders().getFirst(HttpHeaders.RETRY_AFTER)).as(uri).isEqualTo("2");
+        }
+    }
 }

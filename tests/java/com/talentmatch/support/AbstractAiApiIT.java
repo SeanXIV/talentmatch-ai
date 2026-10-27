@@ -5,6 +5,7 @@ import static org.awaitility.Awaitility.await;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.talentmatch.ai.AiCircuitBreaker;
+import com.talentmatch.application.tailoring.TailoringModel;
 import com.talentmatch.profile.ResumeExtractionModel;
 import com.talentmatch.support.Api.Res;
 import java.time.Duration;
@@ -68,10 +69,18 @@ public abstract class AbstractAiApiIT extends AbstractApiIT {
     /** The scripted CV extraction model (Phase 4). */
     protected FakeExtractionModel extractor;
 
+    @Autowired
+    protected TailoringModel tailoringModel;
+
+    /** The scripted tailoring model (Phase 7). */
+    protected FakeTailoringModel tailor;
+
     @BeforeEach
     void resetAi() {
         extractor = (FakeExtractionModel) extractionModel.chatModel();
         extractor.reset();
+        tailor = (FakeTailoringModel) tailoringModel.chatModel();
+        tailor.reset();
         fake.reset();
         circuit.recordSuccess(); // a previous test may have opened the shared circuit
     }
@@ -86,18 +95,21 @@ public abstract class AbstractAiApiIT extends AbstractApiIT {
     void drainAi() {
         fake.releaseAll();
         extractor.releaseAll();
+        tailor.releaseAll();
         awaitAiIdle();
         fake.reset();
         extractor.reset();
+        tailor.reset();
     }
 
     /**
-     * Waits until no explanation generation and no CV extraction is running or queued (background
-     * work persists itself and must not leak into the next test's truncated tables).
+     * Waits until no explanation generation, no CV extraction and no document generation (Phase 7) is
+     * running or queued (background work persists itself and must not leak into the next test's truncated
+     * tables).
      */
     protected void awaitAiIdle() {
         await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(50)).until(() ->
-                idle(aiExecutor) && idle(profileExecutor));
+                idle(aiExecutor) && idle(profileExecutor) && idle(applicationExecutor));
     }
 
     private static boolean idle(ThreadPoolTaskExecutor executor) {

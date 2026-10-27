@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_schema.sh - Verify the TalentMatch AI schema (V1 to V5) in the running
+# test_schema.sh - Verify the TalentMatch AI schema (V1 to V7) in the running
 # talentmatch-postgres container. Behavioral checks run in a transaction that
 # is rolled back, so no test data is left behind.
 #
@@ -44,7 +44,11 @@ BEGIN
                    WHERE version = '5' AND success) THEN
         RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V5';
     END IF;
-    RAISE NOTICE 'PASS: PostgreSQL 16, Flyway V1 to V5 success';
+    IF NOT EXISTS (SELECT 1 FROM flyway_schema_history
+                   WHERE version = '6' AND success) THEN
+        RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V6';
+    END IF;
+    RAISE NOTICE 'PASS: PostgreSQL 16, Flyway V1 to V6 success';
 END $$;
 
 -- ---------- Tables ----------
@@ -251,6 +255,48 @@ BEGIN
     RAISE NOTICE 'PASS: V3 explanation columns and ck_job_match_explanation_complete present';
 END $$;
 
+-- ---------- V6 seeker explanation columns, check and candidate index ----------
+DO $$
+DECLARE r record; actual text;
+BEGIN
+    FOR r IN SELECT * FROM (VALUES
+        ('seeker_explanation_payload',      'jsonb'),
+        ('seeker_explanation_input_hash',   'character(64)'),
+        ('seeker_explanation_model',        'character varying(200)'),
+        ('seeker_explanation_generated_at', 'timestamp with time zone')
+    ) AS v(col, typ) LOOP
+        SELECT format_type(a.atttypid, a.atttypmod) INTO actual
+          FROM pg_attribute a
+         WHERE a.attrelid = 'public.job_match'::regclass AND a.attname = r.col AND NOT a.attisdropped;
+        IF actual IS NULL THEN
+            RAISE EXCEPTION 'FAIL: missing column job_match.%', r.col;
+        END IF;
+        IF actual <> r.typ THEN
+            RAISE EXCEPTION 'FAIL: job_match.% is % (expected %)', r.col, actual, r.typ;
+        END IF;
+        IF EXISTS (SELECT 1 FROM pg_attribute a
+                    WHERE a.attrelid = 'public.job_match'::regclass AND a.attname = r.col AND a.attnotnull) THEN
+            RAISE EXCEPTION 'FAIL: job_match.% must be nullable', r.col;
+        END IF;
+    END LOOP;
+    IF EXISTS (SELECT 1 FROM pg_attribute a
+                WHERE a.attrelid = 'public.job_match'::regclass AND a.attname = 'seeker_ai_explanation') THEN
+        RAISE EXCEPTION 'FAIL: unexpected seeker text column (the payload holds the text)';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+                   WHERE conname = 'ck_job_match_seeker_explanation_complete' AND contype = 'c'
+                     AND conrelid = 'public.job_match'::regclass AND convalidated) THEN
+        RAISE EXCEPTION 'FAIL: missing validated check constraint ck_job_match_seeker_explanation_complete';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes
+                    WHERE schemaname = 'public' AND tablename = 'job_match'
+                      AND indexname = 'ix_job_match_candidate_score'
+                      AND indexdef LIKE '%(candidate_id, score DESC)%') THEN
+        RAISE EXCEPTION 'FAIL: missing index ix_job_match_candidate_score on job_match (candidate_id, score DESC)';
+    END IF;
+    RAISE NOTICE 'PASS: V6 seeker columns, ck_job_match_seeker_explanation_complete and ix_job_match_candidate_score present';
+END $$;
+
 -- ---------- Behavioral checks (rolled back) ----------
 BEGIN;
 
@@ -391,6 +437,83 @@ BEGIN
            explanation_model = NULL, explanation_generated_at = NULL
      WHERE candidate_id = c_id AND job_id = j_id;
     RAISE NOTICE 'PASS: clearing a whole explanation accepted';
+END $$;
+
+ROLLBACK;
+
+-- ---------- V6 behavioral checks (rolled back) ----------
+BEGIN;
+
+DO $$
+DECLARE
+    c_id uuid; j_id uuid;
+    h constant text := repeat('b', 64);
+    p constant jsonb := '{"headline":"h","explanation":"You fit.","strengths":[],"gaps":[]}';
+    r record; n int;
+BEGIN
+    INSERT INTO candidate (full_name, email) VALUES ('QA V6', 'qa.v6@example.com') RETURNING id INTO c_id;
+    INSERT INTO job (title, company) VALUES ('QA V6 Engineer', 'QA V6 Corp') RETURNING id INTO j_id;
+    INSERT INTO job_match (candidate_id, job_id, score) VALUES (c_id, j_id, 0.5);
+    RAISE NOTICE 'PASS: a row without a seeker explanation satisfies the V6 check';
+
+    -- a complete seeker explanation is accepted, independently of the (empty) recruiter columns
+    UPDATE job_match SET seeker_explanation_payload = p, seeker_explanation_input_hash = h,
+           seeker_explanation_model = 'ollama/qa', seeker_explanation_generated_at = now()
+     WHERE candidate_id = c_id AND job_id = j_id;
+    RAISE NOTICE 'PASS: complete seeker explanation accepted with recruiter columns NULL';
+
+    -- and both audiences can be stored side by side
+    UPDATE job_match SET ai_explanation = 'QA text', explanation_payload = '{"headline":"h"}',
+           explanation_input_hash = repeat('a', 64), explanation_model = 'ollama/qa',
+           explanation_generated_at = now()
+     WHERE candidate_id = c_id AND job_id = j_id;
+    RAISE NOTICE 'PASS: recruiter and seeker explanations coexist';
+
+    -- every partial or malformed seeker combination is rejected
+    FOR r IN SELECT * FROM (VALUES
+        ('payload only',            p,                         NULL::text,       NULL::text,  false),
+        ('no hash',                 p,                         NULL,             'ollama/qa', true),
+        ('no model',                p,                         h,                NULL,        true),
+        ('blank model',             p,                         h,                '  ',        true),
+        ('no generated_at',         p,                         h,                'ollama/qa', false),
+        ('no payload',              NULL::jsonb,               h,                'ollama/qa', true),
+        ('payload w/o explanation', '{"headline":"h"}'::jsonb, h,                'ollama/qa', true),
+        ('array payload',           '["explanation"]'::jsonb,  h,                'ollama/qa', true),
+        ('string payload',          '"explanation"'::jsonb,    h,                'ollama/qa', true),
+        ('upper-case hash',         p,                         repeat('B', 64),  'ollama/qa', true),
+        ('non-hex hash',            p,                         repeat('g', 64),  'ollama/qa', true),
+        ('timestamp only',          NULL::jsonb,               NULL,             NULL,        true)
+    ) AS v(label, payload, hash, model, with_ts) LOOP
+        BEGIN
+            UPDATE job_match SET seeker_explanation_payload = r.payload, seeker_explanation_input_hash = r.hash,
+                   seeker_explanation_model = r.model,
+                   seeker_explanation_generated_at = CASE WHEN r.with_ts THEN now() END
+             WHERE candidate_id = c_id AND job_id = j_id;
+            RAISE EXCEPTION 'FAIL: partial seeker explanation accepted (%)', r.label;
+        EXCEPTION WHEN check_violation THEN
+            NULL;
+        END;
+    END LOOP;
+    RAISE NOTICE 'PASS: partial / malformed seeker explanations rejected by ck_job_match_seeker_explanation_complete';
+
+    BEGIN
+        UPDATE job_match SET seeker_explanation_input_hash = 'abc' WHERE candidate_id = c_id AND job_id = j_id;
+        RAISE EXCEPTION 'FAIL: short seeker hash accepted';
+    EXCEPTION WHEN check_violation THEN
+        RAISE NOTICE 'PASS: short seeker hash rejected';
+    END;
+
+    -- clearing the seeker explanation leaves the recruiter one in place (independent checks)
+    UPDATE job_match SET seeker_explanation_payload = NULL, seeker_explanation_input_hash = NULL,
+           seeker_explanation_model = NULL, seeker_explanation_generated_at = NULL
+     WHERE candidate_id = c_id AND job_id = j_id;
+    SELECT count(*) INTO n FROM job_match
+     WHERE candidate_id = c_id AND job_id = j_id AND ai_explanation = 'QA text'
+       AND seeker_explanation_payload IS NULL;
+    IF n <> 1 THEN
+        RAISE EXCEPTION 'FAIL: clearing the seeker explanation affected the recruiter one';
+    END IF;
+    RAISE NOTICE 'PASS: clearing a whole seeker explanation accepted; recruiter explanation kept';
 END $$;
 
 ROLLBACK;
@@ -726,6 +849,110 @@ BEGIN
         RAISE EXCEPTION 'FAIL: skill delete (cascading to job_skill) did not bump job.updated_at (%)', ts;
     END IF;
     RAISE NOTICE 'PASS: skill delete cascades to links and bumps the parent';
+END $$;
+
+ROLLBACK;
+
+-- ---------- V7 applications (rolled back) ----------
+BEGIN;
+
+DO $$
+DECLARE
+    t text; j_id uuid; a_id uuid; keep_id uuid; pv int; cv uuid; cv2 uuid; cl uuid; n int;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM flyway_schema_history WHERE version = '7' AND success) THEN
+        RAISE EXCEPTION 'FAIL: flyway_schema_history has no successful V7';
+    END IF;
+    FOREACH t IN ARRAY ARRAY['application','application_document','application_document_file',
+                             'application_generation','application_event'] LOOP
+        IF to_regclass('public.' || t) IS NULL THEN
+            RAISE EXCEPTION 'FAIL: missing table %', t;
+        END IF;
+    END LOOP;
+    FOREACH t IN ARRAY ARRAY['uq_application_job','uq_application_generation_active'] LOOP
+        IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE schemaname = 'public' AND indexname = t) THEN
+            RAISE EXCEPTION 'FAIL: missing index %', t;
+        END IF;
+    END LOOP;
+    RAISE NOTICE 'PASS: V7 tables and indexes present';
+
+    INSERT INTO job (title, company) VALUES ('QaV7 Engineer', 'QaV7 Corp') RETURNING id INTO j_id;
+    INSERT INTO owner_profile_version (version, profile)
+    SELECT COALESCE(max(version), 0) + 1, '{}' FROM owner_profile_version RETURNING version INTO pv;
+    INSERT INTO application (job_id, job_title, job_company) VALUES (j_id, 'QaV7 Engineer', 'QaV7 Corp')
+    RETURNING id INTO a_id;
+    INSERT INTO application (job_title, job_company) VALUES ('QaV7 Keep', 'QaV7 Corp') RETURNING id INTO keep_id;
+
+    BEGIN
+        INSERT INTO application (job_id, job_title, job_company) VALUES (j_id, 'Dup', 'Dup');
+        RAISE EXCEPTION 'FAIL: second application for one job accepted';
+    EXCEPTION WHEN unique_violation THEN
+        NULL;
+    END;
+    BEGIN
+        UPDATE application SET status = 'APPLIED' WHERE id = a_id;
+        RAISE EXCEPTION 'FAIL: APPLIED without applied_on accepted';
+    EXCEPTION WHEN check_violation THEN
+        NULL;
+    END;
+
+    INSERT INTO application_document (application_id, kind, version, source, profile_version, content, model,
+                                      input_hash)
+    VALUES (a_id, 'CV', 1, 'AI', pv, '{}', 'qa/m', repeat('a', 64)) RETURNING id INTO cv;
+    INSERT INTO application_document (application_id, kind, version, source, based_on_id, profile_version, content)
+    VALUES (a_id, 'CV', 2, 'EDIT', cv, pv, '{}') RETURNING id INTO cv2;
+    INSERT INTO application_document (application_id, kind, version, source, profile_version, content, model,
+                                      input_hash)
+    VALUES (a_id, 'COVER_LETTER', 1, 'AI', pv, '{}', 'qa/m', repeat('a', 64)) RETURNING id INTO cl;
+
+    BEGIN
+        UPDATE application_document SET content = '{"x": 1}' WHERE id = cv;
+        RAISE EXCEPTION 'FAIL: application_document content UPDATE accepted';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE 'FAIL:%' THEN RAISE; END IF;
+    END;
+    BEGIN
+        INSERT INTO application_document_file (document_id, format, content, size_bytes, sha256)
+        VALUES (cv2, 'PDF', '\x010203', 3, repeat('a', 64));
+        RAISE EXCEPTION 'FAIL: file for an unapproved version accepted';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE 'FAIL:%' THEN RAISE; END IF;
+    END;
+    UPDATE application_document SET approved_at = now(), approval_acknowledged = false WHERE id IN (cv2, cl);
+    BEGIN
+        UPDATE application_document SET approved_at = now() + interval '1 hour' WHERE id = cv2;
+        RAISE EXCEPTION 'FAIL: second approval accepted';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE 'FAIL:%' THEN RAISE; END IF;
+    END;
+    BEGIN
+        DELETE FROM application_document WHERE id = cv;
+        RAISE EXCEPTION 'FAIL: direct application_document DELETE accepted';
+    EXCEPTION WHEN raise_exception THEN
+        IF SQLERRM LIKE 'FAIL:%' THEN RAISE; END IF;
+    END;
+    INSERT INTO application_document_file (document_id, format, content, size_bytes, sha256)
+    VALUES (cv2, 'PDF', '\x010203', 3, repeat('a', 64)), (cl, 'DOCX', '\x010203', 3, repeat('a', 64));
+    INSERT INTO application_generation (application_id, want_cv, want_cover_letter, status, model, cv_document_id,
+                                        cover_letter_document_id, started_at, finished_at)
+    VALUES (a_id, true, true, 'SUCCEEDED', 'qa/m', cv, cl, now(), now());
+    INSERT INTO application_event (application_id, from_status, to_status) VALUES (a_id, NULL, 'NEW');
+    UPDATE application SET status = 'APPLIED', applied_on = current_date, sent_cv_id = cv2, sent_cover_letter_id = cl
+    WHERE id = a_id;
+    RAISE NOTICE 'PASS: V7 checks, append-only documents and the file guard';
+
+    DELETE FROM application WHERE id = a_id;
+    SELECT (SELECT count(*) FROM application_document WHERE application_id = a_id)
+         + (SELECT count(*) FROM application_document_file WHERE document_id IN (cv, cv2, cl))
+         + (SELECT count(*) FROM application_generation WHERE application_id = a_id)
+         + (SELECT count(*) FROM application_event WHERE application_id = a_id) INTO n;
+    IF n <> 0 THEN
+        RAISE EXCEPTION 'FAIL: application delete left % child row(s)', n;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM application WHERE id = keep_id) THEN
+        RAISE EXCEPTION 'FAIL: application delete removed another application';
+    END IF;
+    RAISE NOTICE 'PASS: deleting an application cascades through the append-only triggers';
 END $$;
 
 ROLLBACK;

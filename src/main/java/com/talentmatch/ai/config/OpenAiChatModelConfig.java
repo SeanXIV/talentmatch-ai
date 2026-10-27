@@ -1,6 +1,8 @@
 package com.talentmatch.ai.config;
 
 import com.talentmatch.ai.AiProperties;
+import com.talentmatch.application.tailoring.ApplicationProperties;
+import com.talentmatch.application.tailoring.TailoringModel;
 import com.talentmatch.feed.skills.JobSkillExtractionModel;
 import com.talentmatch.feed.skills.SkillsProperties;
 import com.talentmatch.profile.ProfileProperties;
@@ -43,6 +45,18 @@ public class OpenAiChatModelConfig {
     public JobSkillExtractionModel openAiJobSkillExtractionModel(AiProperties ai, SkillsProperties skills) {
         SkillsProperties.Enrichment e = skills.enrichment();
         return JobSkillExtractionModel.remote(build(ai, e.callTimeout(), e.maxOutputTokens(), e.temperature(), true),
+                ModelInfo.of(ai).label());
+    }
+
+    /**
+     * Same model for tailored CVs and cover letters (Phase 7): generation timeout, output budget and
+     * temperature. Non-strict schema, as for CV extraction (nullable headline and summary). Only called
+     * with {@code talentmatch.applications.allow-remote-generation=true}.
+     */
+    @Bean
+    public TailoringModel openAiTailoringModel(AiProperties ai, ApplicationProperties applications) {
+        ApplicationProperties.Generation g = applications.generation();
+        return TailoringModel.remote(build(ai, g.callTimeout(), g.maxOutputTokens(), g.temperature(), false),
                 ModelInfo.of(ai).label());
     }
 

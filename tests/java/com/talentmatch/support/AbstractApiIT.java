@@ -17,10 +17,12 @@ import java.util.Map;
 import java.util.UUID;
 import org.junit.jupiter.api.BeforeEach;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.context.annotation.Import;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskExecutor;
 import org.testcontainers.containers.PostgreSQLContainer;
 
 /**
@@ -65,15 +67,33 @@ public abstract class AbstractApiIT {
     @Autowired
     protected PostgreSQLContainer<?> postgres;
 
+    /** Phase 7: the document generation queue (exists with AI on and off). */
+    @Autowired
+    @Qualifier("applicationExecutor")
+    protected ThreadPoolTaskExecutor applicationExecutor;
+
     protected Api api;
 
     @BeforeEach
     void resetDatabase() {
+        // Phase 7: a generation still finishing from the previous test must not write into the truncated tables.
+        awaitApplicationIdle();
         api = new Api(port, mapper);
         // No CASCADE: every table must be listed (a missing one fails loudly instead of being silently kept).
-        jdbc.execute("TRUNCATE feed_notification, job_posting, feed_job, feed_source, feed_api_usage, feed_state, "
+        // Phase 7: the five V7 tables go in the same statement as owner_profile_version and job (they reference both).
+        jdbc.execute("TRUNCATE application_document_file, application_generation, application_event, "
+                + "application_document, application, "
+                + "feed_notification, job_posting, feed_job, feed_source, feed_api_usage, feed_state, "
                 + "job_preferences, notification_settings, skill_alias, owner_profile, owner_profile_version, resume, "
                 + "job_match, candidate_skill, job_skill, candidate, job, skill");
+    }
+
+    /** Waits until no document generation is running or queued (Phase 7). */
+    protected void awaitApplicationIdle() {
+        org.awaitility.Awaitility.await().atMost(java.time.Duration.ofSeconds(30))
+                .pollInterval(java.time.Duration.ofMillis(50)).until(() ->
+                        applicationExecutor.getActiveCount() == 0
+                                && applicationExecutor.getThreadPoolExecutor().getQueue().isEmpty());
     }
 
     // ------------------------------------------------------------------ fixtures via the API

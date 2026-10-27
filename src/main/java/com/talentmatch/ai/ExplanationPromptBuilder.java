@@ -3,7 +3,6 @@ package com.talentmatch.ai;
 import com.talentmatch.domain.scoring.MatchEvaluation;
 import com.talentmatch.domain.scoring.SkillHit;
 import java.util.List;
-import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 /**
@@ -16,9 +15,6 @@ import java.util.stream.Collectors;
  * boundary and placed only inside their tags. The candidate's email is never an input.
  */
 public final class ExplanationPromptBuilder {
-
-    private static final Pattern WHITESPACE = Pattern.compile("\\s+");
-    private static final String ELLIPSIS = "…";
 
     private final int maxContextChars;
 
@@ -33,7 +29,7 @@ public final class ExplanationPromptBuilder {
         return maxContextChars;
     }
 
-    /** The exact user message sent to the model for this match. */
+    /** The exact recruiter user message sent to the model for this match. */
     public String build(JobContext job, MatchContext match) {
         MatchEvaluation eval = match.evaluation();
         int requiredCount = eval.matchedRequired().size() + eval.missingRequired().size();
@@ -43,6 +39,37 @@ public final class ExplanationPromptBuilder {
         sb.append(ExplanationPrompts.FACTS_HEADER).append('\n');
         sb.append("Job: ").append(line(job.title())).append(" at ").append(line(job.company())).append('\n');
         sb.append("Candidate: ").append(line(match.candidateName())).append('\n');
+        appendFacts(sb, match, eval, requiredCount);
+        sb.append(ExplanationPrompts.BACKGROUND_HEADER).append('\n');
+        appendTagged(sb, ExplanationPrompts.JOB_DESCRIPTION_TAG, job.description());
+        sb.append('\n');
+        appendTagged(sb, ExplanationPrompts.CANDIDATE_SUMMARY_TAG, match.candidateSummary());
+        return sb.toString();
+    }
+
+    /**
+     * The exact seeker user message (Phase 6 §4.4): the same MATCH FACTS lines as {@link #build}
+     * without the candidate line, and the summary in {@code <profile_summary>}. The candidate's name
+     * and email are never part of it.
+     */
+    public String buildSeeker(JobContext job, MatchContext match) {
+        MatchEvaluation eval = match.evaluation();
+        int requiredCount = eval.matchedRequired().size() + eval.missingRequired().size();
+
+        StringBuilder sb = new StringBuilder(1024);
+        sb.append(SeekerExplanationPrompts.INTRO).append("\n\n");
+        sb.append(ExplanationPrompts.FACTS_HEADER).append('\n');
+        sb.append("Job: ").append(line(job.title())).append(" at ").append(line(job.company())).append('\n');
+        appendFacts(sb, match, eval, requiredCount);
+        sb.append(ExplanationPrompts.BACKGROUND_HEADER).append('\n');
+        appendTagged(sb, ExplanationPrompts.JOB_DESCRIPTION_TAG, job.description());
+        sb.append('\n');
+        appendTagged(sb, SeekerExplanationPrompts.PROFILE_SUMMARY_TAG, match.candidateSummary());
+        return sb.toString();
+    }
+
+    /** Score, the four skill lines and the summary line, then a blank line (shared by both audiences). */
+    private static void appendFacts(StringBuilder sb, MatchContext match, MatchEvaluation eval, int requiredCount) {
         sb.append("Score: ").append(match.scorePercent()).append("% (")
                 .append(eval.earnedPoints()).append(" of ").append(eval.maxPoints())
                 .append(" points; required skills weigh more than nice-to-have skills)\n");
@@ -53,11 +80,6 @@ public final class ExplanationPromptBuilder {
         sb.append("Matched nice-to-have skills: ").append(matched(eval.matchedNiceToHave())).append('\n');
         sb.append("Missing nice-to-have skills: ").append(missing(eval.missingNiceToHave())).append('\n');
         sb.append("Summary: ").append(line(eval.summary())).append("\n\n");
-        sb.append(ExplanationPrompts.BACKGROUND_HEADER).append('\n');
-        appendTagged(sb, ExplanationPrompts.JOB_DESCRIPTION_TAG, job.description());
-        sb.append('\n');
-        appendTagged(sb, ExplanationPrompts.CANDIDATE_SUMMARY_TAG, match.candidateSummary());
-        return sb.toString();
     }
 
     /** Skill with years, e.g. {@code Java (5 years)}, {@code Java (1 year)} or {@code Java}. */
@@ -102,66 +124,18 @@ public final class ExplanationPromptBuilder {
         return truncate(clean, maxContextChars);
     }
 
-    /** Single-line field: sanitized with whitespace (including newlines) collapsed to one space. */
+    /** Single-line field: delegates to {@link PromptText#line}. */
     static String line(String text) {
-        if (text == null) {
-            return "";
-        }
-        return WHITESPACE.matcher(sanitize(text)).replaceAll(" ").strip();
+        return PromptText.line(text);
     }
 
-    /**
-     * Escapes {@code & < >}, breaks up {@code {{ }}}, normalizes line breaks and tabs, and strips
-     * every other control character.
-     */
+    /** Delegates to {@link PromptText#sanitize}. */
     static String sanitize(String text) {
-        if (text == null) {
-            return "";
-        }
-        String s = text.replace("\r\n", "\n").replace('\r', '\n').replace('\t', ' ');
-        StringBuilder sb = new StringBuilder(s.length() + 16);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == '\n') {
-                sb.append(c);
-            } else if (Character.isISOControl(c)) {
-                continue;
-            } else if (c == '&') {
-                sb.append("&amp;");
-            } else if (c == '<') {
-                sb.append("&lt;");
-            } else if (c == '>') {
-                sb.append("&gt;");
-            } else {
-                sb.append(c);
-            }
-        }
-        String out = sb.toString();
-        while (out.contains("{{")) {
-            out = out.replace("{{", "{ {");
-        }
-        while (out.contains("}}")) {
-            out = out.replace("}}", "} }");
-        }
-        return out;
+        return PromptText.sanitize(text);
     }
 
-    /**
-     * Cuts {@code text} to at most {@code max} characters at the last whitespace at or before
-     * the limit (hard cut if there is none) and appends an ellipsis.
-     */
+    /** Delegates to {@link PromptText#truncate}. */
     static String truncate(String text, int max) {
-        if (text.length() <= max) {
-            return text;
-        }
-        int cut = -1;
-        for (int i = Math.min(max, text.length() - 1); i > 0; i--) {
-            if (Character.isWhitespace(text.charAt(i))) {
-                cut = i;
-                break;
-            }
-        }
-        String head = cut > 0 ? text.substring(0, cut) : text.substring(0, max);
-        return head.stripTrailing() + ELLIPSIS;
+        return PromptText.truncate(text, max);
     }
 }

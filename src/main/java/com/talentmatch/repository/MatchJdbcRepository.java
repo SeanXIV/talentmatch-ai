@@ -80,6 +80,19 @@ public class MatchJdbcRepository {
             ON CONFLICT (candidate_id, job_id) DO UPDATE
                SET score = EXCLUDED.score, computed_at = EXCLUDED.computed_at""";
 
+    // Candidate-side variant (Phase 6): one candidate, many jobs. Joined to job so jobs deleted in
+    // the meantime are skipped, and to candidate so a deleted candidate writes 0 rows. Rows are
+    // inserted in job_id order. No explanation column (V3 or V6) is touched.
+    private static final String SQL_UPSERT_FOR_CANDIDATE = """
+            INSERT INTO job_match (candidate_id, job_id, score, computed_at)
+            SELECT cand.id, u.j, u.s, now()
+            FROM unnest(:jids::uuid[], :scores::float8[]) AS u(j, s)
+            JOIN job jb ON jb.id = u.j
+            JOIN candidate cand ON cand.id = :candidateId
+            ORDER BY u.j
+            ON CONFLICT (candidate_id, job_id) DO UPDATE
+               SET score = EXCLUDED.score, computed_at = EXCLUDED.computed_at""";
+
     private static final String SQL_RANKED_PAGE = """
             SELECT m.candidate_id, c.full_name, m.score, m.computed_at, m.ai_explanation,
                    c.summary AS candidate_summary, c.updated_at AS candidate_updated_at,
@@ -100,6 +113,21 @@ public class MatchJdbcRepository {
                    explanation_input_hash = :inputHash,
                    explanation_model = :model,
                    explanation_generated_at = :generatedAt
+              FROM candidate c, job j
+             WHERE m.job_id = :jobId AND m.candidate_id = :candidateId
+               AND c.id = m.candidate_id AND j.id = m.job_id
+               AND c.updated_at = :candidateUpdatedAt
+               AND j.updated_at = :jobUpdatedAt
+               AND m.score = :expectedScore""";
+
+    // Seeker counterpart (V6): same guards, only the seeker_explanation_* columns. The text lives
+    // in the payload's 'explanation' key (required by the V6 CHECK).
+    private static final String SQL_SAVE_SEEKER_EXPLANATION = """
+            UPDATE job_match m
+               SET seeker_explanation_payload = CAST(:payload AS jsonb),
+                   seeker_explanation_input_hash = :inputHash,
+                   seeker_explanation_model = :model,
+                   seeker_explanation_generated_at = :generatedAt
               FROM candidate c, job j
              WHERE m.job_id = :jobId AND m.candidate_id = :candidateId
                AND c.id = m.candidate_id AND j.id = m.job_id
@@ -246,6 +274,40 @@ public class MatchJdbcRepository {
         return written;
     }
 
+    /**
+     * Candidate-side upsert: inserts or refreshes the scores of one candidate against many jobs;
+     * computed_at becomes now(). Jobs deleted in the meantime are skipped; a deleted candidate
+     * writes nothing. Explanation columns are never touched.
+     *
+     * @param jobIds distinct job ids (a duplicate would hit the same row twice and fail the statement)
+     * @param scores one score per job id, same order
+     * @return number of rows written
+     * @throws org.springframework.dao.InvalidDataAccessApiUsageException if {@code jobIds} and
+     *         {@code scores} differ in length. The method throws an {@link IllegalArgumentException};
+     *         called through the Spring {@code @Repository} bean, the persistence exception translation
+     *         wraps it in {@code InvalidDataAccessApiUsageException} (with the IAE as its cause). A
+     *         direct call on an unproxied instance sees the IAE itself.
+     */
+    public int upsertCandidateScores(UUID candidateId, List<UUID> jobIds, double[] scores) {
+        if (jobIds.size() != scores.length) {
+            throw new IllegalArgumentException("jobIds and scores differ in length");
+        }
+        int written = 0;
+        for (int from = 0; from < jobIds.size(); from += UPSERT_CHUNK) {
+            int to = Math.min(from + UPSERT_CHUNK, jobIds.size());
+            Double[] chunkScores = new Double[to - from];
+            for (int i = from; i < to; i++) {
+                chunkScores[i - from] = scores[i];
+            }
+            MapSqlParameterSource params = new MapSqlParameterSource()
+                    .addValue("candidateId", candidateId)
+                    .addValue("jids", uuidArray(jobIds.subList(from, to)))
+                    .addValue("scores", sqlArray("float8", chunkScores));
+            written += jdbc.update(SQL_UPSERT_FOR_CANDIDATE, params);
+        }
+        return written;
+    }
+
     public List<RankedRow> findRankedPage(UUID jobId, double minScore, int limit, long offset) {
         MapSqlParameterSource params = new MapSqlParameterSource()
                 .addValue("jobId", jobId)
@@ -273,27 +335,49 @@ public class MatchJdbcRepository {
     }
 
     /**
-     * Stores a generated explanation if nothing it was based on has changed. Call outside any
-     * transaction: it autocommits and is one short statement.
-     *
-     * @param expectedScore the raw job_match.score read with the page (not the rounded value)
-     * @return 1 if saved, 0 if the candidate, job or score changed since they were read (result discarded)
+     * Stores a generated recruiter explanation (V3 columns). Same as
+     * {@link #saveExplanation(ExplanationTarget, UUID, UUID, double, Instant, Instant, String, String, String, String, Instant)}
+     * with {@link ExplanationTarget#RECRUITER}.
      */
     public int saveExplanation(UUID jobId, UUID candidateId, double expectedScore, Instant candidateUpdatedAt,
                                Instant jobUpdatedAt, String text, String payloadJson, String inputHash,
                                String model, Instant generatedAt) {
+        return saveExplanation(ExplanationTarget.RECRUITER, jobId, candidateId, expectedScore, candidateUpdatedAt,
+                jobUpdatedAt, text, payloadJson, inputHash, model, generatedAt);
+    }
+
+    /**
+     * Stores a generated explanation in one target's columns if nothing it was based on has changed.
+     * Call outside any transaction: it autocommits and is one short statement. RECRUITER writes only
+     * the V3 columns, SEEKER only the V6 {@code seeker_explanation_*} columns.
+     *
+     * @param target        which column set to write
+     * @param expectedScore the raw job_match.score read with the page (not the rounded value)
+     * @param text          the explanation text; stored in {@code ai_explanation} for RECRUITER, unused
+     *                      for SEEKER (the payload's {@code explanation} key is the text)
+     * @return 1 if saved, 0 if the candidate, job or score changed since they were read (result discarded)
+     */
+    public int saveExplanation(ExplanationTarget target, UUID jobId, UUID candidateId, double expectedScore,
+                               Instant candidateUpdatedAt, Instant jobUpdatedAt, String text, String payloadJson,
+                               String inputHash, String model, Instant generatedAt) {
         MapSqlParameterSource params = new MapSqlParameterSource()
                 .addValue("jobId", jobId)
                 .addValue("candidateId", candidateId)
                 .addValue("expectedScore", expectedScore)
                 .addValue("candidateUpdatedAt", toOffset(candidateUpdatedAt), Types.TIMESTAMP_WITH_TIMEZONE)
                 .addValue("jobUpdatedAt", toOffset(jobUpdatedAt), Types.TIMESTAMP_WITH_TIMEZONE)
-                .addValue("text", text)
                 .addValue("payload", payloadJson)
                 .addValue("inputHash", inputHash)
                 .addValue("model", model)
                 .addValue("generatedAt", toOffset(generatedAt), Types.TIMESTAMP_WITH_TIMEZONE);
-        return jdbc.update(SQL_SAVE_EXPLANATION, params);
+        String sql = switch (target) {
+            case RECRUITER -> {
+                params.addValue("text", text);
+                yield SQL_SAVE_EXPLANATION;
+            }
+            case SEEKER -> SQL_SAVE_SEEKER_EXPLANATION;
+        };
+        return jdbc.update(sql, params);
     }
 
     public long countMatches(UUID jobId, double minScore) {
@@ -311,15 +395,72 @@ public class MatchJdbcRepository {
      * @throws CannotAcquireLockException if the lock could not be acquired in time
      */
     public void lockJob(UUID jobId) {
+        setLockTimeout();
+        acquireJobLock(jobId);
+    }
+
+    /**
+     * Takes the per-job advisory lock ({@link #lockJob}) for every job, in the given order, until the
+     * current transaction ends. Sets {@code lock_timeout} once; each lock waits at most
+     * {@value #LOCK_TIMEOUT}. Must run inside a transaction. Callers lock one chunk per transaction
+     * (talentmatch.matches.rescore-chunk) to stay well under max_locks_per_transaction.
+     *
+     * <p>The ids must be strictly ascending in PostgreSQL uuid order ({@link UuidOrder}): every
+     * multi-job locker uses that order, and single-job lockers hold one lock at a time, so no lock
+     * cycle can form.
+     *
+     * @throws org.springframework.dao.InvalidDataAccessApiUsageException if the ids are not strictly
+     *         ascending in uuid order. The method throws an {@link IllegalArgumentException}; called
+     *         through the Spring {@code @Repository} bean, the persistence exception translation wraps
+     *         it in {@code InvalidDataAccessApiUsageException} (with the IAE as its cause). A direct call
+     *         on an unproxied instance sees the IAE itself.
+     * @throws CannotAcquireLockException if a lock could not be acquired in time
+     * @throws PessimisticLockingFailureException on a deadlock (backstop; should not happen)
+     */
+    public void lockJobs(List<UUID> sortedJobIds) {
+        if (sortedJobIds.isEmpty()) {
+            return;
+        }
+        if (!UuidOrder.isStrictlyAscending(sortedJobIds)) {
+            throw new IllegalArgumentException("job ids must be distinct and in PostgreSQL uuid order");
+        }
+        setLockTimeout();
+        for (UUID jobId : sortedJobIds) {
+            acquireJobLock(jobId);
+        }
+    }
+
+    /**
+     * Serializes candidate edits with candidate-side scoring for one candidate until the current
+     * transaction ends (advisory key {@code candidate_match:{id}}). Must run inside a transaction.
+     * Waits at most {@value #LOCK_TIMEOUT}. Lock order everywhere: the candidate lock first, then job
+     * locks in ascending uuid order.
+     *
+     * @throws CannotAcquireLockException if the lock could not be acquired in time
+     * @throws PessimisticLockingFailureException on a deadlock (backstop; should not happen)
+     */
+    public void lockCandidate(UUID candidateId) {
+        setLockTimeout();
+        acquireAdvisoryLock("candidate_match:" + candidateId, "candidate " + candidateId);
+    }
+
+    private void setLockTimeout() {
+        jdbc.getJdbcOperations().execute(SQL_SET_LOCK_TIMEOUT);
+    }
+
+    private void acquireJobLock(UUID jobId) {
+        acquireAdvisoryLock("job_match:" + jobId, "job " + jobId);
+    }
+
+    private void acquireAdvisoryLock(String lockKey, String what) {
         try {
-            jdbc.getJdbcOperations().execute(SQL_SET_LOCK_TIMEOUT);
-            jdbc.query(SQL_ADVISORY_LOCK, new MapSqlParameterSource("lockKey", "job_match:" + jobId),
+            jdbc.query(SQL_ADVISORY_LOCK, new MapSqlParameterSource("lockKey", lockKey),
                     (ResultSetExtractor<Void>) rs -> null);
         } catch (PessimisticLockingFailureException e) {
             throw e;
         } catch (DataAccessException e) {
             if ("55P03".equals(sqlState(e))) {
-                throw new CannotAcquireLockException("Timed out waiting for the match lock of job " + jobId, e);
+                throw new CannotAcquireLockException("Timed out waiting for the match lock of " + what, e);
             }
             throw e;
         }
